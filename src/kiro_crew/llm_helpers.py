@@ -2057,6 +2057,7 @@ async def stream_and_collect(
     on_steer_consumed: Callable[[str], None] | None = None,
     on_complete: Callable[[LLMEvent], None] | None = None,
     on_tool_gate: Callable[[str, bool, bool], None] | None = None,
+    on_event: Callable[[LLMEvent], None] | None = None,
     retry_transient: bool = True,
     max_turns: int | None = None,
     session_key: str = "",
@@ -2101,6 +2102,14 @@ async def stream_and_collect(
             the final turn never did. ``tool_title`` is LLM-authored: redact it
             before display or persistence. Raising from the callback is
             swallowed; observing a gate decision must never fail the turn.
+        on_event: Optional observe-only callback invoked with EVERY raw
+            ``LLMEvent`` (text_chunk, tool_call, tool_result,
+            permission_request, complete, ...) before the loop's own dispatch,
+            for a caller that needs the full structured stream (e.g. a cron
+            live-trace tee). It receives the event verbatim, so any persistence
+            or display of ``tool_input``/``title``/``text`` must redact — those
+            are LLM-authored. Raising from it is swallowed; observation must
+            never fail the turn. Callers that pass nothing pay no overhead.
         retry_transient: When True (default), transient backend errors are
             retried in-place with bounded backoff. Set False from callers that
             already own an outer transient-retry loop, so the inner arm doesn't
@@ -2188,6 +2197,16 @@ async def stream_and_collect(
         attempt_stats_before = _billing_stats(provider)
         try:
             async for event in provider.stream(message):
+                # Best-effort per-event observer, fired for EVERY event kind
+                # before dispatch (text_chunk, tool_call, tool_result,
+                # permission_request, complete, ...). Observe-only: a raising
+                # observer must never fail the turn (mirrors the on_complete
+                # swallow below). Callers that pass no on_event pay nothing.
+                if on_event is not None:
+                    try:
+                        on_event(event)
+                    except Exception:
+                        logger.debug("on_event callback failed", exc_info=True)
                 if event.kind == EVENT_TEXT_CHUNK:
                     result_text += event.text
                     if on_chunk:

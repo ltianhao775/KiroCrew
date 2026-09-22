@@ -725,6 +725,10 @@ async def api_crons_create(request: web.Request) -> web.Response:
         return web.json_response({"error": f"invalid timezone: {safe_tz!r}"}, status=400)
     strict_schedule = body.get("strict_schedule", False)
     hide_in_chat = body.get("hide_in_chat", False)
+    # Per-job real-time debug log opt-in: raises the agent tick's kiro-cli log
+    # level so it writes a tailable transcript. Off by default; see the cron
+    # spec's Real-Time Debug Log section.
+    debug_log = body.get("debug_log", False)
     # A job created on a full context pays for memory, lessons, steering, skills
     # and prior history on every wake, whether or not the wake had anything to
     # do. The store has carried this flag since the tool path gained it; only
@@ -787,6 +791,7 @@ async def api_crons_create(request: web.Request) -> web.Response:
         "timezone": (timezone_val or ""),
         "strict_schedule": bool(strict_schedule),
         "hide_in_chat": bool(hide_in_chat),
+        "debug_log": bool(debug_log),
         "minimal_context": bool(minimal_context),
         "persistent_session": bool(persistent_session),
         "folder_id": folder_id,
@@ -959,6 +964,7 @@ async def api_cron_update(request: web.Request) -> web.Response:
         "silent",
         "strict_schedule",
         "hide_in_chat",
+        "debug_log",
         "minimal_context",
         "persistent_session",
         "folder_id",
@@ -2992,6 +2998,7 @@ async def api_crons(request: web.Request) -> web.Response:
             "silent": j.silent,
             "strict_schedule": j.strict_schedule,
             "hide_in_chat": j.hide_in_chat,
+            "debug_log": j.debug_log,
             # Returned so the edit form can show the job's real setting instead
             # of defaulting the control to off and silently clearing the flag on
             # the next save.

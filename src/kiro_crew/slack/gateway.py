@@ -1462,6 +1462,102 @@ def _vet_at_claim_then(
 _annotate_model_fallback = annotate_model_fallback
 
 
+def live_event_record(ev: Any) -> dict[str, Any] | None:
+    """Project one ``LLMEvent`` into a redacted, JSON-safe live-trace record.
+
+    Returns ``None`` for kinds not worth tracing (thinking chunks, structured
+    status, todo updates, mcp/oauth, ...). Every free-text field an event
+    carries is LLM-authored, so it is passed through ``redact`` (exfil-URL +
+    credential passes) before it can reach the trace file. A tool RESULT never
+    persists its raw ``tool_output`` — only the digest + byte length the event
+    already carries — so a credential-shaped result body cannot land in the
+    trace. Text chunks are NOT emitted per-event here (D2: they are aggregated
+    by the tee into one ``text`` record at each assistant/tool boundary).
+    """
+    from kiro_crew.acp.types import (
+        EVENT_COMPLETE,
+        EVENT_TOOL_CALL,
+        EVENT_TOOL_RESULT,
+    )
+
+    kind = getattr(ev, "kind", "")
+    if kind == EVENT_TOOL_CALL:
+        return {
+            "t": "tool_call",
+            "id": ev.tool_call_id or "",
+            "title": redact(ev.title or ""),
+            "input": redact(ev.tool_input) if ev.tool_input else "",
+            "input_was_redacted": bool(ev.tool_input_redacted),
+        }
+    if kind == EVENT_TOOL_RESULT:
+        return {
+            "t": "tool_result",
+            "id": ev.tool_call_id or "",
+            "status": ev.tool_status or "",
+            "final": bool(ev.tool_final),
+            "output_digest": ev.tool_output_digest or "",
+            "output_bytes": ev.tool_output_bytes,
+        }
+    if kind == EVENT_COMPLETE:
+        return {
+            "t": "complete",
+            "stop_reason": ev.stop_reason or "",
+            "refusal": bool(ev.refusal),
+        }
+    return None
+
+
+def make_cron_live_tee(history: Any, job_id: str) -> Callable[[Any], None]:
+    """Build an ``on_event`` callback that tees a cron tick's structured event
+    stream into ``cron-history/<job_id>.live.jsonl`` in real time.
+
+    D2 (aggregated text): consecutive ``text_chunk`` events are accumulated and
+    flushed as ONE ``{"t": "text", ...}`` record at the next tool-call /
+    tool-result / complete boundary, so the trace reads as whole assistant
+    messages rather than one line per token.
+
+    Every write is fire-and-forget onto the loop (``ensure_future`` of the
+    store's off-loop, best-effort ``append_live_event``) so the tee never
+    blocks the tick, and a store that is disabled or degrades simply drops the
+    events. Redaction happens in :func:`live_event_record` (tool call/result)
+    and here (aggregated text) before anything is scheduled.
+    """
+    from kiro_crew.acp.types import EVENT_TEXT_CHUNK
+
+    text_buf: list[str] = []
+
+    def _schedule(rec: dict[str, Any]) -> None:
+        rec["ts"] = time.time()
+        try:
+            asyncio.ensure_future(history.append_live_event(job_id, rec))
+        except RuntimeError:
+            # No running loop (should not happen on the cron dispatch path);
+            # dropping a trace event must never fail the tick.
+            logger.debug("cron live-tee: no running loop, dropped event", exc_info=True)
+
+    def _flush_text() -> None:
+        if text_buf:
+            joined = "".join(text_buf)
+            text_buf.clear()
+            if joined.strip():
+                _schedule({"t": "text", "text": redact(joined)})
+
+    def _tee(ev: Any) -> None:
+        kind = getattr(ev, "kind", "")
+        if kind == EVENT_TEXT_CHUNK:
+            text_buf.append(ev.text or "")
+            return
+        rec = live_event_record(ev)
+        if rec is None:
+            return
+        # Flush any accumulated assistant text BEFORE the tool/complete record,
+        # so ordering in the trace matches what happened.
+        _flush_text()
+        _schedule(rec)
+
+    return _tee
+
+
 async def _cron_stream_with_posttoken_resume(
     client: Any, message: str, *, job_name: str, **stream_kwargs: Any
 ) -> tuple[str, float | None]:
@@ -5336,6 +5432,12 @@ class GatewayOrchestrator:
             # When agent_sequence has multiple agents, run them sequentially
             # with per-agent session keys and per-job env vars.
             agents = cron_agents
+            # Real-time live trace (per job): start THIS run's structured event
+            # trace fresh (D1: each run overwrites the previous), so an operator
+            # tailing cron-history/<id>.live.jsonl always follows the run in
+            # flight. Best-effort — a failure here never blocks the tick.
+            if job.debug_log and self.cron_svc is not None:
+                await self.cron_svc.history.begin_live_trace(job.id)
             if agent_sequence_dispatches(agents):
                 assert self.sessions is not None
                 assert self.ctx_builder is not None
@@ -5425,6 +5527,11 @@ class GatewayOrchestrator:
                             ),
                             on_tool_gate=_gate.note,
                             on_complete=_seq_note_complete,
+                            on_event=(
+                                make_cron_live_tee(self.cron_svc.history, job.id)
+                                if (job.debug_log and self.cron_svc is not None)
+                                else None
+                            ),
                             fallback_models=configured_fallback_chain(),
                         )
                         # The prompt reached the model and the turn completed, so
@@ -5603,6 +5710,11 @@ class GatewayOrchestrator:
                     ),
                     on_tool_gate=_gate.note,
                     on_complete=_note_complete,
+                    on_event=(
+                        make_cron_live_tee(self.cron_svc.history, job.id)
+                        if (job.debug_log and self.cron_svc is not None)
+                        else None
+                    ),
                     fallback_models=configured_fallback_chain(),
                 )
 

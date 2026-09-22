@@ -171,9 +171,7 @@ def truncate_summary(text: str, cap: int) -> str:
 
     # The marker gets its own line so it never fuses onto the end of a kept
     # URL — "<url>..." reads as a longer, dead link.
-    parts = ([head] if head else []) + ([_CUT_MARKER] if marked else []) + (
-        [body] if body else []
-    )
+    parts = ([head] if head else []) + ([_CUT_MARKER] if marked else []) + ([body] if body else [])
     return "\n".join(parts)
 
 
@@ -498,6 +496,66 @@ class CronHistoryStore:
             raise ValueError(f"Path traversal blocked: {job_id!r}")
         return path
 
+    def _live_path(self, job_id: str) -> Path:
+        """Per-job live-trace file: ``<dir>/<job_id>.live.jsonl``.
+
+        Same path-traversal guard as :meth:`_job_path`. Holds the structured,
+        redacted, real-time event stream of the CURRENT run for a job whose
+        ``debug_log`` is on — truncated at each run start (:meth:`begin_live_trace`)
+        so ``tail -f`` always follows the latest run. Not indexed, not capped
+        like the run records; a transient tail reclaimed with the rest of the
+        cron-history dir.
+        """
+        path = (self._dir / f"{job_id}.live.jsonl").resolve()
+        if path.parent != self._dir.resolve():
+            raise ValueError(f"Path traversal blocked: {job_id!r}")
+        return path
+
+    async def begin_live_trace(self, job_id: str) -> None:
+        """Truncate a job's live-trace file at run start (best-effort).
+
+        D1: each run overwrites the previous run's live trace, so a follower
+        always sees only the run in flight. Never raises into the tick."""
+        if not self._enabled:
+            return
+        try:
+            await asyncio.to_thread(self._begin_live_sync, job_id)
+        except OSError as exc:
+            self._degrade("begin_live_trace", exc)
+
+    def _begin_live_sync(self, job_id: str) -> None:
+        fd = self._lock()
+        try:
+            p = self._live_path(job_id)
+            os.close(os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        finally:
+            self._unlock(fd)
+
+    async def append_live_event(self, job_id: str, event: dict[str, Any]) -> None:
+        """Append ONE already-redacted structured event to the live trace.
+
+        Best-effort, off-loop, ``enabled``-gated, ``_degrade`` on OSError — the
+        same contract as :meth:`append`. No index write: the live trace is a
+        per-run tail, not a queryable record. The caller (the cron dispatch
+        tee) owns redaction; this sink only serializes JSON.
+        """
+        if not self._enabled:
+            return
+        try:
+            await asyncio.to_thread(self._append_live_sync, job_id, event)
+        except OSError as exc:
+            self._degrade("append_live_event", exc)
+
+    def _append_live_sync(self, job_id: str, event: dict[str, Any]) -> None:
+        fd = self._lock()
+        try:
+            p = self._live_path(job_id)
+            wfd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(wfd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event) + "\n")
+        finally:
+            self._unlock(fd)
+
     def _lock_path(self) -> Path:
         return self._dir / ".history.lock"
 
@@ -527,7 +585,7 @@ class CronHistoryStore:
         # from. Lifting that cap belongs to whoever owns the registry's size.
         record.summary = truncate_summary(record.summary, self._summary_cap)
         if len(record.trace) > self._trace_cap:
-            record.trace = record.trace[:self._trace_cap] + "\n...[truncated]"
+            record.trace = record.trace[: self._trace_cap] + "\n...[truncated]"
 
         if not self._enabled:
             return
@@ -674,7 +732,7 @@ class CronHistoryStore:
             lines = job_path.read_text(encoding="utf-8").strip().splitlines()
             if len(lines) <= self._max_records_per_job:
                 return
-            keep = lines[-self._max_records_per_job:]
+            keep = lines[-self._max_records_per_job :]
             tmp = job_path.with_suffix(".tmp")
             wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(wfd, "w", encoding="utf-8") as f:
@@ -700,7 +758,7 @@ class CronHistoryStore:
                     continue
                 lines = p.read_text(encoding="utf-8").strip().splitlines()
                 if len(lines) > self._max_records_per_job:
-                    keep = lines[-self._max_records_per_job:]
+                    keep = lines[-self._max_records_per_job :]
                     tmp = p.with_suffix(".tmp")
                     wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                     with os.fdopen(wfd, "w", encoding="utf-8") as f:
@@ -709,7 +767,7 @@ class CronHistoryStore:
             if self._index_path.exists():
                 lines = self._index_path.read_text(encoding="utf-8").strip().splitlines()
                 if len(lines) > self._max_index_records:
-                    keep = lines[-self._max_index_records:]
+                    keep = lines[-self._max_index_records :]
                     tmp = self._index_path.with_suffix(".tmp")
                     wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                     with os.fdopen(wfd, "w", encoding="utf-8") as f:

@@ -379,6 +379,35 @@ run. You can also change the level at runtime from the dashboard Logs page.
 
 Tail a background gateway's output with `kirocrew logs -f`.
 
+### Watching one cron job's tick in real time
+
+`kirocrew logs -f` shows only the gateway's own log — a cron agent tick runs in a
+separate `kiro-cli` subprocess whose reasoning and tool calls do not land there.
+To watch a specific job live, turn on its per-job debug log, which streams a
+clean, structured trace of the tick to a per-job file you can tail. Set it with
+the `cron_update` tool (or at creation with `cron_add`):
+
+```
+cron_update  job_id=<id>  debug_log=true
+```
+
+The tick then writes one JSON event per line to
+`~/.kiro/crew/cron-history/<job_id>.live.jsonl` — `text` (assistant messages),
+`tool_call` (title + input), `tool_result` (status + output digest), and
+`complete` — as they happen. `tail -f` that file while the job runs:
+
+```
+tail -f ~/.kiro/crew/cron-history/<job_id>.live.jsonl
+```
+
+The file is truncated at each run start, so it always shows the run in flight.
+It is credential-safe (every field is redacted and tool outputs are reduced to a
+digest, never raw) and best-effort (a trace-write failure never affects the run).
+Off by default; turn it back off with `debug_log=false`. It is independent of
+`agent.log_level` (the gateway's own log) and has no effect on `script`/`command`
+crons, which run no `kiro-cli` tick. For a finished run's result instead of the
+live trace, read `GET /api/crons/{id}/history` (or `cron-history/<id>.jsonl`).
+
 ## Emergency Recovery
 
 1. Stop the gateway: Ctrl+C, or `kirocrew stop` if it is running detached

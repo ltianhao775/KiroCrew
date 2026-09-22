@@ -831,7 +831,15 @@ class CronJob:
     timeout: int = (
         0  # script/command timeout in seconds (0 = use default: 30s script, 300s command)
     )
-    # Operator-approved vault secrets for SCRIPT jobs: env-var name ->
+    # AGENT (message) crons only: when True, the tick streams a clean,
+    # structured real-time trace of its ACP event stream (assistant text,
+    # tool_call, tool_result, complete) to cron-history/<job_id>.live.jsonl,
+    # one JSON event per line, which an operator can `tail -f`. Truncated at
+    # each run start (always the run in flight) and credential-safe (fields
+    # redacted, tool outputs reduced to a digest). Best-effort: a trace-write
+    # failure never affects the run. Default False. No-op for script/command
+    # crons, which run no agent tick.
+    debug_log: bool = False
     # vault secret NAME (kiro_crew.secrets.SecretVault; plaintext never touches
     # this store). Minted ONLY by the owner approving an agent request on the
     # Schedule page — no surface writes an active grant directly, so an agent
@@ -1960,6 +1968,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         persistent_session=j.get("persistent_session", True),
         minimal_context=j.get("minimal_context", False),
         hide_in_chat=j.get("hide_in_chat", False),
+        debug_log=j.get("debug_log", False),
         folder_id=_guard_str("folder_id"),
         chat_folder_id=_guard_str("chat_folder_id"),
         model=_guard_str("model"),
@@ -2602,6 +2611,16 @@ class CronService:
 
     # ── Public API ──
 
+    @property
+    def history(self) -> CronHistoryStore:
+        """The cron execution-history store (also the live-trace sink).
+
+        Public accessor so surfaces that drive a run (the gateway cron
+        dispatch) can tee a job's live event trace without reaching into a
+        private attribute.
+        """
+        return self._history
+
     def add_job(
         self,
         name: str,
@@ -2634,6 +2653,7 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        debug_log: bool = False,
     ) -> CronJob:
         """Add a new job. Provide one of ``every_secs``, ``at_ts``, or ``cron_expr``.
 
@@ -2695,6 +2715,7 @@ class CronService:
             minimal_context=minimal_context,
             timeout=timeout,
             timeout_secs=timeout_secs,
+            debug_log=debug_log,
         )
         self._persist_add_locked(job)
         self._arm_timer()
@@ -2825,6 +2846,7 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        debug_log: bool = False,
     ) -> CronJob:
         """Validate inputs and construct the :class:`CronJob` (no I/O, no lock).
 
@@ -2951,6 +2973,7 @@ class CronService:
             minimal_context=minimal_context,
             timeout=timeout,
             timeout_secs=int(timeout_secs) if timeout_secs else _JOB_TIMEOUT_SECS,
+            debug_log=debug_log,
         )
 
     def _persist_add_locked(self, job: CronJob) -> None:
@@ -3003,6 +3026,7 @@ class CronService:
         minimal_context: bool = False,
         timeout: int = 0,
         timeout_secs: int = 0,
+        debug_log: bool = False,
         source_preset: str = "",
         source_template_prompt: str = "",
     ) -> CronJob:
@@ -3054,6 +3078,7 @@ class CronService:
             minimal_context=minimal_context,
             timeout=timeout,
             timeout_secs=timeout_secs,
+            debug_log=debug_log,
         )
         # Dashboard-only template provenance. Set on the freshly-built job
         # BEFORE the off-loop persist -- the object has no other reference yet,
@@ -3347,6 +3372,8 @@ class CronService:
                     job.minimal_context = bool(kwargs["minimal_context"])
                 if "hide_in_chat" in kwargs:
                     job.hide_in_chat = bool(kwargs["hide_in_chat"])
+                if "debug_log" in kwargs:
+                    job.debug_log = bool(kwargs["debug_log"])
                 if "folder_id" in kwargs:
                     job.folder_id = kwargs["folder_id"] or ""
                 if "chat_folder_id" in kwargs:
@@ -6179,6 +6206,7 @@ class CronService:
                     "persistent_session": j.persistent_session,
                     "minimal_context": j.minimal_context,
                     "hide_in_chat": j.hide_in_chat,
+                    "debug_log": j.debug_log,
                     "folder_id": j.folder_id,
                     "chat_folder_id": j.chat_folder_id,
                     "model": j.model,

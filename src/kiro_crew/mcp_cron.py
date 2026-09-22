@@ -1254,6 +1254,15 @@ def _list_tools() -> list[dict[str, Any]]:
                         "notification and the History tab. Only applies to agent crons "
                         "(LLM jobs with a message); script/command crons never create a slot.",
                     },
+                    "debug_log": {
+                        "type": "boolean",
+                        "description": "When true, this agent cron's tick streams a clean, "
+                        "structured real-time trace (assistant text, tool calls, tool results) "
+                        "to cron-history/<job_id>.live.jsonl, one JSON event per line, which you "
+                        "can `tail -f`. Truncated at each run start; credential-safe (redacted, "
+                        "tool outputs as digests); best-effort. Default false. No effect on "
+                        "script/command crons, which run no agent tick.",
+                    },
                     "strict_schedule": {
                         "type": "boolean",
                         "description": "When true, fire exactly on schedule with no jitter. "
@@ -1368,6 +1377,14 @@ def _list_tools() -> list[dict[str, Any]]:
                         "session in the dashboard active-session list. Set true to keep "
                         "fire-and-forget jobs out of the Chats sidebar (result still goes to "
                         "Slack/bell + History).",
+                    },
+                    "debug_log": {
+                        "type": "boolean",
+                        "description": "When true, this agent cron's tick streams a clean, "
+                        "structured real-time trace (assistant text, tool calls, tool results) "
+                        "to cron-history/<job_id>.live.jsonl which you can `tail -f`. Truncated "
+                        "at each run start; credential-safe; best-effort. Set false to turn it "
+                        "off. No effect on script/command crons.",
                     },
                     "model": {
                         "type": "string",
@@ -1683,6 +1700,7 @@ def _render_cron_list_json(jobs: list[Any]) -> str:
             "minimal_context": bool(job.minimal_context),
             "persistent_session": bool(job.persistent_session),
             "hide_in_chat": bool(job.hide_in_chat),
+            "debug_log": bool(job.debug_log),
             "message": message[:_JSON_MESSAGE_LEN],
             # A consumer classifies the prompt, and anything past the cut is
             # invisible to it -- including the words that would RULE OUT a
@@ -2536,6 +2554,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         persistent_session = args.get("persistent_session")
         minimal_context = args.get("minimal_context")
         hide_in_chat = args.get("hide_in_chat")
+        debug_log = args.get("debug_log")
         strict_schedule = args.get("strict_schedule")
         timeout_val = args.get("timeout", 0)
         timeout_secs_val = args.get("timeout_secs", 0)
@@ -2567,6 +2586,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 silent=bool(silent),
                 strict_schedule=strict_schedule if isinstance(strict_schedule, bool) else False,
                 hide_in_chat=hide_in_chat if isinstance(hide_in_chat, bool) else False,
+                debug_log=debug_log if isinstance(debug_log, bool) else False,
                 folder_id=folder_id,
                 command=command or "",
                 script=script or "",
@@ -2674,6 +2694,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             hic = args["hide_in_chat"]
             if isinstance(hic, bool):
                 kwargs["hide_in_chat"] = hic
+        if "debug_log" in args:
+            dbg = args["debug_log"]
+            if isinstance(dbg, bool):
+                kwargs["debug_log"] = dbg
         if "model" in args:
             m = str(args["model"] or "").strip()
             if m:
