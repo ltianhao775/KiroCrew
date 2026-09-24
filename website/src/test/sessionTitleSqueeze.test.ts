@@ -36,8 +36,10 @@ describe('session header at phone widths', () => {
 
   it('lets the editing input shrink too', async () => {
     const s = await src()
-    // `flex-none` plus a `size` attribute refuses to shrink at all.
-    expect(s).toMatch(/session-header-title[^"]*min-w-0 flex-1 outline-hidden md:max-w-\[50vw\]/)
+    // `flex-none` plus a `size` attribute refuses to shrink at all. (The
+    // editor keeps the shared Input's own chrome now -- #13050 -- so its
+    // outline handling comes from the primitive, not from this class list.)
+    expect(s).toMatch(/session-header-title[^"]*min-w-0 flex-1 md:max-w-\[50vw\]/)
     expect(s, 'flex-none would pin the input at its size attribute')
       .not.toMatch(/session-header-title[^"]*flex-none/)
   })
@@ -55,6 +57,9 @@ describe('session header at phone widths', () => {
     // `group/title` is the keyboard-reveal hook for the Pen; the squeeze
     // contract is the flex/min-w-0 pair that follows it.
     expect(s, 'the clickable wrapper').toMatch(/<Clickable className="(?:group\/title )?flex min-w-0 items-center gap-1"/)
-    expect(s, 'the editing cluster').toMatch(/flex min-w-0 flex-1 items-center gap-1 px-1\.5/)
+    // Closing quote included: the editing wrapper carries NO padding of its
+    // own -- the editor's border and padding stand in for the pill's, so the
+    // header keeps its height while editing (#13050).
+    expect(s, 'the editing cluster').toMatch(/flex min-w-0 flex-1 items-center gap-1"/)
   })
 })

@@ -22,9 +22,9 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import model_registry, resource_status
 from kiro_crew._sqlite_compat import sqlite3
-from kiro_crew.agent import _prompt_path
+from kiro_crew.agent import _prompt_path, is_managed_prompt
 from kiro_crew.agent_discovery import agent_skill_globs
-from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, is_claude_code
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 from kiro_crew.board_tag_grammar import is_grantable_tag_id
 from kiro_crew.config import live
@@ -32,6 +32,13 @@ from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.context_blocks import measure_prompt
 from kiro_crew.cron import get_local_tz
+from kiro_crew.folder_steering import (
+    FOLDER_STEERING_OMISSION_SOURCE,
+    SteeringCollection,
+    collect_folder_steering,
+    render_folder_steering,
+    render_omission_notice,
+)
 from kiro_crew.hooks import (
     HOOK_INJECT_CONTEXT,
     HOOK_MODIFY,
@@ -42,6 +49,12 @@ from kiro_crew.hooks import (
     safe_read_file_bytes_nolink,
 )
 from kiro_crew.learn import LessonStore
+from kiro_crew.member_essential_context import (
+    _MAX_DOCUMENTS,
+    ESSENTIAL_MAX_CHARS,
+    MemberEssentialContextError,
+    render_essentials,
+)
 from kiro_crew.members import (
     MemberLifecycle,
     MemberSlugError,
@@ -596,6 +609,15 @@ _STRUCTURAL_MARKER_RES: tuple[re.Pattern[str], ...] = (
     # the variable-tail convention above.
     re.compile(r"\[\s*REINJECTED\s*AFTER\s*COMPACTION\s*[-]{1,2}", re.IGNORECASE),
     re.compile(r"\[\s*END\s*REINJECTED\s*\]", re.IGNORECASE),
+    # Folder steering's own frame. Forging the opener presents attacker text
+    # (a channel message, a memory line, a steering BODY) as operator-selected
+    # folder rules "to follow as you would project steering" -- an escalation.
+    # The genuine section is therefore minted AFTER this scrub, by
+    # ``build_message`` (fresh session) and the compaction-reinjection leg,
+    # never inside the scrubbed session-context tail. Head-anchored with the
+    # required hyphen separator, per the variable-tail convention above.
+    re.compile(r"\[\s*FOLDER\s*STEERING\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*END\s*FOLDER\s*STEERING\s*\]", re.IGNORECASE),
 )
 _STRUCTURAL_MARKER_NEUTRALIZED = "[marker-removed]"
 
@@ -907,6 +929,122 @@ def _neutralize_structural_markers(text: str) -> str:
     return _apply_marker_spans(text, _structural_marker_spans(text))
 
 
+def _fit_folder_steering_into_envelope(
+    documents: list[tuple[str, str]],
+    folder_docs: SteeringCollection | list[tuple[str, str]],
+    *,
+    identity: str,
+    owner: str,
+) -> list[tuple[str, str]]:
+    """The prefix of *folder_docs* that fits the essentials envelope beside *documents*.
+
+    ``render_essentials`` REFUSES an envelope over ``ESSENTIAL_MAX_CHARS`` or
+    ``_MAX_DOCUMENTS`` -- correct for a member's own essentials, which must
+    never be silently cut, but folder steering is operator-pointed task
+    guidance that the non-member path already truncates. One plausible 64 KB
+    guide must not abort every turn of every member chat in the folder, so
+    folder documents are admitted in order while both bounds still hold and
+    the tail is dropped. The character arithmetic mirrors the renderer part for
+    part (same header, same scrub, same neutralization) so the fitted envelope
+    renders without ever reaching its refusal.
+
+    A dropped tail is never silent: whenever this fit leaves documents out, or
+    the collection itself hit a ceiling, ONE extra essentials document
+    (``FOLDER_STEERING_OMISSION_SOURCE``) states the counts, and its own cost is
+    reserved inside both bounds -- fitted documents are given back from the
+    tail until the notice fits -- so the notice is the last thing to go, not
+    the first, and past the count room it may take one extra slot (that ceiling
+    bounds the member's OWN declared essentials, not the envelope). A member turn
+    whose essentials leave no room even for a minimal notice
+    gets no folder steering at all, logged at warning.
+    """
+    if isinstance(folder_docs, SteeringCollection):
+        candidates = folder_docs.documents
+        ceilings = folder_docs.omissions
+    else:
+        candidates = folder_docs
+        ceilings = []
+    try:
+        used = len(render_essentials(documents, identity=identity))
+    except MemberEssentialContextError:
+        # The member's own essentials already exceed the envelope; the caller's
+        # render raises with its own diagnostic. Folder steering adds nothing.
+        return []
+    count_room = _MAX_DOCUMENTS - len(documents)
+
+    def _cost(source: str, body: str) -> int:
+        return (
+            len(f"[Essential source: {_neutralize_structural_markers(source)}]\n")
+            + len(_neutralize_structural_markers(_scrub_member_payload(body)))
+            + 1
+        )
+
+    fitted: list[tuple[str, str]] = []
+    for source, body in candidates:
+        if len(fitted) >= count_room:
+            break
+        # A folder document's source is a HOST FILENAME an agent can choose, and
+        # ``render_essentials`` scrubs member-authority markers from bodies
+        # only -- its source labels are trusted member sources. A folder label
+        # is not one of those, so it is scrubbed here, before costing, and the
+        # scrubbed spelling is what the envelope carries.
+        source = _scrub_member_payload(source)
+        cost = _cost(source, body)
+        if used + cost > ESSENTIAL_MAX_CHARS:
+            break
+        used += cost
+        fitted.append((source, body))
+    while True:
+        dropped = len(candidates) - len(fitted)
+        if not dropped and not ceilings:
+            return fitted
+        lines = [render_omission_notice(omission) for omission in ceilings]
+        if dropped:
+            lines.append(
+                f"[FOLDER STEERING OMISSION: {dropped} more document(s) were not loaded -- "
+                f"they do not fit beside this member's own essentials. "
+                f"The standards above are incomplete.]"
+            )
+        notice = (FOLDER_STEERING_OMISSION_SOURCE, "\n".join(lines))
+        # The document-count ceiling bounds the member's OWN declared essentials
+        # (member_essential_context enforces it on the declaration); the
+        # renderer enforces only the character bound. So the notice may take
+        # ONE slot past ``count_room`` -- otherwise a member whose own essentials
+        # fill every slot would lose folder steering with no trace in the
+        # envelope that replaces every prior snapshot. Folder DOCUMENTS still
+        # respect the count room above; only the notice is exempt.
+        if used + _cost(*notice) <= ESSENTIAL_MAX_CHARS:
+            logger.debug(
+                "folder steering truncated for member %s: %d of %d documents fit the envelope",
+                owner,
+                len(fitted),
+                len(candidates),
+            )
+            return [*fitted, notice]
+        if not fitted:
+            # Nothing left to give back. One last, minimal line: it says only
+            # that folder steering exists and was omitted, so the envelope that
+            # replaces every prior snapshot never drops the rules in silence.
+            minimal = (
+                FOLDER_STEERING_OMISSION_SOURCE,
+                "[FOLDER STEERING OMISSION: this folder declares steering that does not fit "
+                "beside this member's own essentials; none of it is loaded.]",
+            )
+            if used + _cost(*minimal) <= ESSENTIAL_MAX_CHARS:
+                logger.warning(
+                    "folder steering omitted entirely for member %s: only the minimal notice fits",
+                    owner,
+                )
+                return [minimal]
+            logger.warning(
+                "folder steering omitted entirely for member %s: the essentials envelope "
+                "has no room even for the omission notice",
+                owner,
+            )
+            return []
+        used -= _cost(*fitted.pop())
+
+
 def _neutralize_reply_format_markers(text: str) -> str:
     """Neutralize only reply-format headers in an assembled prompt segment.
 
@@ -1021,6 +1159,12 @@ _MEMORY_PREFS_CAP = _budget(0.026)  # user preferences                     = 2.6
 _MEMORY_PROJECTS_CAP = _budget(0.039)  # active projects                      = 3.9%
 _MEMORY_HISTORY_CAP = _budget(0.16)  # daily history (multi-tier decay)     = 16%
 _LESSONS_CAP = _budget(0.226)  # learned corrections (high priority)  = 22.6%
+# Startup rule allowance for the authored directive tier. Window-INDEPENDENT
+# and deliberately NOT a share of ``_CONTEXT_BUDGET_BASE``: that base is the
+# ordinary discretionary pool, and standing rules are not discretionary. The
+# value restores the allowance a 1M-window session had before the base was
+# pinned to its smallest-window value (165_000 * 0.226 = 37_290).
+_LESSONS_STARTUP_CAP = 37_000
 # Past findings the author marked as experience rather than as standing rules.
 # A SEPARATE, deliberately smaller allowance instead of a share of
 # ``_LESSONS_CAP``: the two tiers answer different questions, so a user with many
@@ -1106,6 +1250,7 @@ class _ResolvedCaps:
     projects: int
     memory_history: int
     lessons: int
+    lessons_startup: int
     lesson_experience: int
     semantic: int
     episodic: int
@@ -1163,6 +1308,7 @@ def _resolve_caps_cached(window: int) -> _ResolvedCaps:
         projects=_scaled(_MEMORY_PROJECTS_CAP),
         memory_history=_scaled(_MEMORY_HISTORY_CAP),
         lessons=_scaled(_LESSONS_CAP),
+        lessons_startup=_scaled(_LESSONS_STARTUP_CAP),
         lesson_experience=_scaled(_LESSON_EXPERIENCE_CAP),
         semantic=_scaled(_SEMANTIC_MEMORY_CAP),
         episodic=_scaled(_EPISODIC_MEMORY_CAP),
@@ -1440,6 +1586,37 @@ _GROUP_DESCRIPTIONS = {
 def _group_included(groups: frozenset[str] | None, group: str) -> bool:
     """True when *group* is in scope; ``None`` ⇒ every group."""
     return groups is None or group in groups
+
+
+def _config_scoped_groups(
+    context_groups: frozenset[str] | None, cfg: "KiroCrewConfig | None" = None
+) -> frozenset[str] | None:
+    """The caller-passed scope intersected with the operator's config toggles.
+
+    ``memory.inject_memory`` / ``memory.inject_lessons`` (with
+    ``memory.persistence_enabled`` as the global switch) withhold a group on
+    EVERY surface. Intersecting here — instead of at each call site — keeps a
+    new context entry point from silently escaping the config;
+    ``build_session_context``, the v2 essentials builder and the
+    post-compaction re-injection all route through this.
+    Subagent narrowing is preserved: config can only remove groups from the
+    caller-passed scope, never add one back. Only the memory and lessons groups
+    are ever subtracted, so a project-group gate reads the caller scope
+    directly. The ``[CONTEXT SCOPE]`` block
+    stays keyed to the caller-passed value, because "your parent withheld"
+    describes per-spawn narrowing, not the operator's standing choice.
+    """
+    if cfg is None:
+        cfg = KiroCrewConfig.load()
+    withheld: set[str] = set()
+    if not (cfg.memory.persistence_enabled and cfg.memory.inject_memory):
+        withheld.add(CONTEXT_GROUP_MEMORY)
+    if not (cfg.memory.persistence_enabled and cfg.memory.inject_lessons):
+        withheld.add(CONTEXT_GROUP_LESSONS)
+    if not withheld:
+        return context_groups
+    base = SWITCHABLE_CONTEXT_GROUPS if context_groups is None else context_groups
+    return frozenset(base) - withheld
 
 
 def _build_context_scope_section(groups: frozenset[str] | None) -> str:
@@ -1894,7 +2071,6 @@ def _reply_style_rules(level: str) -> str:
             "in the picture's words. End: what it is, one line. Word check "
             "still runs. Cut check spares the picture and the reasons. This "
             "reply may run long.\n"
-            'Not asked? Offer it in three words: "say why".\n'
             'Asked for depth (a doc, a walkthrough, "in detail")? This '
             "mode is off for that reply.\n\n"
             "Reply in the user's language."
@@ -2029,6 +2205,58 @@ def _load_steering_resources() -> str:
         return ""
 
 
+def _project_steering_delivered(provider_type: str, native_steering: bool) -> bool:
+    """Whether the project/global ``.kiro/steering`` trees already reach the model.
+
+    Three paths exist and this names all of them, so the folder-steering dedup
+    skips those trees ONLY where one of them is in effect: kiro-cli (the ACP
+    default label) loads an agent's ``resources`` natively when spawned with
+    ``--agent``; the Claude Code seam receives the explicit ``[Steering
+    resources]`` load in ``build_message`` (gated on ``is_cc``); KAS reports
+    ``native_steering`` on its session provider. Every other harness -- Codex,
+    OpenCode, Pi, Goose, DeepSeek -- has NO path for those trees today, so a
+    folder that declares one of them must deliver its documents itself rather
+    than skip them as "already delivered" with nothing arriving in their place.
+    """
+    return provider_type == PROVIDER_ACP or is_claude_code(provider_type) or bool(native_steering)
+
+
+def _render_folder_steering_section(
+    steering_dirs: tuple[str, ...],
+    project: str | None,
+    cap: int,
+    *,
+    skip_delivered_roots: bool = True,
+) -> str:
+    """The folder-steering prompt section, capped like the steering section.
+
+    One helper for the fresh-session path and the post-compaction reinjection
+    path so the two cannot drift in what they read or how they truncate. The
+    reader itself lives in :mod:`kiro_crew.folder_steering`; ``cap`` is
+    ``caps.steering`` ALWAYS, not only under ``skills.lazy_load``: the section
+    is appended as required (protected from budget trims), so without its own
+    finite bound an operator-pointed tree of up to 64 x 256 KB would be handed
+    to the model whole and reject every turn. The bound is applied BY the
+    renderer, which reserves the omission notices and footer before spending
+    the budget on bodies; a bare slice would cut off exactly the lines that
+    say the section is incomplete.
+
+    The bodies and labels are scrubbed with :func:`_neutralize_structural_markers`
+    INSIDE the renderer, before the genuine ``[FOLDER STEERING -- ...]`` frame
+    is minted around them; the frame itself is in ``_STRUCTURAL_MARKER_RES``,
+    so the returned section must be appended AFTER any scrub of the
+    surrounding text, never inside the scrubbed session-context tail. Both
+    callers do exactly that.
+    """
+    return render_folder_steering(
+        collect_folder_steering(
+            steering_dirs, project=project, skip_delivered_roots=skip_delivered_roots
+        ),
+        max_chars=cap,
+        scrub=_neutralize_structural_markers,
+    )
+
+
 # Critical rules reinforced every session (supplements the system prompt).
 # The diff-block rule is RUNTIME-SELECTED server-side (_critical_rules_for):
 # the trusted runtime resolution already exists for the [RUNTIME] line, so
@@ -2054,7 +2282,9 @@ _DIFF_RULE_DASHBOARD = (
     "earlier ones into the collapsed steps pane; this marker exempts the "
     "message so mid-turn deliverables stay visible. The marker is an HTML "
     "comment and renders as nothing in the dashboard -- do not use it on "
-    "routine progress notes, only on content the user must see.\n"
+    "routine progress notes, only on content the user must see. Prefer "
+    "restructuring the turn so the deliverable IS its last message; reach for "
+    "the marker only when that is not possible.\n"
 )
 _DIFF_RULE_CHANNEL = (
     "After ANY file change (create, edit, append, delete), you MUST show a "
@@ -3131,9 +3361,14 @@ class ContextBuilder:
             prompt = data.get("prompt") or ""
             if not isinstance(prompt, str):
                 return ""
-            # The product prompt is deliberately omitted from V2 essentials;
-            # even a fork referring to it still needs its session-start copy.
-            if agent == owner_template and prompt != f"file://{_prompt_path()}":
+            # The managed contract resolves to the contract file for EVERY spec
+            # carrying it, owner template or not: a fork or template copy
+            # inherits _NATIVE_PROMPT_STUB verbatim, and returned literally the
+            # stub text would be that agent's whole persona. An owner template's
+            # own prompt is delivered via essentials, so it is omitted here.
+            if is_managed_prompt(prompt):
+                prompt = f"file://{_prompt_path()}"
+            elif agent == owner_template:
                 return ""
             if prompt.startswith("file://"):
                 source = Path(prompt[7:]).expanduser()
@@ -3324,6 +3559,7 @@ class ContextBuilder:
         member_template: str = "",
         conditional_index: bool = False,
         trigger_text: str = "",
+        steering_dirs: tuple[str, ...] = (),
     ) -> str:
         """Refresh complete member essentials without opening learned memory."""
         from kiro_crew.member_essential_context import (
@@ -3338,6 +3574,21 @@ class ContextBuilder:
         template = member_template or template
         if not owner:
             return ""
+        # Same config intersection as build_session_context: this builder is a
+        # second context entry point, so a group the operator disabled must be
+        # withheld here too rather than only on the main path.
+        #
+        # EXCEPT when profile_overrides is supplied. That argument makes this a
+        # VALIDATOR (_validate_private_profile_update), not a context build: the
+        # candidate profile is appended only under the memory-group gate below,
+        # and render_essentials' combined-budget refusal is what rejects a
+        # profile that fits per-file but overflows the combined cap. Scoping the
+        # groups here would drop that gate whenever injection is disabled, so an
+        # oversized profile would save and then break every later member build.
+        # A validation pass must see the complete candidate set regardless of
+        # what the operator currently injects.
+        if profile_overrides is None:
+            context_groups = _config_scoped_groups(context_groups)
         reads = not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY)
         identity = self._build_member_section(owner, strict=True, include_briefing=reads)
         documents = documents_for_member(
@@ -3366,6 +3617,29 @@ class ContextBuilder:
                     )
                 sources[source] = body
             documents = list(sources.items())
+        # Folder-inherited steering rides INSIDE the essentials envelope for a
+        # member chat (the envelope IS its session-start context), through the
+        # same reader the non-member path uses. After the template/project
+        # documents so global and project steering keep precedence; before the
+        # memory files. None of these sources is declared host-native
+        # (kiro_launch_documents never sees the folder dirs), so the native
+        # envelope keeps their bodies. The envelope's bounds -- 64 documents AND
+        # ``ESSENTIAL_MAX_CHARS`` rendered -- are applied to folder steering as
+        # a BUDGET, not a fault: the member's own sources already occupy part
+        # of both, and an operator pointing a folder at a large standards tree
+        # must degrade the way the non-member path does (by dropping the tail)
+        # rather than abort every turn of every member chat in that folder
+        # until the folder shrinks. The character budget depends on the memory
+        # documents appended below, so the candidates are collected here (their
+        # position recorded) and fitted just before the envelope renders.
+        folder_docs: SteeringCollection = SteeringCollection()
+        folder_insert_at = len(documents)
+        if (
+            steering_dirs
+            and not blocks_reads
+            and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
+        ):
+            folder_docs = collect_folder_steering(steering_dirs, project=project)
         if reads:
             from kiro_crew.memory_stores import memory_store_dir_for
 
@@ -3403,6 +3677,11 @@ class ContextBuilder:
                     "current conversation already answers the question.",
                 )
             )
+        if folder_docs:
+            fitted = _fit_folder_steering_into_envelope(
+                documents, folder_docs, identity=identity, owner=owner
+            )
+            documents[folder_insert_at:folder_insert_at] = fitted
         envelope = render_essentials(documents, identity=identity)
         if native_envelope_out is not None:
             native = native_documents or {}
@@ -3443,6 +3722,7 @@ class ContextBuilder:
         project: str | None = None,
         member: str = "",
         execution_context: Any = None,
+        steering_dirs: tuple[str, ...] = (),
         _v2_essentials: str | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
@@ -3524,6 +3804,7 @@ class ContextBuilder:
                 blocks_reads=blocks_reads,
                 context_groups=context_groups,
                 member_template=execution_context.template_id if execution_context else "",
+                steering_dirs=steering_dirs,
             )
 
         # Minimal V1 stays date/time + agent identity. Private V2 also carries
@@ -3642,6 +3923,19 @@ class ContextBuilder:
         # member capability gate below — one read per context build.
         _cfg = KiroCrewConfig.load()
 
+        # Config-driven injection toggles (memory.inject_memory /
+        # memory.inject_lessons, with memory.persistence_enabled as the global
+        # switch): a group the operator disabled is withheld on EVERY surface —
+        # dashboard, channels, cron, heartbeat, task runner, eval, subagents —
+        # by intersecting here, the one method all context builds pass through,
+        # rather than at the eleven call sites that would each have to remember
+        # to pass ``context_groups``. The caller-passed ``context_groups`` keeps
+        # driving the [CONTEXT SCOPE] block below: its "Your parent withheld"
+        # prose describes subagent narrowing, and a config withholding is the
+        # operator's standing choice, not the parent's per-spawn one, so it is
+        # deliberately silent there.
+        effective_groups = _config_scoped_groups(context_groups, _cfg)
+
         if mode == _member_mode and _member_backend_can_dispatch(_cfg):
             append_required(
                 f"[CREW MEMBER OPERATING MODE]\n"
@@ -3707,7 +4001,7 @@ class ContextBuilder:
         # the sub-agent reads the scope as framing rather than discovering a gap.
         append_required(_build_context_scope_section(context_groups))
 
-        if _group_included(context_groups, CONTEXT_GROUP_LESSONS):
+        if _group_included(effective_groups, CONTEXT_GROUP_LESSONS):
             profile_ctx = _build_user_profile_section(_cfg)
             if profile_ctx:
                 parts.append(profile_ctx)
@@ -3764,6 +4058,15 @@ class ContextBuilder:
                 append_required(
                     "[Steering resources]\n" + steering_ctx + "\n[End of steering resources]\n\n"
                 )
+        # Folder-inherited steering is NOT appended here. Its frame is in
+        # ``_STRUCTURAL_MARKER_RES`` (a forged copy in a channel message or a
+        # steering body must not read as operator-selected folder rules), and
+        # the caller scrubs this whole tail with _neutralize_structural_markers,
+        # so a genuine section placed here would be erased along with any
+        # forgery. ``build_message`` mints it right after that scrub, gated on
+        # the same conditions (non-member chat, project context group, not a
+        # minimal/slim run); member chats carry it inside the essentials
+        # envelope built above.
         _mark("steering")
 
         # Thread conversation history — highest priority context.
@@ -3887,7 +4190,7 @@ class ContextBuilder:
         memory = None
         member_vectors = None
         if not blocks_reads and any(
-            _group_included(context_groups, group)
+            _group_included(effective_groups, group)
             for group in (CONTEXT_GROUP_MEMORY, CONTEXT_GROUP_LESSONS)
         ):
             if private:
@@ -3904,7 +4207,7 @@ class ContextBuilder:
                     )
             else:
                 memory = self.get_memory_for(workspace, memory_store)
-        if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY):
+        if not blocks_reads and _group_included(effective_groups, CONTEXT_GROUP_MEMORY):
             if private:
                 append_required(
                     "[Memory tools]\n"
@@ -4018,7 +4321,7 @@ class ContextBuilder:
         lessons_renderer: Callable[[int], str] | None = None
         lessons_part_index: int | None = None
         if (memory is not None or member_vectors is not None) and _group_included(
-            context_groups, CONTEXT_GROUP_LESSONS
+            effective_groups, CONTEXT_GROUP_LESSONS
         ):
             # V1 only: the JSONL store answers when the vector store is absent OR not yet
             # populated, and stays silent once it holds lessons.
@@ -4042,7 +4345,7 @@ class ContextBuilder:
                         project_dir=project,
                         background=True,
                         hard_cap=hard_cap,
-                        directive_budget=caps.lessons,
+                        directive_budget=caps.lessons_startup,
                         experience_budget=caps.lesson_experience,
                     )
 
@@ -4059,7 +4362,7 @@ class ContextBuilder:
                         project_dir=project,
                         background=True,
                         hard_cap=hard_cap,
-                        directive_budget=caps.lessons,
+                        directive_budget=caps.lessons_startup,
                         experience_budget=caps.lesson_experience,
                     )
 
@@ -4071,7 +4374,7 @@ class ContextBuilder:
                     return lesson_store.get_context(
                         project_dir=project,
                         cap=hard_cap,
-                        directive_budget=caps.lessons,
+                        directive_budget=caps.lessons_startup,
                         experience_budget=caps.lesson_experience,
                         query_text=query_text,
                     )
@@ -4083,7 +4386,7 @@ class ContextBuilder:
                     return self.lessons.get_context(
                         project_dir=project,
                         cap=hard_cap,
-                        directive_budget=caps.lessons,
+                        directive_budget=caps.lessons_startup,
                         experience_budget=caps.lesson_experience,
                         query_text=query_text,
                     )
@@ -4120,7 +4423,7 @@ class ContextBuilder:
             session_key
             and self.conversation_log
             and not blocks_reads
-            and _group_included(context_groups, CONTEXT_GROUP_MEMORY)
+            and _group_included(effective_groups, CONTEXT_GROUP_MEMORY)
         ):
             provenance = self.conversation_log.recent_with_provenance(
                 session_key, exclude_last_n=exclude_last_n
@@ -4226,6 +4529,53 @@ class ContextBuilder:
         )
         return context
 
+    def _resolve_agent_prompt(
+        self,
+        agent: str | None,
+        *,
+        project: str | None,
+        mode: str,
+        session_key: str | None,
+        is_cc: bool,
+        private_owner: bool,
+    ) -> str:
+        """Return the agent contract for the ``[AGENT SYSTEM PROMPT]`` block, or "".
+
+        Session start and post-compaction reinjection both call this, so the
+        contract a compacted session gets back is the one it started with.
+        """
+        is_custom = bool(agent) and agent != "kirocrew"
+        agent_prompt: str
+        if is_cc and (not is_custom or not private_owner):
+            # CC gets the same Kiro Crew persona prompt as kiro — including
+            # the Output Format rules (diff blocks, image embeds, OPTIONS)
+            # which are dashboard UI contracts, not kiro-specific. Only the
+            # kiro-cli *branding* references are rewritten to claude code.
+            try:
+                pp = _prompt_path(mode=mode)
+                agent_prompt = pp.read_text(encoding="utf-8")
+                agent_prompt = agent_prompt.replace("kiro-cli", "claude code")
+                agent_prompt = re.sub(r"\bKiro\b", "Claude", agent_prompt)
+                agent_prompt = re.sub(r"\bkiro\b", "claude", agent_prompt)
+                agent_prompt = agent_prompt.strip()
+            except Exception:
+                agent_prompt = ""
+        elif is_custom:
+            agent_prompt = self._load_agent_prompt(
+                agent or "", project, owner_template=(agent or "") if private_owner else ""
+            )
+        else:
+            try:
+                pp = _prompt_path(mode=mode)
+                logger.debug("Prompt selection: mode=%r → %s", mode, pp)
+                agent_prompt = pp.read_text(encoding="utf-8")
+            except OSError:
+                agent_prompt = ""
+        if not agent_prompt:
+            return ""
+        agent_prompt = self._resolve_prompt_templates(agent_prompt, session_key or "")
+        return self._substitute_bot_name(agent_prompt)
+
     def build_message(
         self,
         text: str,
@@ -4262,6 +4612,7 @@ class ContextBuilder:
         member: str = "",
         execution_context: Any = None,
         context_provider: "ContextPromptProvider | None" = None,
+        steering_dirs: tuple[str, ...] = (),
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -4396,6 +4747,7 @@ class ContextBuilder:
                 conditional_index=context_provider is not None
                 and delivery is not None
                 and not context_provider.native_steering,
+                steering_dirs=steering_dirs,
             )
         if _essentials and not is_new_session:
             parts.append(_essentials)
@@ -4436,38 +4788,19 @@ class ContextBuilder:
             slim_resume = _member_turn.lifecycle is MemberLifecycle.SLIM_RESUME
             # Agent prompt goes BEFORE session context wrapper
             # so the LLM treats it as its identity, not background info.
-            if slim_resume:
-                agent_prompt = ""
-            elif is_cc and (not is_custom or not _private_owner):
-                # CC gets the SAME KiroCrew persona prompt as kiro — including
-                # the Output Format rules (diff blocks, image embeds, OPTIONS)
-                # which are dashboard UI contracts, not kiro-specific. Only the
-                # kiro-cli *branding* references are rewritten to claude code.
-                try:
-                    pp = _prompt_path(mode=mode)
-                    agent_prompt = pp.read_text(encoding="utf-8")
-                    # Replace kiro-cli references with claude code equivalents
-                    agent_prompt = agent_prompt.replace("kiro-cli", "claude code")
-                    agent_prompt = re.sub(r"\bKiro\b", "Claude", agent_prompt)
-                    agent_prompt = re.sub(r"\bkiro\b", "claude", agent_prompt)
-                    agent_prompt = agent_prompt.strip()
-                except Exception:
-                    agent_prompt = ""
-            elif is_custom:
-                agent_prompt = self._load_agent_prompt(
-                    agent or "", project, owner_template=(agent or "") if _private_owner else ""
+            agent_prompt = (
+                ""
+                if slim_resume
+                else self._resolve_agent_prompt(
+                    agent,
+                    project=project,
+                    mode=mode,
+                    session_key=session_key,
+                    is_cc=is_cc,
+                    private_owner=bool(_private_owner),
                 )
-            else:
-
-                try:
-                    pp = _prompt_path(mode=mode)
-                    logger.debug("Prompt selection: mode=%r → %s", mode, pp)
-                    agent_prompt = pp.read_text(encoding="utf-8")
-                except OSError:
-                    agent_prompt = ""
+            )
             if agent_prompt:
-                agent_prompt = self._resolve_prompt_templates(agent_prompt, session_key or "")
-                agent_prompt = self._substitute_bot_name(agent_prompt)
                 parts.append(
                     f"[AGENT SYSTEM PROMPT]\n{agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n"
                 )
@@ -4491,6 +4824,7 @@ class ContextBuilder:
                     project=project,
                     member=member,
                     execution_context=execution_context,
+                    steering_dirs=steering_dirs,
                     _v2_essentials=_essentials,
                 )
             if session_ctx:
@@ -4571,6 +4905,36 @@ class ContextBuilder:
                         + session_ctx
                         + "[END OF SESSION CONTEXT]\n\n"
                     )
+            # Folder-inherited steering: the ONE delivery seam for every
+            # provider. No is_cc / is_custom gate on purpose -- kiro-cli,
+            # Claude Code, Codex, KAS and any config-authored harness all
+            # receive this identically, because it is prompt text, not a
+            # launch document some hosts consume and others drop. Minted
+            # HERE, after the session-context scrub above, because its
+            # frame is in the scrub set: a `[FOLDER STEERING --` planted
+            # in a channel message, a memory line or a steering body is
+            # neutralized by that scrub (and by the renderer's own body
+            # scrub), while this genuine frame is the only one that
+            # survives. Member chats carry it inside the essentials
+            # envelope instead; minimal/slim runs never carried it.
+            if (
+                steering_dirs
+                and not _essentials
+                and not (minimal_context or slim_resume)
+                and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
+            ):
+                _caps_fs = _resolve_caps(model_window)
+                _folder_ctx = _render_folder_steering_section(
+                    steering_dirs,
+                    project,
+                    _caps_fs.steering,
+                    skip_delivered_roots=_project_steering_delivered(
+                        provider_type,
+                        context_provider is not None and context_provider.native_steering,
+                    ),
+                )
+                if _folder_ctx:
+                    parts.append(_folder_ctx + "\n\n")
             # Mint trusted reply-style framing only after the session-context
             # payload has been scrubbed. Its own markers are intentionally in the
             # scrub set, so placing it inside ``session_ctx`` would erase it.
@@ -4626,7 +4990,29 @@ class ContextBuilder:
         # mapping excludes and an unmapped custom agent cannot receive a block
         # its session-start context never contained.
         if not is_new_session and needs_reinjection:
-            if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_MEMORY):
+            # The managed spec prompt is a stub pointing at this block, so a
+            # compaction that drops it leaves the session with no contract.
+            # Trusted content (managed contract or the user's own persona),
+            # so no marker scrub — the session-start path applies none either.
+            _agent_prompt = self._resolve_agent_prompt(
+                agent,
+                project=project,
+                mode=mode,
+                session_key=session_key,
+                is_cc=is_cc,
+                private_owner=bool(_private_owner),
+            )
+            if _agent_prompt:
+                parts.append(
+                    f"[AGENT SYSTEM PROMPT]\n{_agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n"
+                )
+            # The stored-memory half routes through the same config intersection
+            # as the session-start build: this path restores a block that build
+            # withheld, so reading the caller scope alone would hand back the
+            # activity index the operator's inject_memory setting excluded.
+            if not blocks_reads and _group_included(
+                _config_scoped_groups(context_groups), CONTEXT_GROUP_MEMORY
+            ):
                 memory = self.get_memory_for(workspace, memory_store)
                 parts.append(_neutralize_structural_markers(memory.activity_index()))
                 parts.append(
@@ -4674,6 +5060,34 @@ class ContextBuilder:
             )
             if _prefs:
                 parts.append("[REINJECTED AFTER COMPACTION — response preferences]\n" + _prefs)
+            # Folder steering is session-start context too, and unlike kiro's
+            # native project steering it has no host-side persistence across a
+            # compaction -- it was prompt text, and the compaction dropped it.
+            # Re-read the CURRENT folder documents (a folder edit lands here as
+            # well). Member chats re-receive the essentials envelope on every
+            # non-fresh turn above, so they need no separate block. The payload
+            # is operator-authored files; the renderer scrubs their bodies and
+            # labels before minting the genuine frame.
+            if steering_dirs and not _essentials:
+                _caps_fs = _resolve_caps(model_window)
+                _folder_ctx = _render_folder_steering_section(
+                    steering_dirs,
+                    project,
+                    _caps_fs.steering,
+                    skip_delivered_roots=_project_steering_delivered(
+                        provider_type,
+                        context_provider is not None and context_provider.native_steering,
+                    ),
+                )
+                if _folder_ctx:
+                    # Bodies were scrubbed inside the renderer; the frame it
+                    # minted is in the scrub set, so it must NOT pass through
+                    # _neutralize_structural_markers again here.
+                    parts.append(
+                        "[REINJECTED AFTER COMPACTION — folder steering]\n"
+                        + _folder_ctx
+                        + "\n[END REINJECTED]\n\n"
+                    )
             # Member identity is session-start context too, so a compaction
             # dropped it along with the skills index: without this, the next
             # turn of a member DM thread runs with no identity, no working

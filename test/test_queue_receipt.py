@@ -167,7 +167,9 @@ class TestRatchet:
             names = {
                 node.attr
                 for node in ast.walk(tree)
-                if isinstance(node, ast.Attribute) and node.attr in {
+                if isinstance(node, ast.Attribute)
+                and node.attr
+                in {
                     "_queue_receipts",
                     "_receipt_lock",
                 }
@@ -185,6 +187,4 @@ class TestRatchet:
             src = path.read_text(encoding="utf-8")
             if "_enqueue_with_receipt" in src and "ReceiptQueue" not in src:
                 missing.append(path.parent.name)
-        assert not missing, (
-            f"{missing} implement a mid-turn queue without the shared ReceiptQueue"
-        )
+        assert not missing, f"{missing} implement a mid-turn queue without the shared ReceiptQueue"

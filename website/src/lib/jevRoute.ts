@@ -13,9 +13,14 @@
  *  - `decisions_enabled` on `GET /api/dashboard/config` is the FLEET's answer
  *    (`capabilities.decisions`, resolved server-side). Fail closed on `=== true`:
  *    an absent field is an older gateway or a read that has not landed.
- *  - `enabled` on `GET /api/decisions/consent` is the OWNER's answer, the keystone.
- *    Offering the row without it would put a paid third-party call one click away
- *    from a user who never consented to one.
+ *  - `permits` on `GET /api/decisions/consent` is the OWNER's answer as the GATE
+ *    will read it. Strictly stronger than the keystone's `enabled`, and that
+ *    difference is the whole reason it is the field used: `permits` additionally
+ *    holds the consented endpoint against the one config names NOW, and folds in
+ *    the governance denial. Consent recorded for one provider address while
+ *    `provider.endpoint` names another is a refusal at the gate, so a surface
+ *    reading `enabled` alone offers a control that routes nothing and a chip that
+ *    claims a routed turn the backend declined.
  *
  *  Neither read is an enforcement point — the gate re-checks both, and a request
  *  carrying the sentinel against an unconsented keystone simply routes nothing —
@@ -29,6 +34,22 @@
  *  `dashboard/chat_handlers.py`, which is the only reader. */
 export const JEV_ROUTE_MODEL = 'auto:jev'
 
+/** Whether a slot names no model, i.e. Jev's to pick when the preview is on.
+ *
+ *  Mirrors `_JEV_ROUTE_AUTO_MODELS` in `dashboard/chat_runner.py`, which is the
+ *  gate that actually routes: `auto` is the picker's inherit spelling and `''` is
+ *  what a freshly dispatched slot carries, and both mean the same thing here.
+ *
+ *  Takes the slot's RAW `model`, never the composer's displayed one: the display
+ *  value substitutes the backend's served id for an inheriting slot, so it is
+ *  almost never `auto` and a chip keyed off it would claim every routed turn was
+ *  pinned. Stripped and lower-cased for the same reason the gate is.
+ */
+export function isUnpinnedModel(model: string | undefined): boolean {
+  const named = (model || '').trim().toLowerCase()
+  return named === '' || named === 'auto'
+}
+
 /** Whether the picker may offer the row at all.
  *
  *  `hasSlot` is the third required answer and it is not cosmetic: a pick made
@@ -39,11 +60,11 @@ export const JEV_ROUTE_MODEL = 'auto:jev'
  */
 export function jevRouteOffered(
   dashboardConfig: { decisions_enabled?: boolean } | undefined,
-  consent: { enabled?: boolean } | undefined,
+  consent: { permits?: boolean } | undefined,
   hasSlot: boolean,
 ): boolean {
   return (
-    dashboardConfig?.decisions_enabled === true && consent?.enabled === true && hasSlot === true
+    dashboardConfig?.decisions_enabled === true && consent?.permits === true && hasSlot === true
   )
 }
 

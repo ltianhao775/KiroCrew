@@ -53,7 +53,11 @@ from kiro_crew.config.paths import data_home
 from kiro_crew.deploy import engine
 from kiro_crew.deploy.engine import AWSError, _checked, _harden_bucket
 from kiro_crew.platform_compat import is_link_or_junction
-from kiro_crew.sandbox import crew_home_visible_spellings
+from kiro_crew.sandbox import (
+    carveout_shadowed_by_foreign_mask,
+    crew_home_visible_spellings,
+    effective_sandbox_mode,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -86,6 +90,19 @@ PRESIGN_MAX_SECS = 7 * 24 * 3600
 #: segment, no leading slash, bounded length. S3 allows far more; the drive
 #: does not need to.
 _KEY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()+@=-]{0,254}$")
+
+#: Version ids are OPAQUE: S3 documents them as URL-ready strings with no internal
+#: structure, and the ids it mints draw on the full base64 alphabet, so ``+``, ``/``
+#: and ``=`` all occur in real ones. This admits any printable ASCII without
+#: whitespace; the one character that cannot lead is handled separately in
+#: :func:`validate_version_id`, so each rule states its own reason. Length is bounded
+#: by :data:`_MAX_VERSION_ID_LEN` so one number governs it.
+#:
+#: Applied with ``fullmatch`` and carrying no anchors, because ``$`` also matches
+#: BEFORE a trailing newline: anchored with ``$`` this pattern accepts ``"abc\n"``
+#: and sends a whitespace-bearing id to the CLI, which is the one thing it exists to
+#: prevent.
+_VERSION_ID_RE = re.compile(r"[\x21-\x7e]+")
 _MAX_KEY_LEN = 900
 
 
@@ -103,6 +120,66 @@ def validate_key(key: str) -> Optional[str]:
                 "key segments must start alphanumeric and use only letters, "
                 "digits, spaces, and ._()+@=- (max 255 chars each)"
             )
+    return None
+
+
+def validate_version_id(value: Any) -> Optional[str]:
+    """Return an error string when ``value`` cannot be passed as a ``--version-id``.
+
+    This is a question about SYNTAX, not about identity. Whether a syntactically
+    valid id names bytes this install can claim is a different question, decided by
+    the caller against its own upload record -- ``backup._is_provable_version_id``
+    is the one that rejects ``"null"``, which is well-formed here and names a
+    version SLOT rather than one version. Two checks because they are two
+    questions; one of them passing says nothing about the other.
+
+    What makes the syntax check load-bearing is where the value lands.
+    :func:`get_file` passes it as its own argv element directly after
+    ``--version-id``, and that is the first place in this module a version id
+    becomes a bare argument rather than a field inside a JSON document (the delete
+    path puts it in ``{"Key": ..., "VersionId": ...}``, where nothing can read it
+    as anything else). There is no shell involved -- ``engine.run_aws`` spawns a
+    fixed argv -- so this is not about shell metacharacters, which an argv list
+    already neutralises. It is about the AWS CLI's OWN option grammar: its parser
+    reads a leading ``-`` as the start of another option, so a stored id of
+    ``--profile`` would silently repoint the call instead of naming a version.
+    Refusing a leading ``-`` is what closes that, and a quoted argv cannot.
+
+    The id arrives from ``backup.json``, which is local state this install wrote and
+    which is NOT agent-writable: ``apps/aws-control/data`` sits behind the agent
+    file-tool floor (``security._CREW_SECRET_LEAVES``) and is bind-masked from every
+    agent sandbox (``sandbox._CREW_HIDDEN_LEAVES``). So this check is not standing
+    between an agent and the CLI. It is here because the value crosses into an argv
+    element where a leading ``-`` changes what the command MEANS, and a stored id is
+    read back long after it was written, by which time a truncated or partially
+    rewritten file is the ordinary way it goes wrong.
+
+    The shape is as WIDE as S3's own contract and no wider. Version ids are opaque
+    URL-ready strings drawn from the full base64 alphabet, so ``+``, ``/`` and ``=``
+    all appear in real ones and a narrower alphabet would refuse the recovery read
+    for genuine ids -- silently turning this whole path back into the refusal it
+    exists to avoid. Printable ASCII without whitespace is the bound, because a
+    control character or a newline is not something S3 mints and has no business
+    reaching a log line or an argv element. Everything past the first character is
+    inert as argv data, so the leading ``-`` is the entire security question and it
+    gets its own check below.
+    """
+    if not isinstance(value, str) or not value:
+        return "version id must be a non-empty string"
+    # Reuses the module's existing ceiling rather than restating a number in the
+    # pattern, so there is exactly one value to change. `_MAX_VERSION_ID_LEN` is
+    # defined further down this module, beside the row-length bounds its other two
+    # callers use; a module-level name is resolved when this runs, not when it is
+    # defined, so reading it from above is fine.
+    if len(value) > _MAX_VERSION_ID_LEN:
+        return f"version id must be at most {_MAX_VERSION_ID_LEN} characters"
+    # Its own check rather than a clause in the pattern, because it is the one rule
+    # here that is about safety rather than about shape, and a reader should not
+    # have to decode a character class to find it.
+    if value.startswith("-"):
+        return "version id must not start with '-'"
+    if not _VERSION_ID_RE.fullmatch(value):
+        return "version id must be printable ASCII with no spaces"
     return None
 
 
@@ -625,6 +702,7 @@ def get_file(
     dest_path: str,
     *,
     account: str,
+    version: str = "",
     timeout: int = 600,
 ) -> None:
     """Download ``section/key`` to a local path, pinned to the bucket's owner.
@@ -633,21 +711,64 @@ def get_file(
     account currently holds that bucket name. On the read side the damage is
     inverted -- a restore would write a stranger's bytes into the owner's session
     directory -- so the same guard applies.
+
+    ``version`` pins the read to ONE stored version instead of whatever is current
+    at that name. Empty -- the default, and what every pre-existing caller passes by
+    saying nothing -- keeps the current-version read byte for byte, so this widens
+    the primitive without moving any caller that does not ask.
+
+    Naming a version is the read-side half of the argument :func:`put_file` makes
+    about recording one. A key is a NAME, the drive is reachable by more than one
+    install by design, and versioning is on for exactly that reason: a co-writer
+    overwriting a recorded key leaves this install's bytes behind as a noncurrent
+    version. Without this parameter those bytes are on the drive and no code path
+    can ask for them, which is the gap this closes
+    (``backup.restore_download``). The owner pin stays on the pinned read for the
+    same reason it is on the unpinned one -- a version id is meaningless in the
+    wrong account, and pinning the version is not a substitute for pinning who
+    answers.
+
+    The id is validated rather than trusted (:func:`validate_version_id`), and
+    raises :class:`ValueError` rather than reaching the CLI: it travels as its own
+    argv element after ``--version-id``, where a leading ``-`` would be read as
+    another option. A caller holding an id it cannot vouch for should check it
+    first and decide what to do, rather than letting this raise -- the restore path
+    does, because for it an unusable recorded id is a refusal to report, not an
+    error to surface.
+
+    ``dest_path`` stays LAST in the argv: ``s3api get-object`` takes the output file
+    positionally, so an option inserted after it would not be read as an option.
     """
+    args = [
+        "s3api",
+        "get-object",
+        "--bucket",
+        bucket,
+        "--key",
+        section_key(section, key),
+    ]
+    if version:
+        err = validate_version_id(version)
+        if err:
+            # Deliberately not folded into an AWSError: nothing has been asked of
+            # AWS yet, and reporting a local state problem as a service failure
+            # would send a reader to the wrong place.
+            raise ValueError(f"refusing to fetch by version id: {err}")
+        args += ["--version-id", version]
+    args += [
+        "--expected-bucket-owner",
+        account,
+        dest_path,
+    ]
     _checked(
-        [
-            "s3api",
-            "get-object",
-            "--bucket",
-            bucket,
-            "--key",
-            section_key(section, key),
-            "--expected-bucket-owner",
-            account,
-            dest_path,
-        ],
+        args,
         profile,
-        action="s3:GetObject",
+        # A version-pinned GetObject is authorized against `s3:GetObjectVersion`,
+        # a DIFFERENT action from `s3:GetObject`. `_checked` renders the action
+        # name as the remediation hint on AccessDenied, so reporting the
+        # unversioned one here sends the reader to add a permission they already
+        # hold and be denied again.
+        action="s3:GetObjectVersion" if version else "s3:GetObject",
         timeout=timeout,
     )
 
@@ -755,6 +876,18 @@ def get_object_head_bytes(
     over the staged file, and the CLI reports ``ENOENT`` on a path the gateway
     just created.
 
+    Each spelling's staging ROOT is checked before the spawn
+    (:func:`sandbox.carveout_shadowed_by_foreign_mask`). That root is the mask
+    entry the lift cancels, so the guard's equality rule exempts it and only
+    some OTHER masked ancestor refuses — a data home relocated beneath one
+    (``KIROCREW_HOME`` under ``~/.gnupg``) would hand this child that whole tree,
+    so the transfer is refused instead of run. One shadowed spelling refuses the
+    call: the CLI needs every spelling, not a surviving subset. The check is
+    skipped only where no mask can exist for reasons that cannot change before
+    the spawn — a non-POSIX host, or an ``off`` tier — never on the backend probe,
+    whose transient failures are uncached by design and would otherwise skip the
+    refusal for a spawn that still applies the lift.
+
     The mask is a Linux/macOS mechanism; Windows has no sandbox, so there the
     destination is pinned by IDENTITY instead of by hiding, and the pin covers
     the whole path, not just the file. The staging root and then the per-call
@@ -791,6 +924,27 @@ def get_object_head_bytes(
             platform_compat.chmod_safe(tmp_dir, 0o700)
         else:
             platform_compat.restrict_dir_to_owner(tmp_dir)
+        staging_spellings = crew_home_visible_spellings(tmp_dir)
+        # Skipped only where no mask can exist, and only on facts that cannot
+        # flip between here and the spawn: a non-POSIX host has no sandbox
+        # backend at all, and an "off" tier makes ``wrap_argv`` ignore
+        # ``extra_visible_dirs`` outright. Deliberately NOT the backend probe:
+        # ``detect_backend`` leaves a TRANSIENT "none" uncached on purpose, so a
+        # momentary fork failure asked here would skip the refusal while the
+        # spawn's own re-probe still applies the lift. A permanent no-backend
+        # POSIX host therefore pays a refused preview instead, which is the
+        # direction every other rule on this path already fails in.
+        if platform_compat.IS_POSIX and effective_sandbox_mode("standard") != "off":
+            for spelling in staging_spellings:
+                # Asked of the staging ROOT, which is the mask entry this lift
+                # cancels and therefore equality-exempt, so only some OTHER masked
+                # ancestor refuses. Asking about the per-call dir would refuse on
+                # every layout.
+                if carveout_shadowed_by_foreign_mask(os.path.dirname(spelling), mode="standard"):
+                    raise ValueError(
+                        "preview staging sits beneath an independently masked "
+                        "directory; carving it out for the CLI would unmask that tree"
+                    )
         tmp_path = os.path.join(tmp_dir, "object")
         # Ours, exclusively, before the CLI ever sees the name. A pre-planted
         # entry of any kind fails the create instead of becoming the target.
@@ -828,7 +982,7 @@ def get_object_head_bytes(
                 profile,
                 action="s3:GetObject",
                 timeout=60,
-                extra_visible_dirs=crew_home_visible_spellings(tmp_dir),
+                extra_visible_dirs=staging_spellings,
             )
         except AWSError as exc:
             # A byte range is unsatisfiable against a 0-byte object, and S3
@@ -1084,10 +1238,14 @@ _VERSION_PAGE_ITEMS = 1000
 _VERSION_ROWS_MAX = 10 * _DELETE_BATCH_MAX
 
 #: S3's own ceiling for a version id. A longer value cannot name a real version.
-#: Paired with :data:`_MAX_KEY_LEN` and :data:`_MAX_MODIFIED_LEN` it bounds every
-#: unbounded-length field a row retains, and none is ever shortened to fit: a
-#: truncated key or version id names a DIFFERENT object, so an over-long row is
-#: dropped instead of trimmed.
+#: Two readers share it. For a retained row it pairs with :data:`_MAX_KEY_LEN` and
+#: :data:`_MAX_MODIFIED_LEN` to bound the row's unbounded-length fields, and none is
+#: ever shortened to fit: a truncated key or version id names a DIFFERENT object, so
+#: an over-long row is dropped instead of trimmed. :func:`validate_version_id`
+#: applies the same ceiling on the way OUT, to an id this install recorded earlier
+#: and is about to pass to the CLI. It is one fact about S3 in both places, so it is
+#: one number; the row-shape pairing above describes rows alone and does not
+#: enumerate the callers.
 _MAX_VERSION_ID_LEN = 1024
 
 #: The third retained variable-length field. An ISO-8601 instant needs about 25

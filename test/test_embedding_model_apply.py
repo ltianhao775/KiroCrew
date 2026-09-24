@@ -385,6 +385,10 @@ class TestNonObjectJsonBody:
     def _request(self, payload):
         class _Req:
             headers: dict = {}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def __init__(self, p):
                 self._p = p

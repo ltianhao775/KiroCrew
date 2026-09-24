@@ -10,9 +10,22 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp.test_utils import make_mocked_request
 
+from kiro_crew.dashboard.handlers import files as files_mod
 from kiro_crew.dashboard.handlers.files import api_file_diff
+from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.security.redaction import redact_credentials
 
 requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+
+# A documented placeholder, not a real credential: the redactor matches it anyway.
+PLACEHOLDER = "lp_your_token_here"
+BEARER_LINE = '"Authorization": "Bearer ' + PLACEHOLDER + '"'
+# `redact` composes credential redaction with exfiltration-URL redaction, so the
+# tests pin one fixture per pass; a fixture both passes match could not tell which
+# one is still wired up. A long opaque query is the discriminator: the exfil pass
+# masks it and the credential pass leaves it alone. A bare URL is not -- that pass
+# masks a URL only when it carries an exfil signal.
+EXFIL_URL = "https://collect.example.com/p?d=" + "A" * 900
 
 
 def _req(path: str = "") -> make_mocked_request:
@@ -383,3 +396,123 @@ async def test_sel_audit_logging_on_success(tmp_path):
     call_kwargs = mock_sel.log_api_access.call_args
     assert call_kwargs[1]["operation"] == "file_diff"
     assert call_kwargs[1]["outcome"] == "allowed"
+
+
+def _git_repo(tmp_path):
+    """Initialise a committable git repo in *tmp_path*."""
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True)
+
+
+def _credential_line(text: str) -> str:
+    """The single line of *text* mentioning the bearer header."""
+    return next(line for line in text.splitlines() if "Authorization" in line or "REDACTED" in line)
+
+
+@pytest.mark.asyncio
+@requires_git
+async def test_head_content_is_redacted_like_the_panel_buffer(tmp_path):
+    """An unchanged credential line must not render as a diff hunk.
+
+    The file panel's diff view puts ``api_file_read``'s already-redacted buffer
+    beside this endpoint's ``original`` and diffs the two strings itself. Serving
+    HEAD raw therefore invents a hunk on a line nobody touched, and leaks a
+    secret committed in HEAD that ``/api/file-read`` masks.
+    """
+    _git_repo(tmp_path)
+    f = tmp_path / "config.json"
+    f.write_text(BEARER_LINE + "\nkeep\n")
+    subprocess.run(["git", "add", "config.json"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+    # Edit an unrelated line, which is what opens the panel's diff view.
+    f.write_text(BEARER_LINE + "\nchanged\n")
+
+    with patch("kiro_crew.dashboard.handlers.files._sel", return_value=_mock_sel()):
+        resp = await api_file_diff(_req(str(f)))
+    body = json.loads(resp.body)
+
+    assert body["status"] == "modified"
+    assert PLACEHOLDER not in body["original"]
+    assert "[REDACTED: credential]" in body["original"]
+    # Both panes agree on the untouched line, so it renders as unchanged.
+    assert _credential_line(body["original"]) == _credential_line(redact(f.read_text()))
+
+
+@pytest.mark.asyncio
+@requires_git
+async def test_untracked_diff_is_redacted(tmp_path):
+    """The untracked branch's ``diff`` is the whole file, so it is redacted too."""
+    _git_repo(tmp_path)
+    (tmp_path / "init.txt").write_text("x")
+    subprocess.run(["git", "add", "init.txt"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+    f = tmp_path / "new.json"
+    f.write_text(BEARER_LINE + "\n")
+
+    with patch("kiro_crew.dashboard.handlers.files._sel", return_value=_mock_sel()):
+        resp = await api_file_diff(_req(str(f)))
+    body = json.loads(resp.body)
+
+    assert body["status"] == "untracked"
+    assert PLACEHOLDER not in body["diff"]
+    assert "[REDACTED: credential]" in body["diff"]
+
+
+@pytest.mark.asyncio
+@requires_git
+async def test_exfiltration_url_is_redacted_in_both_fields(tmp_path):
+    """The exfiltration-URL pass is wired up on both fields, not just credentials.
+
+    Both fields go through one `redact` shim that composes two passes. A
+    bearer-only fixture cannot tell them apart, so either field could regress to
+    credential-only while a URL an agent could be steered into leaked through.
+    """
+    _git_repo(tmp_path)
+    f = tmp_path / "notes.md"
+    f.write_text(EXFIL_URL + "\nkeep\n")
+    subprocess.run(["git", "add", "notes.md"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+    f.write_text(EXFIL_URL + "\nchanged\n")
+
+    with patch("kiro_crew.dashboard.handlers.files._sel", return_value=_mock_sel()):
+        resp = await api_file_diff(_req(str(f)))
+    body = json.loads(resp.body)
+
+    assert body["status"] == "modified"
+    assert EXFIL_URL not in body["original"]
+    assert EXFIL_URL not in body["diff"]
+    assert "[REDACTED: suspicious URL to collect.example.com]" in body["original"]
+    # This fixture is a discriminator only while the credential pass ignores it.
+    assert redact_credentials(EXFIL_URL)[0] == EXFIL_URL
+
+
+@pytest.mark.asyncio
+@requires_git
+async def test_a_credential_straddling_the_read_cap_is_still_masked(tmp_path):
+    """Neither field may be truncated before the redaction pass.
+
+    Slicing first cuts the tail a credential pattern needs to match, and the
+    surviving prefix is then served as real bytes. The offset is arrangeable by
+    whoever writes the file, so this pins the ordering rather than the cap: the
+    pass sees whole text, and truncating afterwards is the only safe order.
+    """
+    _git_repo(tmp_path)
+    f = tmp_path / "padded.txt"
+    # Places the token across the byte offset the sibling endpoint caps at.
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    padding = "a" * (files_mod._FILE_READ_CAP - 10)
+    f.write_text(padding + secret + "\nkeep\n")
+    subprocess.run(["git", "add", "padded.txt"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+    f.write_text(padding + secret + "\nchanged\n")
+
+    with patch("kiro_crew.dashboard.handlers.files._sel", return_value=_mock_sel()):
+        resp = await api_file_diff(_req(str(f)))
+    body = json.loads(resp.body)
+
+    assert body["status"] == "modified"
+    # Neither the whole token nor a prefix of it long enough to be the secret.
+    assert secret not in body["original"]
+    assert secret[:14] not in body["original"]
+    assert "[REDACTED: credential]" in body["original"]

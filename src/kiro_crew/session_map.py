@@ -58,11 +58,59 @@ def _kiro_sessions_dir() -> Path:
     return _KIRO_SESSIONS_DIR if _KIRO_SESSIONS_DIR is not None else kiro_sessions_dir()
 
 
+#: Below this many bytes a kiro-cli session's ``.jsonl`` holds no turn: the
+#: conversation exists on disk but ``session/load`` has nothing to restore, so
+#: :meth:`SessionMap.get` prunes the mapping rather than resume it. The ONE
+#: definition of that bar, read only through :func:`_jsonl_holds_a_turn` -- by
+#: :meth:`SessionMap.get`, which prunes on it, and by
+#: :func:`session_files_resumable`, the whole-rule predicate a reader outside
+#: this module asks -- so the two cannot drift.
+_RESUMABLE_JSONL_MIN_BYTES = 10
+
+
+def _jsonl_holds_a_turn(sessions_dir: Path, sid: str) -> bool:
+    try:
+        size = (sessions_dir / f"{sid}.jsonl").stat().st_size
+    except FileNotFoundError:
+        size = 0
+    return size >= _RESUMABLE_JSONL_MIN_BYTES
+
+
+def session_files_resumable(sid: str, provider: str = "") -> bool:
+    """Whether *sid*'s on-disk files still let ``session/load`` resume it.
+
+    The same rule :meth:`SessionMap.get` applies before it hands a sid out, in
+    one place so a second reader cannot drift from it. Only kiro-cli keeps
+    transcripts at a flat path this process can stat -- the ``{sid}.json``
+    present and the ``{sid}.jsonl`` holding at least one turn. For every other
+    backend the sid's validity is decided by ``session/load`` itself, so this
+    answers True and leaves the typed refusal to the resume. An absent
+    provider label means kiro-cli.
+    """
+    if (provider or PROVIDER_LABEL_DEFAULT) != PROVIDER_LABEL_DEFAULT:
+        return True
+    if not sid:
+        return False
+    sessions_dir = _kiro_sessions_dir()
+    return (sessions_dir / f"{sid}.json").exists() and _jsonl_holds_a_turn(sessions_dir, sid)
+
+
 # Per-conversation flag recording a refusal of automatic origin mirroring. Named
 # here rather than at the caller because it is an ON-DISK contract: the map
 # persists it, so renaming the literal would silently re-enable mirroring for
 # every conversation that had already turned it off.
 MIRROR_OPT_OUT_FLAG = "mirror_opt_out"
+
+#: Set on a conversation whose owning app was uninstalled: its next cold start must
+#: start EMPTY. Clearing the sid alone stops the native resume and not the replay —
+#: the transcript stays on disk by design, so ``build_session_replay`` would inject
+#: the removed app's history into the first turn of the next installation under the
+#: same slot key, which is the bug the pointer drop exists to prevent. Persisted
+#: rather than in-memory because the two writers are different processes (the
+#: gateway-less CLI has no live manager) and because a gateway restart between the
+#: uninstall and the reinstall must not lose it. One-shot: consumed, and cleared as
+#: it is consumed, by the first cold start that honours it.
+SUPPRESS_REPLAY_FLAG = "suppress_replay"
 
 # Highest explicit DM generation acknowledged before its first provider turn.
 # Stored on the stable bucket entry so repeated /new commands cost one integer,
@@ -75,7 +123,15 @@ GENERATION_FLOOR_FIELD = "generation_floor"
 # the map carries forever, and every mutation rewrites the whole map. A flag
 # describing one session (Slack's ``temporary`` / ``incognito`` threads) must
 # stay collectable — one leaked row per such thread would grow without bound.
-_DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG})
+# ``SUPPRESS_REPLAY_FLAG`` is durable for the reason the paragraph above gives, not
+# as an exception to it: it is a decision about the key's NEXT cold start, written at
+# a moment when there is no session at all, and ``prune`` deletes a sid-less entry
+# that nothing holds back. Losing it there would lose it in precisely the case it
+# exists for — clear the pointer, restart the gateway, reinstall — so the flag would
+# be decorative. The "grows without bound" cost the paragraph warns about does not
+# apply: unlike a Slack ``temporary`` flag, this one is ONE-SHOT, so the row it keeps
+# alive is collectable again as soon as the first cold start consumes it.
+_DURABLE_FLAGS = frozenset({MIRROR_OPT_OUT_FLAG, SUPPRESS_REPLAY_FLAG})
 
 # How long a deferred flush waits before serializing, so a burst of mutations
 # (a subagent wave calling ``set`` once per spawn) collapses into one write
@@ -849,12 +905,7 @@ class SessionMap:
             return sid
         sessions_dir = _kiro_sessions_dir()
         if sid and (sessions_dir / f"{sid}.json").exists():
-            jsonl = sessions_dir / f"{sid}.jsonl"
-            try:
-                jsonl_size = jsonl.stat().st_size
-            except FileNotFoundError:
-                jsonl_size = 0
-            if jsonl_size < 10:
+            if not _jsonl_holds_a_turn(sessions_dir, sid):
                 logger.info("Session %s has empty JSONL — pruning stale entry for %s", sid, key)
                 self._repair_or_remove_stale(matched_key)
                 return None
@@ -1101,7 +1152,7 @@ class SessionMap:
         return entry.get("provider", "")
 
     @_guarded
-    def clear_sid(self, key: str) -> None:
+    def clear_sid(self, key: str) -> bool:
         """Clear the stored session ID without removing the entry.
 
         Used on provider switch (the SID is incompatible with the new
@@ -1109,10 +1160,18 @@ class SessionMap:
         is stashed as ``discarded_sid`` so the operation is diagnosable and
         manually reversible — the native conversation still exists on disk;
         only the pointer to it is dropped.
+
+        Returns whether a pointer was actually dropped, so a caller clearing a
+        SET of keys can report how many conversations it orphaned without a
+        second lookup. ``get`` is the wrong probe for that: it gates on the
+        transcript file existing and prunes stale entries as a side effect, so
+        it answers "is this resumable" rather than "is a pointer recorded".
         """
         entry = self._data.get(canonical_key(key))
         if entry and _stash_and_clear_sid(entry):
             self._save()
+            return True
+        return False
 
     def get_discarded_sid(self, key: str) -> str:
         """Return the last sid dropped from *key* by any path, or ''.

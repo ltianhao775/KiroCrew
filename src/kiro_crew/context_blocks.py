@@ -364,6 +364,31 @@ def split_blocks(
     return {label: size for label, size in out.items() if size > 0}
 
 
+def _block_domain(label: str) -> str:
+    """Group one assembled block by what the provider is being asked to do with it.
+
+    Five domains: the user's own turn is a ``request``, the two instruction
+    blocks are a ``contract``, the three replayed-turn blocks are ``replay``,
+    and the reply-format rules are a ``following_interaction``. Everything else
+    is ``background`` — that is most of ``_MARKERS``, plus the
+    ``UNCLASSIFIED_LABEL`` remainder ``split_blocks`` emits for bytes it could
+    not attribute, so a growing ``background`` share says nothing on its own
+    about which block grew.
+
+    The four named cases are mutually exclusive, so the check order is for
+    reading only and carries no precedence.
+    """
+    if label == USER_LABEL:
+        return "request"
+    if label in {"agent_instructions", "critical_rules"}:
+        return "contract"
+    if label in {"conversation_replay", "thread_history", "history_prefix"}:
+        return "replay"
+    if label == REPLY_FORMAT_LABEL:
+        return "following_interaction"
+    return "background"
+
+
 def measure_prompt(prompt: str, *, user_span: tuple[int, int], lifecycle: str) -> dict:
     """Exact Crew-assembled extents, not provider input or token estimates.
 
@@ -382,23 +407,7 @@ def measure_prompt(prompt: str, *, user_span: tuple[int, int], lifecycle: str) -
             label: {
                 "chars": count,
                 "bytes": byte_counts[label],
-                "domain": (
-                    "request"
-                    if label == USER_LABEL
-                    else (
-                        "contract"
-                        if label in {"agent_instructions", "critical_rules"}
-                        else (
-                            "replay"
-                            if label in {"conversation_replay", "thread_history", "history_prefix"}
-                            else (
-                                "following_interaction"
-                                if label == REPLY_FORMAT_LABEL
-                                else "background"
-                            )
-                        )
-                    )
-                ),
+                "domain": _block_domain(label),
             }
             for label, count in chars.items()
         },

@@ -107,6 +107,23 @@ class Settings:
     # stack. It closes the case that rule cannot see: an image run by any other path.
     single_principal: bool = False
 
+    # How many seconds this task may run before the supervisor stops it, where zero
+    # means unbounded.
+    #
+    # Absent reads as zero, so a launch path that says nothing about lifetime behaves
+    # exactly as it does without this setting: the task runs until something outside
+    # stops it. The launcher derives the value from the same bound its own launch-time
+    # sweep enforces, which is why there is one number and not two to keep in step.
+    #
+    # It exists because a Fargate task is unattended. A sweep driven by a launch cannot
+    # reach a cluster whose last launch has already happened, so a deadline the task
+    # carries itself is the only one that still holds with no further launch, no
+    # scheduler, and the owner's gateway switched off.
+    #
+    # Carries a default for the same reason `bundle_dir` does: several tests build
+    # Settings by hand.
+    task_ttl_seconds: int = 0
+
     @property
     def backend_base_url(self) -> str:
         return f"http://{BACKEND_HOST}:{self.backend_port}"
@@ -169,6 +186,30 @@ def _bool(name: str, default: bool) -> bool:
         "single principal, which decides whether one caller's turns may share a "
         "conversation slot with another's."
     )
+
+
+def parse_task_ttl_seconds(name: str) -> int:
+    """Seconds a task may run, where zero means unbounded and a negative is REFUSED.
+
+    Absent, empty and ``0`` all read as unbounded, so a launch path that says
+    nothing about lifetime gets the behaviour it gets without this setting at all.
+
+    A negative value is refused rather than repaired, on the same ground as
+    ``_bool``: it is not a shorter life. A deadline already in the past stops the
+    task in its first wait, and the supervisor treats a lifetime stop as an
+    ORDERLY one, so a task that did no work at all would report a clean shutdown.
+    The launcher derives this value and the request builder refuses a caller who
+    names it, so a negative arriving here says the launcher is wrong rather than
+    that an operator mistyped, and a refusal at startup is how that gets seen.
+    """
+    value = _int(name, 0)
+    if value < 0:
+        raise ConfigError(
+            f"{name} must be zero or more seconds, got {value}. Zero means unbounded. "
+            "A negative deadline is already past, so the task would stop in its first "
+            "wait and report that as an orderly shutdown."
+        )
+    return value
 
 
 def parse_route_prefix(raw: str | None) -> str:
@@ -251,4 +292,9 @@ def load() -> Settings:
         # The crew bundle in the image. Defaults to the real path; a test points
         # SMC_BUNDLE_DIR at a fixture. Never defaulted to a temp dir (see field).
         bundle_dir=_path("SMC_BUNDLE_DIR", "/app/crew-bundle"),
+        # Derived by the launcher from the same bound its launch-time sweep enforces,
+        # never operator-supplied: the request builder refuses a caller who names it.
+        # Absent or zero means unbounded, so a launch that says nothing about lifetime
+        # behaves as it does without this setting.
+        task_ttl_seconds=parse_task_ttl_seconds("SMC_TASK_TTL_SECONDS"),
     )

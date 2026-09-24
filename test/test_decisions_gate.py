@@ -31,6 +31,7 @@ from kiro_crew.config.sections import (
     DECISION_PROVIDER_ENDPOINT_DEFAULT,
     DecisionProviderConfig,
     DecisionsConfig,
+    NudgeWakeConfig,
 )
 from kiro_crew.decisions import consent as consent_mod
 from kiro_crew.decisions import gate as gate_mod
@@ -61,7 +62,12 @@ QUESTIONS = [Choice(id="verdict", prompt="Which skill?", options=["NONE", "DUP"]
 
 
 def _config(
-    *, bucket: int = 100, timeout_ms: int = 1000, endpoint: str = "", model: str | None = None
+    *,
+    bucket: int = 100,
+    timeout_ms: int = 1000,
+    endpoint: str = "",
+    model: str | None = None,
+    judge_provider: str | None = None,
 ):
     """A config object shaped like the one ``decide`` reads off the live snapshot.
 
@@ -71,6 +77,9 @@ def _config(
     it is the keystone, patched by the ``consent`` fixture. An empty *endpoint*
     keeps the dataclass default, which is the one the fixture consents to; a
     ``None`` *model* keeps the dataclass default too.
+
+    *judge_provider* selects which lane serves :data:`gate.JUDGE_POINT`, whose
+    authority is a lane rather than a scope. ``None`` keeps the dataclass default.
     """
     kwargs: dict = {"timeout_ms": timeout_ms}
     if endpoint:
@@ -78,7 +87,10 @@ def _config(
     if model is not None:
         kwargs["model"] = model
     provider = DecisionProviderConfig(**kwargs)
-    return SimpleNamespace(decisions=DecisionsConfig(bucket=bucket, provider=provider))
+    decisions_kwargs: dict = {"bucket": bucket, "provider": provider}
+    if judge_provider is not None:
+        decisions_kwargs["nudge_wake"] = NudgeWakeConfig(provider=judge_provider)
+    return SimpleNamespace(decisions=DecisionsConfig(**decisions_kwargs))
 
 
 @pytest.fixture(autouse=True)
@@ -583,6 +595,8 @@ class TestPointName:
             "message.steer",
             "model.route",
             "compaction.keep",
+            "memory.recall",
+            "nudge.wake",
         )
 
     @pytest.mark.parametrize("unknown", ["skills.dedupe", "cron.novelty", "", "skills.Select"])
@@ -601,15 +615,20 @@ class TestPointName:
     def test_every_shipped_name_is_admitted(self, install_impl, monkeypatch):
         """Each shipped point, given the egress scope its own request needs.
 
-        Two points carry a category the main switch never described, so consent alone
-        does not admit either -- ``tool.risk`` needs the keystone's ``tool_args``
-        scope and ``compaction.keep`` needs its ``compaction`` one. Both are granted
-        here rather than dropping those points from the loop, because "every shipped
-        name" is the claim and a loop that skipped one would stop making it.
+        Three points carry a category the main switch never described, so consent
+        alone does not admit any of them -- ``tool.risk`` needs the keystone's
+        ``tool_args`` scope, ``compaction.keep`` its ``compaction`` one and
+        ``memory.recall`` its ``memory_text`` one. All are granted here rather than
+        dropping those points from the loop, because "every shipped name" is the claim
+        and a loop that skipped one would stop making it.
+
+        Granted through the gate's own table rather than by naming the readers: a point
+        added with a fourth scope is then admitted by this loop automatically, so the
+        test keeps asserting what it says instead of silently narrowing to three.
         """
         install_impl(_RecordingOracle())
-        monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
-        monkeypatch.setattr(consent_mod, "consented_compaction", lambda *_a, **_kw: True)
+        for reader_name, _category in gate_mod._POINT_SCOPES.values():
+            monkeypatch.setattr(consent_mod, reader_name, lambda *_a, **_kw: True)
         for name in DECISION_POINT_NAMES:
             assert is_enabled(name, config=_config()) is True
 
@@ -635,6 +654,41 @@ class TestPointName:
         monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
         assert is_enabled("tool.risk", config=_config()) is True
         assert is_enabled("compaction.keep", config=_config()) is False
+
+    def test_the_memory_point_is_refused_without_its_own_scope(self, install_impl, monkeypatch):
+        """And neither scope beside it grants it.
+
+        A recalled memory is text the agent wrote down turns or days ago, which is not
+        what either other scope was reviewed as, so an install that granted both must
+        still be inert for ``memory.recall``.
+        """
+        install_impl(_RecordingOracle())
+        monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
+        monkeypatch.setattr(consent_mod, "consented_compaction", lambda *_a, **_kw: True)
+        assert is_enabled("tool.risk", config=_config()) is True
+        assert is_enabled("compaction.keep", config=_config()) is True
+        assert is_enabled("memory.recall", config=_config()) is False
+
+    def test_every_scoped_point_is_inert_on_a_keystone_recording_no_scope(self, install_impl):
+        """The state every install consented before the scopes existed is in.
+
+        Driven off the gate's own table so a point added with a new scope is covered
+        without this test being touched, and with NO point exempted: the assertion is
+        universal or it is not a ratchet.
+
+        :data:`gate.JUDGE_POINT` reaches it by pinning the lane whose authority IS the
+        scope. That point carries two lanes (``is_enabled`` resolves them through
+        ``_judge_authority``): the small-model lane needs no scope, so under the default
+        ``auto`` the point is authorized with nothing recorded, while the Jev lane sends
+        to a third party and needs this point's own scope. Pinning ``jev`` therefore asks
+        the question this ratchet exists to ask, and answers it for the same reason every
+        other row answers it.
+        """
+        install_impl(_RecordingOracle())
+        assert is_enabled("skills.select", config=_config()) is True
+        assert is_enabled("message.steer", config=_config()) is True
+        for name in gate_mod._POINT_SCOPES:
+            assert is_enabled(name, config=_config(judge_provider=gate_mod.LANE_JEV)) is False, name
 
 
 # ---------------------------------------------------------------------------

@@ -57,22 +57,44 @@ citation to follow.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Final
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
-from kiro_crew.crew_log.entry_types import SESSION_ENTRY_TYPES
+from kiro_crew.config.paths import data_home
+from kiro_crew.crew_log.entry_types import (
+    RADAR_CI_BOUNDS,
+    RADAR_CI_KEYS,
+    RADAR_CLEARABLE_FIELDS,
+    RADAR_CREW_LEVEL_EVENT_KIND,
+    RADAR_DEFAULT_SKIP_SCOPE,
+    RADAR_EDITING_PHASES,
+    RADAR_ENTRY_TYPE,
+    RADAR_EVENT_KINDS,
+    RADAR_LABELS_LIMIT,
+    RADAR_NUMBER_BOUNDS,
+    RADAR_PHASES,
+    RADAR_SKIP_SCOPES,
+    RADAR_TERMINAL_PHASES,
+    SESSION_ENTRY_TYPES,
+    WORK_ENTRY_TYPE,
+)
 from kiro_crew.crew_log.errors import CODE_BAD_DATA, CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION, Entry
 from kiro_crew.crew_log.store import (
     CrewLog,
+    log_exception_text,
     segment_paths,
+    session_units_by_slot,
     session_units_for_slot,
     unit_header_created_at,
 )
+from kiro_crew.projection import ProjectionRegistry, Savepoint, attribute_seq
 
 if TYPE_CHECKING:
     # Type-only: the savepoint module imports this one, so a runtime import here
@@ -83,6 +105,7 @@ if TYPE_CHECKING:
 # which event kinds exist, how much of each field is kept -- belong to the ledger
 # subsystem. They are imported rather than restated so one owner sets them, the
 # same direction ``store`` already takes for the store-name fold.
+from kiro_crew import session_ledger
 from kiro_crew.session_ledger import _FOLD_NAME as LEDGER_FOLD_NAME
 from kiro_crew.session_ledger import _MAX_ARTIFACT_KEY as LEDGER_ARTIFACT_KEY_LIMIT
 from kiro_crew.session_ledger import _MAX_ARTIFACTS as LEDGER_ARTIFACT_LIMIT
@@ -94,6 +117,7 @@ from kiro_crew.session_ledger import EVENT_KINDS as LEDGER_EVENT_KINDS
 from kiro_crew.session_ledger import LEDGER_ENTRY_TYPE
 from kiro_crew.session_ledger import SCHEMA_VERSION as LEDGER_SCHEMA_VERSION
 from kiro_crew.session_ledger import TERMINAL_PHASES as LEDGER_TERMINAL_PHASES
+from kiro_crew.work_vocab import WORK_CONDUCTOR_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +143,13 @@ PROJECTION_NAMES: Final[tuple[str, ...]] = (
 #: otherwise name a projection with no reader.
 INTERNAL_PROJECTION_NAMES: Final[tuple[str, ...]] = ("class",)
 
+#: Folds keyed by one SESSION, which are the ones the projection kernel drives
+#: (:func:`_session_registry`). The advertised panel set plus the internal ``class``:
+#: all of them fold a single crew log, so one pass over one file serves them and a
+#: savepoint beside that file resumes them. The slot-keyed folds are the complement
+#: and are driven by :func:`fold_slot_checkpoint`, which joins several files.
+SESSION_FOLD_NAMES: Final[tuple[str, ...]] = PROJECTION_NAMES + INTERNAL_PROJECTION_NAMES
+
 #: Projections keyed by a SLOT instead of by one crew log. A slot owns one ACP
 #: session id at a time, so a fact that belongs to the slot for its whole life --
 #: its work ledger -- is spread over a unit per id it ran under, and answering for
@@ -126,12 +157,38 @@ INTERNAL_PROJECTION_NAMES: Final[tuple[str, ...]] = ("class",)
 #: :data:`PROJECTION_NAMES` for that reason: the growth push and the side panel
 #: address a session, and pushing a slot-wide value under one session's id would
 #: report a partial answer as the whole one.
-SLOT_PROJECTION_NAMES: Final[tuple[str, ...]] = ("ledger",)
+SLOT_PROJECTION_NAMES: Final[tuple[str, ...]] = ("ledger", "radar", "work")
+
+#: The slot-keyed fold served by its OWNER and by no generic route. This fold's owner
+#: (the Issue Radar crew store) orders a crew's units by the order the crew recorded
+#: into them and pins the live unit last; a generic read has neither fact, and a
+#: per-unit read would serve a part of the record as the whole. The dashboard's
+#: projection routes refuse this name the way they refuse an unregistered one.
+OWNER_SERVED_SLOT_PROJECTION: Final[str] = "radar"
 
 #: Every fold this module registers, in registry order.
 FOLD_NAMES: Final[tuple[str, ...]] = (
     PROJECTION_NAMES + INTERNAL_PROJECTION_NAMES + SLOT_PROJECTION_NAMES
 )
+
+#: The SHAPE of what these folds store, which is what a savepoint holds. It lives
+#: here because it describes ``start`` and ``step``, and those are here: the
+#: projection kernel reads it off each definition
+#: (:class:`~kiro_crew.projection.ProjectionDefinition`) and refuses a payload
+#: written under another number, so a stored state cannot resume onto logic that
+#: keeps different bookkeeping. ``crew_log.checkpoint`` re-exports it as
+#: ``CHECKPOINT_VERSION``, the name its files and its own docs use.
+#:
+#: THE RULE: any change to what a fold's ``start`` or ``step`` STORES moves it,
+#: including one that keeps the same keys. Shape is all this number and
+#: ``_state_matches_fold`` can check, so a counting fix that leaves the keys alone
+#: would resume the old build's state onto the new logic -- and the long sessions a
+#: savepoint speeds up are the ones that then serve pre-fix numbers for the life of
+#: the unit. Moving it retires every savepoint to a cold fold, which costs one refold
+#: each and is the only in-product way to retire them, since the tree is fenced from
+#: the agent. ``test_changing_what_a_fold_stores_forces_the_savepoint_version_to_move``
+#: pins each fold's stored state, so forgetting the move fails CI rather than shipping.
+FOLD_STATE_VERSION: Final[int] = 3
 
 #: The types these folds can interpret, handed to ``iter_from(known=...)`` so an
 #: entry from a newer writer stops the fold instead of skewing it. The set is the
@@ -188,14 +245,6 @@ TEXT_LIMIT: Final[int] = 200
 #: different call's frame. Past this length an id identifies NOTHING, exactly like
 #: an absent one, and is counted and left unpaired.
 ID_LIMIT: Final[int] = 200
-
-#: Entries folded per pass over a log. Five folds consume the same entries, so a
-#: single generator would be exhausted by the first one and the span has to be
-#: materialized -- but materializing the WHOLE span puts an entire cold-folded
-#: log in memory at once, and a cold fold is the ordinary first read for any
-#: session. Folding in chunks keeps one pass over the file while bounding what is
-#: held to this many entries.
-FOLD_CHUNK_ENTRIES: Final[int] = 1024
 
 #: The token dimensions ``turn/completed`` bills, in the order it declares them.
 TOKEN_DIMENSIONS: Final[tuple[str, ...]] = ("input", "output", "cache_read", "cache_write")
@@ -319,12 +368,49 @@ def _state_matches_fold(name: str, state: dict[str, Any]) -> bool:
 
 @dataclass(frozen=True)
 class _Fold:
-    """One projection's three pure pieces."""
+    """One projection's three pure pieces.
+
+    ``bind_slot`` is the fourth piece a SLOT-keyed fold has: the reader knows
+    which slot it is folding and says so before the first entry, so the fold
+    never has to infer its board from whichever entry happens to come first.
+
+    ``affects`` and ``copy_state`` are what let a MUTATING ``step`` serve as the
+    projection kernel's pure ``apply`` (:class:`_SessionFold`). ``step`` edits the
+    dict it is handed, and the kernel requires a new object on a real change and the
+    SAME object on none -- so ``apply`` copies first and steps the copy, and skips
+    both when the entry cannot touch this fold.
+
+    ``affects`` is the set of entry types whose ``step`` can change this fold's
+    state, or ``None`` for a fold every entry moves. It may be WIDER than the truth
+    and must never be narrower: a type wrongly included costs a copy and, for a
+    client watching the change feed, one frame for an entry that changed nothing,
+    while a type wrongly left out drops a real change and serves a stale value with
+    nothing raised.
+
+    ``copy_state`` must copy every container ``step`` can reach, transitively --
+    ``None`` falls back to a deep copy, which is always correct and pays for the
+    whole state. A shallower copy is what makes the per-entry cost bounded, and
+    ``test_a_fold_never_reaches_into_the_state_it_was_handed`` is what keeps it
+    honest: a nested container left shared shows up there as the prior state moving.
+    """
 
     name: str
     start: Callable[[], dict[str, Any]]
     step: Callable[[dict[str, Any], Entry], None]
     render: Callable[[dict[str, Any]], dict[str, Any]]
+    bind_slot: Callable[[dict[str, Any], str], None] | None = None
+    affects: frozenset[str] | None = None
+    copy_state: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+
+    def touched_by(self, entry: Entry) -> bool:
+        """Whether *entry* can move this fold, so a copy is worth making."""
+        return self.affects is None or entry.type in self.affects
+
+    def copied(self, state: dict[str, Any]) -> dict[str, Any]:
+        """*state* copied deeply enough that :attr:`step` cannot reach the original."""
+        if self.copy_state is None:
+            return copy.deepcopy(state)
+        return self.copy_state(state)
 
 
 def require_name(name: str) -> str:
@@ -799,24 +885,7 @@ def _fold_attempt(
             handle,
             prefix_seen,
         )
-    # ONE pass over the file, in bounded chunks. Five folds consume the same
-    # entries, so a bare generator would be exhausted by the first of them and
-    # some materialization is required -- but materializing the whole span holds
-    # an entire cold-folded log in memory, and a cold fold (no reusable bundle,
-    # so ``from_seq`` is 1) is the ordinary first read for any session. Chunking
-    # keeps the single pass and bounds what is held to ``FOLD_CHUNK_ENTRIES``.
-    # Folding a span in pieces is the same value as folding it whole: ``advance``
-    # is seq-anchored and each chunk is strictly after the last, which is the
-    # property the incremental-equals-from-scratch test pins at every split.
-    grown = dict(base)
-    chunk: list[Entry] = []
-    for entry in handle.iter_from(from_seq, known=KNOWN_TYPES):
-        chunk.append(entry)
-        if len(chunk) >= FOLD_CHUNK_ENTRIES:
-            grown = _advance_all(grown, chunk)
-            chunk.clear()
-    if chunk:
-        grown = _advance_all(grown, chunk)
+    grown = _drive_session(_session_registry(wanted), session_id, base, handle)
     reached = max((cp.last_seq for cp in grown.values()), default=last_seq)
     return (
         SessionProjections(
@@ -869,19 +938,176 @@ def _persisted(
     return savepoints.save(handle, bundle, prefix=prefix)
 
 
-def _advance_all(
-    checkpoints: dict[str, Checkpoint], chunk: Sequence[Entry]
-) -> dict[str, Checkpoint]:
-    """Every checkpoint advanced over the part of *chunk* it has not consumed.
+# --------------------------------------------------------------------------- #
+# The folds as projection-kernel units
+# --------------------------------------------------------------------------- #
 
-    The per-checkpoint filter is what lets one chunk serve every fold that may sit
-    at DIFFERENT seqs: a reused bundle can hold a status checkpoint further along
-    than its tools one, and ``advance`` refuses an entry at or below the seq it
-    already reached rather than silently double-counting it.
+
+class _SessionFold:
+    """One crew-log fold as a :mod:`kiro_crew.projection` unit.
+
+    The kernel drives a pure ``apply`` and decides "something changed" by comparing
+    the returned object's IDENTITY with the one it handed over. These folds are
+    written the other way round -- ``step`` edits the dict it is given and returns
+    nothing -- so this wrapper supplies the difference rather than the folds being
+    rewritten: an entry the fold cannot be moved by returns the state UNTOUCHED, and
+    any other entry is stepped onto a copy.
+
+    Keeping ``step`` as it is, byte for byte, is the point. The folds are where this
+    module's meaning lives, and a rewrite of every mutation site into a functional
+    form would put a hundred chances to change a number between the old behaviour and
+    the new one, in the one place that must not move.
     """
+
+    def __init__(self, fold: _Fold) -> None:
+        self._fold = fold
+        self.key = fold.name
+        self.state_version = FOLD_STATE_VERSION
+
+    def init(self) -> dict[str, Any]:
+        return self._fold.start()
+
+    def apply(self, state: dict[str, Any], entry: Entry) -> dict[str, Any]:
+        if not self._fold.touched_by(entry):
+            return state
+        grown = self._fold.copied(state)
+        self._fold.step(grown, entry)
+        return grown
+
+    def view(self, state: dict[str, Any]) -> dict[str, Any]:
+        return self._fold.render(state)
+
+
+class _HeldCheckpoints:
+    """The checkpoints a read already holds, offered as the kernel's savepoint source.
+
+    ``prime_checkpointed`` installs each unit's state at its watermark and then folds
+    only the tail past the lowest of them, which is exactly what a read resuming from
+    a cached bundle or from disk wants -- so both arrive through this one seam rather
+    than through a second seeding path the tail fold would have to agree with.
+
+    The identity is not checked here and no equality is compared, because the caller
+    has already decided these checkpoints describe the log it is about to fold: a
+    cached bundle passes the reuse test in :func:`_fold_attempt`, and a savepoint read
+    from disk passed every admission condition in
+    :mod:`kiro_crew.crew_log.checkpoint`. Re-deciding it on weaker evidence is how the
+    two answers would get the chance to disagree.
+
+    A name this holds nothing for answers ``None``, which drops the kernel's floor to
+    the start and refolds the whole log -- the cold fold, which reaches the same value.
+    """
+
+    def __init__(self, held: Mapping[str, Checkpoint]) -> None:
+        self._held = held
+
+    def load(
+        self,
+        store: str,
+        key: str,
+        *,
+        state_version: int,
+        identity: Mapping[str, Any],
+        admit: Any = None,
+    ) -> Savepoint | None:
+        checkpoint = self._held.get(key)
+        if checkpoint is None:
+            return None
+        return Savepoint(
+            key=key,
+            state_version=state_version,
+            watermark=checkpoint.last_seq,
+            state=checkpoint.state,
+            identity=identity,
+        )
+
+    def save(self, store: str, savepoint: Savepoint) -> bool:
+        """Never written to. Persisting is :mod:`kiro_crew.crew_log.checkpoint`'s."""
+        return False
+
+    def discard(self, store: str, key: str) -> None:
+        return None
+
+
+def _session_registry(names: Sequence[str]) -> ProjectionRegistry:
+    """A registry holding exactly *names*, for one read.
+
+    Per READ, not one shared instance, and that is a behaviour requirement rather
+    than a preference. A registry folds every unit registered in it, so a shared one
+    would make ``fold_session(("status",))`` fold all six session folds and write all
+    six savepoints -- and it would compute the persisted floor across folds the caller
+    never asked for. What this module caches between reads is the bundle a caller
+    hands back as ``since=``, so the registry's own cells have nothing to carry.
+    """
+    registry = ProjectionRegistry(seq_of=attribute_seq)
+    for name in names:
+        registry.register(_SessionFold(_FOLDS[name]))
+    return registry
+
+
+def _drive_session(
+    registry: ProjectionRegistry,
+    session_id: str,
+    base: Mapping[str, Checkpoint],
+    handle: CrewLog,
+) -> dict[str, Checkpoint]:
+    """*base* carried forward over every entry of *handle* above it.
+
+    One pass over the file for every fold, and NOTHING is materialized: the kernel
+    takes the tail as a stream and folds each entry through every unit as it arrives,
+    so a cold fold of a long log holds one entry at a time. Each unit drops an entry
+    at or below its own watermark inside the kernel's own fold step -- the same step a
+    live event takes -- which is what lets one pass serve folds sitting at different
+    seqs: a resumed bundle can hold ``status`` further along than ``tools``.
+
+    A fold that RAISES over resumed state retires the state instead of the read. The
+    shape checks a savepoint passes read a state's top level, so a value malformed
+    below it -- a tool row holding a number where a list belongs -- is admitted and
+    fails in the fold, and nothing above catches that: the routes answer only to
+    ``CrewLogError``, so the read 500s and does so on every later read, because the
+    file that caused it is still there. Any exception therefore discards the savepoints
+    and folds the whole log from empty, which is the module's standing answer to doubt.
+    A cold fold that raises is NOT swallowed -- that is a fold defect on real entries,
+    and serving a value past it would hide it.
+    """
+    try:
+        registry.prime_checkpointed(session_id, _HeldCheckpoints(base), {}, _tail_reader(handle))
+        return _cells_as_checkpoints(registry, session_id)
+    except Exception:
+        log_exception_text(
+            logger,
+            logging.DEBUG,
+            "crew log %s could not fold its resumed state; discarding and folding cold",
+            session_id,
+        )
+
+    from kiro_crew.crew_log import checkpoint as savepoints
+
+    wanted = tuple(base)
+    savepoints.discard(handle, wanted)
+    # A FRESH registry: the one above holds cells the failed pass half-folded, and
+    # priming over them would carry that half into the cold answer. An empty source
+    # drops the kernel's floor to the start, which is the cold fold.
+    cold = _session_registry(wanted)
+    cold.prime_checkpointed(session_id, _HeldCheckpoints({}), {}, _tail_reader(handle))
+    return _cells_as_checkpoints(cold, session_id)
+
+
+def _tail_reader(handle: CrewLog) -> Callable[[int], Iterable[Entry]]:
+    """The kernel's tail source for *handle*: the entries strictly above a watermark."""
+
+    def tail_from(watermark: int) -> Iterable[Entry]:
+        # The kernel's empty watermark is -1 and a checkpoint's is 0; both mean
+        # nothing consumed, and the log's own first seq is 1.
+        return handle.iter_from(max(watermark, 0) + 1, known=KNOWN_TYPES)
+
+    return tail_from
+
+
+def _cells_as_checkpoints(registry: ProjectionRegistry, session_id: str) -> dict[str, Checkpoint]:
+    """Every registered fold's cell as the checkpoint this module's callers carry."""
     return {
-        name: advance(cp, tuple(entry for entry in chunk if entry.seq > cp.last_seq))
-        for name, cp in checkpoints.items()
+        name: Checkpoint(name=name, last_seq=max(watermark, 0), state=state)
+        for name, (state, watermark) in registry.cells(session_id).items()
     }
 
 
@@ -889,6 +1115,11 @@ def read_projection(session_id: str, name: str) -> Projection:
     """One projection for *session_id*, folded from the start of its crew log."""
     bundle = fold_session(session_id, (require_name(name),))
     return bundle.projection(name)
+
+
+# --------------------------------------------------------------------------- #
+# Reading a slot's logs
+# --------------------------------------------------------------------------- #
 
 
 # --------------------------------------------------------------------------- #
@@ -1656,6 +1887,564 @@ def _ledger_render(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# radar -- the Issue Radar crew ledger
+# --------------------------------------------------------------------------- #
+
+#: Ceilings on the state a crew's fold RETAINS. The crew page reads at most
+#: ``_MAX_EVENTS`` lines (500), so the event tail keeps that many; the oldest go
+#: first, which is the order every reader already drops them in. Phase lines are
+#: kept PER ITEM so a long-parked lane's entry line cannot be pushed out by other
+#: items' chatter -- the lane that has sat longest is the one the pipeline view
+#: exists to show. Text is re-clamped on the way in because these bytes come off a
+#: file a reader does not control.
+RADAR_EVENT_LIMIT: Final[int] = 500
+RADAR_PHASE_LINE_LIMIT: Final[int] = 200
+#: Rejected approaches kept PER ITEM, newest last; a crew that rejects more than
+#: this on one issue has stopped learning from the list, and the oldest rows are
+#: the ones a resume can do without.
+RADAR_TRIED_LIMIT: Final[int] = 100
+#: Work items and passes kept PER CREW. Past the bound the fold EVICTS -- an item:
+#: a finished one first, oldest finish first, then the open one longest without
+#: progress; a pass: the earliest decided -- and COUNTS what it evicted in
+#: ``counts``, so a bounded record is told from a complete one. A crew that has
+#: touched more distinct issues than this has a history, not a working set, and the
+#: working set is what a resume needs; an evicted pass is one the repository may
+#: investigate again, which the spec accepts as this index's bound.
+RADAR_ITEM_LIMIT: Final[int] = 500
+RADAR_SKIP_LIMIT: Final[int] = 5000
+#: Clamp for every free-text field the fold reads. It is a SHAPE gate on bytes a
+#: reader does not control, not an input cap, so it must equal the largest value the
+#: record tool would have accepted -- ``validation.MAX_MEDIUM_STRING``, the cap on
+#: ``next``, ``decision``, ``why``, ``tried_approach`` and ``tried_rejected_because``.
+#: Lower than that and an ordinary accepted field is truncated on every read, which
+#: is silent state corruption rather than a bound. Not imported from ``validation``
+#: on purpose -- the fold stays free of the MCP layer -- so
+#: ``test_issue_radar_crew_store`` pins the two constants equal instead.
+RADAR_TEXT_LIMIT: Final[int] = 5000
+RADAR_SCHEMA_VERSION: Final[int] = 1
+
+
+def _radar_iso(stamp_ms: int) -> str:
+    """An entry's epoch-millisecond ``time`` as the UTC ``Z`` spelling the record keeps.
+
+    Derived from the envelope rather than written into the entry: one clock, and no
+    way for an entry to claim a time the log disagrees with. A stamp outside the
+    range a ``datetime`` holds answers ``""`` rather than raising, because this reads
+    bytes a reader does not control and one damaged line must cost a display value,
+    not every read of the crew forever.
+    """
+    try:
+        moment = datetime.fromtimestamp(stamp_ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return ""
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _radar_text(value: Any, limit: int = RADAR_TEXT_LIMIT) -> str:
+    """*value* as a clamped string, or ``""``. The fold's own shape gate."""
+    if not isinstance(value, str):
+        return ""
+    return value[:limit]
+
+
+def _radar_int(value: Any) -> int | None:
+    """*value* as an int, or ``None``. Bools are refused: JSON ``true`` is not a number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _radar_number(value: Any, field: str) -> int | None:
+    """*value* as an int inside the record tool's range for *field*, or ``None``.
+
+    The magnitude half of the same rule :func:`_radar_text` applies to a string and
+    :func:`radar_ci_state` to a counter: these bytes come off a file a reader does not
+    control, so a number outside the range the tool would have accepted is dropped
+    rather than retained. Dropping is the existing answer for a number of the wrong
+    type, and an item or skip keyed on such a number was never one the tool wrote.
+    """
+    number = _radar_int(value)
+    if number is None:
+        return None
+    low, high = RADAR_NUMBER_BOUNDS[field]
+    return number if low <= number <= high else None
+
+
+def radar_ci_state(value: Mapping[str, Any]) -> dict[str, Any]:
+    """The members of a CI reading the record tool would have accepted, bounded.
+
+    Only :data:`RADAR_CI_KEYS`, each with the tool's own type and ceiling from
+    :data:`RADAR_CI_BOUNDS`: a string verdict clipped to its length, a counter kept
+    only when it is an int within the tool's range. Any other member, and any member
+    of the wrong shape, is dropped. The fold applies this to the bytes it reads and
+    the crew store's carry to a pre-projection file, so a reading that reached the
+    log by any path is retained within the same bounds.
+    """
+    kept: dict[str, Any] = {}
+    for key in RADAR_CI_KEYS:
+        if key not in value:
+            continue
+        kind, bound = RADAR_CI_BOUNDS[key]
+        member = value[key]
+        if kind is str:
+            if isinstance(member, str) and member:
+                kept[key] = member[:bound]
+            continue
+        number = _radar_int(member)
+        if number is not None and 0 <= number <= bound:
+            kept[key] = number
+    return kept
+
+
+def _radar_event_id(ts: str, crew_id: str, number: int | None, kind: str, text: str) -> str:
+    """The content-addressed line id the crew ledger has always given a progress line.
+
+    Kept byte-identical to the pre-projection formula so a reader keyed on ids sees
+    the same id for the same line. ``number`` renders as the empty string on a
+    crew-level line, which cannot collide with a real number.
+    """
+    shown = "" if number is None else int(number)
+    raw = f"{ts}|{crew_id}|{shown}|{kind}|{text}".encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _radar_start() -> dict[str, Any]:
+    return {
+        "crew_id": "",
+        "owner": "",
+        "repo": "",
+        "items": {},
+        "events": [],
+        "skips": {},
+        "phase_lines": {},
+        # ``[line id, payload digest]`` pairs for the newest entries folded: the
+        # collapse of a REPEATED entry keys on the whole update, not on the line's
+        # display identity, so two same-millisecond calls that differ only in the
+        # fields they patch both fold.
+        "last_update": {},
+        # How many items and passes the bounds above evicted from this fold, so a
+        # reader can tell a bounded record from a complete one.
+        "evicted_items": 0,
+        "evicted_skips": 0,
+    }
+
+
+def _radar_payload_digest(data: Mapping[str, Any]) -> str:
+    """A digest of the whole update, so a repeat is told from a same-looking one."""
+    try:
+        raw = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        raw = repr(sorted(data.items(), key=lambda kv: str(kv[0])))
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _radar_new_item(crew_id: str, owner: str, repo: str, number: int) -> dict[str, Any]:
+    """A work item before its first update, in the key order the record has always had."""
+    return {
+        "schema": RADAR_SCHEMA_VERSION,
+        "crew_id": crew_id,
+        "owner": owner,
+        "repo": repo,
+        "number": number,
+        "phase": "selected",
+        "outcome": None,
+        "decision": "",
+        "why": "",
+        "next": "",
+        "tried": [],
+        "worktree": "",
+        "branch": "",
+        "base_sha": "",
+        "pr_number": None,
+        "ci_state": {},
+        "claim_comment_id": None,
+        "labels_applied": [],
+        "claimed_at": None,
+        "last_progress_at": None,
+        "finished_at": None,
+    }
+
+
+def _radar_record_skip(
+    state: dict[str, Any], key: str, number: int, skip: Mapping[str, Any], crew_id: str, ts: str
+) -> None:
+    """Record one pass in this crew's contribution to the repository's skip index.
+
+    FIRST decision wins, as the shared index always did: the first crew's reason is
+    the audit trail a human reads, a later identical pass adds nothing, and a
+    different conclusion is a disagreement to surface on the later crew's own item
+    rather than a silent edit of someone else's record. ``crew_id`` and
+    ``decided_at`` on the row default to the entry's own and are overridden only by
+    a carried row, which re-states a decision made elsewhere and earlier.
+    """
+    if not isinstance(skip.get("reason"), str):
+        return
+    skips: dict[str, dict[str, Any]] = state["skips"]
+    if key in skips:
+        return
+    scope = skip.get("scope")
+    skips[key] = {
+        "number": number,
+        "reason": _radar_text(skip["reason"]),
+        "scope": (
+            scope
+            if isinstance(scope, str) and scope in RADAR_SKIP_SCOPES
+            else RADAR_DEFAULT_SKIP_SCOPE
+        ),
+        "crew_id": _radar_text(skip.get("crew_id"), 64) or crew_id,
+        "decided_at": _radar_text(skip.get("decided_at"), 64) or ts,
+        # The writer saw another crew's decision standing when it recorded this pass;
+        # the union never lets such a row stand over the one it saw. The writer's
+        # observation orders the two, so a clock stepped backward cannot re-order them.
+        "deferred": skip.get("deferred") is True,
+    }
+    while len(skips) > RADAR_SKIP_LIMIT:
+        # The EARLIEST decided pass goes first: the shared index keeps a number's
+        # first decision, and of this crew's rows the oldest is the one most likely
+        # already re-decided by the issue itself (closed, or reopened and worked).
+        oldest = min(skips, key=lambda k: (str(skips[k].get("decided_at") or ""), k))
+        del skips[oldest]
+        state["evicted_skips"] += 1
+
+
+def _radar_bound_items(state: dict[str, Any], keep: str) -> None:
+    """Evict work items past :data:`RADAR_ITEM_LIMIT`, never the one just written.
+
+    A FINISHED item goes before any open one -- an open item is work the crew still
+    owes, and the record exists so it can resume that work -- oldest finish first;
+    only when every other item is open does the one longest without progress go. An
+    evicted item takes its phase history with it, so the two stay bounded together,
+    and is counted.
+
+    An item in an EDITING phase is never a victim, whatever the pressure. The
+    one-editor rule is decided by scanning the items this record still holds, so
+    evicting the item that holds the edit makes the rule answer "no editor" and admit
+    a second one -- and an append-only log cannot retract the conflicting lines the two
+    then write. The bound stays meaningful because the rule admits ONE editing item at
+    a time, so this withholds at most one candidate out of the limit; if it somehow
+    withholds them all, the bound is exceeded instead, which is what this function
+    already does when the only item left is the one just written.
+    """
+    items: dict[str, dict[str, Any]] = state["items"]
+    while len(items) > RADAR_ITEM_LIMIT:
+        candidates = [
+            key for key in items if key != keep and items[key]["phase"] not in RADAR_EDITING_PHASES
+        ]
+        if not candidates:
+            return
+        finished = [key for key in candidates if items[key]["phase"] in RADAR_TERMINAL_PHASES]
+        pool = finished or candidates
+        victim = min(
+            pool,
+            key=lambda k: (
+                str(items[k].get("finished_at") or items[k].get("last_progress_at") or ""),
+                k,
+            ),
+        )
+        del items[victim]
+        state["phase_lines"].pop(victim, None)
+        state["evicted_items"] += 1
+
+
+def _radar_step(state: dict[str, Any], entry: Entry) -> None:
+    if entry.type != RADAR_ENTRY_TYPE:
+        return
+    data = entry.data
+    crew_id = _radar_text(data.get("crew_id"), 64)
+    if not crew_id:
+        return
+    if not state["crew_id"]:
+        # The first entry names the crew; every unit a crew's slot ran under belongs
+        # to that one crew, so a later entry naming another is a planted or damaged
+        # line and is left out rather than folded into a record it does not own.
+        state["crew_id"] = crew_id
+        state["owner"] = _radar_text(data.get("owner"), 256)
+        state["repo"] = _radar_text(data.get("repo"), 256)
+    elif crew_id != state["crew_id"]:
+        return
+    ts = _radar_iso(entry.time)
+    kind = data.get("event_kind")
+    if not (isinstance(kind, str) and kind in RADAR_EVENT_KINDS):
+        return
+    text = _radar_text(data.get("event"))
+    number = _radar_number(data.get("number"), "number")
+    carried = data.get("carried") is True
+    events: list[dict[str, Any]] = state["events"]
+
+    if number is None:
+        # A crew-level line -- the queue sweep that took nothing. Consecutive sweeps
+        # COALESCE: "checked, took nothing" is a recurring latest-value fact, and a
+        # crew is nudged on a timer, so one line per idle cycle would push the crew's
+        # real work history out of its own bounded tail. The first sweep after real
+        # work stands; a sweep landing on a sweep adds nothing, and its timestamp is
+        # deliberately the older one -- when the idle stretch BEGAN is the reading a
+        # human opening a quiet crew wants.
+        if kind != RADAR_CREW_LEVEL_EVENT_KIND:
+            return
+        if events and events[-1].get("kind") == RADAR_CREW_LEVEL_EVENT_KIND:
+            return
+        events.append(
+            {
+                "id": _radar_event_id(ts, crew_id, None, kind, text),
+                "ts": ts,
+                "crew_id": crew_id,
+                "kind": kind,
+                "text": text,
+            }
+        )
+        del events[: max(0, len(events) - RADAR_EVENT_LIMIT)]
+        return
+    if kind == RADAR_CREW_LEVEL_EVENT_KIND:
+        # The pairing the writer enforces, re-applied to the bytes: a crew-level kind
+        # with a number would file a queue sweep under an issue it never touched.
+        return
+
+    key = str(number)
+    line_id = _radar_event_id(ts, crew_id, number, kind, text)
+    digest = _radar_payload_digest(data)
+    last_update: dict[str, str] = state["last_update"]
+    skip = data.get("skip")
+    skip_row = skip if isinstance(skip, Mapping) else None
+    carried_pass = carried and skip_row is not None and "phase" not in data
+    # WHAT THIS UPDATE WROTE, and therefore what has to still be here for a retry of
+    # it to be redundant. Every update writes an item except a carried pass, which
+    # deliberately writes a skip and no item; an update carrying a `skip` writes one
+    # too. Items and skips are bounded on SEPARATE rules and evict independently, so
+    # asking whether EITHER survived would let a surviving skip vouch for an item the
+    # item bound has since evicted -- and then a crash retry of the same update, which
+    # is the one thing that would put the item back, returns here instead and leaves it
+    # missing until some later DISTINCT update happens to rewrite it.
+    still_present = (carried_pass or key in state["items"]) and (
+        skip_row is None or key in state["skips"]
+    )
+    if last_update.get(key) == digest and still_present:
+        # The same UPDATE twice IN A ROW for this item -- an append retried after a
+        # crash or after a refused read-back, or one call landing twice. Only the
+        # item's LAST applied update is compared, never a window of history: a retry
+        # is by construction the next update for its item (the crew's writes are
+        # serialized and the crew is waiting on the answer), while an item that
+        # legitimately returns to an earlier state with identical fields after
+        # intervening updates is a new update and applies. The digest covers the
+        # whole update -- crew, number, kind, text and every field -- and not the
+        # timestamped line id, which a retry re-stamps.
+        #
+        # Gated on the RECORD still existing, because this map and the two bounded
+        # collections evict on different rules and different key sets: the digest of
+        # an evicted item (or pass) can outlive it, and a retry matching that stale
+        # digest would return here and leave the record GONE -- a row the crew was
+        # told landed, absent. While the record is present the dedup is doing its
+        # job; once it is not, the retry is what puts it back.
+        return
+    last_update.pop(key, None)
+    last_update[key] = digest
+    while len(last_update) > RADAR_EVENT_LIMIT:
+        last_update.pop(next(iter(last_update)))
+    if carried_pass and skip_row is not None:
+        # A carried PASS on an issue this crew never worked -- the pre-projection
+        # index was repository-wide, so the crew that carries it forward is usually
+        # not the crew that decided it. It records the row and the line and NO work
+        # item: an item would put an issue the crew never touched on its own page.
+        _radar_record_skip(state, key, number, skip_row, crew_id, ts)
+        events.append(
+            {
+                "id": line_id,
+                "ts": ts,
+                "crew_id": crew_id,
+                "number": number,
+                "kind": kind,
+                "text": text,
+            }
+        )
+        del events[: max(0, len(events) - RADAR_EVENT_LIMIT)]
+        return
+    items: dict[str, dict[str, Any]] = state["items"]
+    existing = items.get(key)
+    item = (
+        existing
+        if existing is not None
+        else _radar_new_item(crew_id, state["owner"], state["repo"], number)
+    )
+    prev_phase = item["phase"] if existing is not None else None
+    progressed = existing is None
+
+    cleared = data.get("clear")
+    if isinstance(cleared, list):
+        # An explicit null in the update is carried as a CLEAR, named by field, since
+        # a typed null is not a value the entry type admits. Applied before the set
+        # fields, so a call that clears and sets the same field keeps the set value.
+        for name in cleared:
+            if not isinstance(name, str) or name not in RADAR_CLEARABLE_FIELDS:
+                continue
+            if name in ("pr_number", "claim_comment_id", "outcome"):
+                item[name] = None
+            elif name == "ci_state":
+                item[name] = {}
+            elif name == "labels_applied":
+                item[name] = []
+            else:
+                item[name] = ""
+            if name in ("pr_number", "ci_state", "next"):
+                progressed = True
+
+    phase = data.get("phase")
+    if isinstance(phase, str) and phase in RADAR_PHASES:
+        if phase != item["phase"]:
+            progressed = True
+        item["phase"] = phase
+    for field_name in ("decision", "why", "worktree", "branch", "base_sha"):
+        if isinstance(data.get(field_name), str):
+            item[field_name] = _radar_text(data[field_name])
+    if isinstance(data.get("next"), str):
+        new_next = _radar_text(data["next"])
+        if new_next != item["next"]:
+            progressed = True
+        item["next"] = new_next
+    if "pr_number" in data:
+        item["pr_number"] = _radar_number(data.get("pr_number"), "pr_number")
+        progressed = True
+    if "claim_comment_id" in data:
+        item["claim_comment_id"] = _radar_number(data.get("claim_comment_id"), "claim_comment_id")
+    ci_state = data.get("ci_state")
+    if isinstance(ci_state, Mapping):
+        # Merged KEY BY KEY, only the declared members, each re-bounded to the record
+        # tool's own type and ceiling: a reading that named any other key would
+        # otherwise grow the item by key with no bound, and one that carried an
+        # oversized member would make every retained item hold it -- the entry type
+        # admits an object here, and these are bytes read off a file.
+        merged_ci: dict[str, Any] = radar_ci_state(item["ci_state"])
+        merged_ci.update(radar_ci_state(ci_state))
+        item["ci_state"] = merged_ci
+        progressed = True
+    labels = data.get("labels_applied")
+    if isinstance(labels, list):
+        item["labels_applied"] = [_radar_text(x, 256) for x in labels if isinstance(x, str)][
+            :RADAR_LABELS_LIMIT
+        ]
+    if isinstance(data.get("outcome"), str):
+        item["outcome"] = _radar_text(data["outcome"]).strip() or None
+    tried = data.get("tried")
+    if (
+        isinstance(tried, Mapping)
+        and isinstance(tried.get("approach"), str)
+        and tried["approach"].strip()
+    ):
+        row = {
+            "approach": _radar_text(tried["approach"]).strip(),
+            "rejected_because": _radar_text(tried.get("rejected_because")),
+        }
+        # A carried entry RE-STATES a record, and a carry that did not fully land is
+        # run again, so the same rejected approach can arrive twice; a live entry
+        # is one call and appends as it always did.
+        already = carried and any(
+            r.get("approach") == row["approach"]
+            and r.get("rejected_because") == row["rejected_because"]
+            for r in item["tried"]
+        )
+        if not already:
+            item["tried"].append({**row, "at": ts})
+            del item["tried"][: max(0, len(item["tried"]) - RADAR_TRIED_LIMIT)]
+            progressed = True
+
+    # Stamps come off the entry's own clock. ``claimed_at`` is stamped once, the
+    # first time the item is in any phase past ``selected``; ``last_progress_at``
+    # moves ONLY on real progress, because the claim TTL is measured from it and a
+    # bare read-back must not renew a claim. A CARRIED entry brings its own stamps:
+    # it re-states a record that already had them, and re-stamping would make every
+    # carried claim look freshly made.
+    if carried:
+        for stamp in ("claimed_at", "last_progress_at", "finished_at"):
+            if stamp in data:
+                item[stamp] = _radar_text(data.get(stamp), 64) or None
+        if item["last_progress_at"] is None:
+            item["last_progress_at"] = ts
+    else:
+        if item["claimed_at"] is None and item["phase"] != "selected":
+            item["claimed_at"] = ts
+        if item["last_progress_at"] is None or progressed:
+            item["last_progress_at"] = ts
+        if item["phase"] in RADAR_TERMINAL_PHASES:
+            if not item["finished_at"]:
+                item["finished_at"] = ts
+        else:
+            # Reopened, or never finished: a resolved issue can come back and be
+            # handled again by the same crew, which reuses this very item, so EVERY
+            # field that describes a finished result is dropped together.
+            item["finished_at"] = None
+            item["outcome"] = None
+    items[key] = item
+    _radar_bound_items(state, keep=key)
+
+    if skip_row is not None:
+        _radar_record_skip(state, key, number, skip_row, crew_id, ts)
+
+    # The line carries ``phase`` ONLY when this entry created the item or moved it,
+    # so a reader can treat "a line carrying a phase" as "an ENTRY into that phase":
+    # a CI reading that leaves the item in ``awaiting-ci`` must not reset the lane's
+    # dwell clock, or the item polled most often is the one whose stall is hidden.
+    moved = existing is None or prev_phase != item["phase"]
+    line: dict[str, Any] = {
+        "id": line_id,
+        "ts": ts,
+        "crew_id": crew_id,
+        "number": number,
+        "kind": kind,
+        "text": text,
+    }
+    if moved:
+        line["phase"] = item["phase"]
+        phase_lines: dict[str, list[dict[str, str]]] = state["phase_lines"]
+        rows = phase_lines.setdefault(key, [])
+        rows.append({"phase": item["phase"], "at": item["last_progress_at"] if carried else ts})
+        del rows[: max(0, len(rows) - RADAR_PHASE_LINE_LIMIT)]
+    events.append(line)
+    del events[: max(0, len(events) - RADAR_EVENT_LIMIT)]
+
+
+def _radar_render(state: dict[str, Any]) -> dict[str, Any]:
+    """The crew's ledger, in the shapes its readers already expect.
+
+    ``items`` newest progress first and ``events`` newest first, the orders the crew
+    page has always listed them in. ``skips`` is THIS crew's contribution to the
+    repository's shared index -- the index itself is the union over every crew of
+    the repository, folded by the app. ``phase_lines`` is the per-item history of
+    phase entries the pipeline view draws lanes from.
+    """
+    items = sorted(
+        (
+            dict(
+                record,
+                tried=[dict(row) for row in record["tried"]],
+                ci_state=dict(record["ci_state"]),
+                labels_applied=list(record["labels_applied"]),
+            )
+            for record in state["items"].values()
+        ),
+        key=lambda record: record.get("last_progress_at") or "",
+        reverse=True,
+    )
+    return {
+        "schema": RADAR_SCHEMA_VERSION,
+        "crew_id": state["crew_id"],
+        "owner": state["owner"],
+        "repo": state["repo"],
+        "items": items,
+        "events": [dict(line) for line in reversed(state["events"])],
+        "skips": {key: dict(row) for key, row in state["skips"].items()},
+        "phase_lines": {
+            key: [dict(row) for row in rows] for key, rows in state["phase_lines"].items()
+        },
+        "counts": {
+            "open": sum(
+                1
+                for record in state["items"].values()
+                if record["phase"] not in RADAR_TERMINAL_PHASES
+            ),
+            "evicted_items": state["evicted_items"],
+            "evicted_skips": state["evicted_skips"],
+        },
+    }
+
+
 # --------------------------------------------------------------------------- #
 # class -- what kind of session this log belongs to, over its whole life
 # --------------------------------------------------------------------------- #
@@ -1856,7 +2645,7 @@ def _class_render(state: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-def fold_slot_checkpoint(name: str, unit_ids: Sequence[str]) -> Checkpoint:
+def fold_slot_checkpoint(name: str, unit_ids: Sequence[str], *, slot: str = "") -> Checkpoint:
     """*name* folded over every crew log of one slot, OLDEST UNIT FIRST.
 
     The slot-keyed read. ``unit_ids`` comes from
@@ -1880,9 +2669,15 @@ def fold_slot_checkpoint(name: str, unit_ids: Sequence[str]) -> Checkpoint:
     advances this state over the entry it is appending to answer with the record
     that entry produces, so the answer comes out of this same fold instead of a
     second implementation of the same update rules.
+
+    *slot* is handed to a fold that declares ``bind_slot``, so a slot-keyed fold
+    knows which slot it answers for before the first entry instead of guessing
+    it from that entry.
     """
     fold_spec = _FOLDS[require_name(name)]
     state = fold_spec.start()
+    if slot and fold_spec.bind_slot is not None:
+        fold_spec.bind_slot(state, slot)
     reached = 0
     for unit_id in unit_ids:
         handle = open_session_log(unit_id)
@@ -1897,12 +2692,12 @@ def fold_slot_checkpoint(name: str, unit_ids: Sequence[str]) -> Checkpoint:
     return Checkpoint(name=name, last_seq=reached, state=state)
 
 
-def fold_slot(name: str, unit_ids: Sequence[str]) -> Projection:
+def fold_slot(name: str, unit_ids: Sequence[str], *, slot: str = "") -> Projection:
     """:func:`fold_slot_checkpoint` rendered -- the value a slot-keyed reader is served."""
-    return projection_of(fold_slot_checkpoint(name, unit_ids))
+    return projection_of(fold_slot_checkpoint(name, unit_ids, slot=slot))
 
 
-def read_slot_projection(slot: str, name: str) -> Projection:
+def read_slot_projection(slot: str, name: str, *, also_slots: Sequence[str] = ()) -> Projection:
     """One slot-keyed projection for *slot*, folded over every unit it ran under.
 
     The units come from the fold's OWNER, not from a raw store listing. For the ledger
@@ -1910,18 +2705,536 @@ def read_slot_projection(slot: str, name: str) -> Projection:
     ahead of the header clock, and a raw listing here would serve a different answer
     from the one every other reader gets -- including a deleted conversation's goal and
     phase on a recycled slot key. A fold whose owner has no such rule falls through to
-    the store listing, which is what it would have used anyway.
+    the store listing, which is what it would have used anyway. *also_slots* names
+    further slots whose units join the fold after those -- a caller that knows of a
+    party the record itself does not name yet (a worker bound before the board was
+    recorded) says so here.
     """
-    return fold_slot(require_name(name), _slot_units_for_fold(slot, name))
+    units = list(_slot_units_for_fold(slot, name))
+    known = set(units)
+    for extra in also_slots:
+        for unit_id in _supplemental_units(extra, name):
+            if unit_id not in known:
+                known.add(unit_id)
+                units.append(unit_id)
+    return projection_of(fold_slot_warm(require_name(name), units, slot=slot))
+
+
+def _supplemental_units(slot: str, name: str) -> "tuple[str, ...]":
+    """One *also_slots* slot's units, in the same ORDER the fold uses for its own.
+
+    A supplemental slot arrives by a different route from the fold's own units -- the
+    caller names a party the record does not name yet -- but its units land in the same
+    fold, so a later one still applies over an earlier one. Resolving it through the raw
+    store listing would therefore order this one party by the header clock while every
+    other unit in the same fold is ordered causally, and a clock that steps backward
+    across that party's reset would fold its older unit last. The order log exists to
+    prevent exactly that, so the supplemental path has to read it too.
+
+    Only the work fold is redirected here. The ledger fold's supplemental units keep the
+    store listing they already used; changing that is a separate question from this one.
+    """
+    if name == "work":
+        return session_ledger.work_crew_log_units(slot)
+    return session_units_for_slot(slot)
 
 
 def _slot_units_for_fold(slot: str, name: str) -> "tuple[str, ...]":
     """The units *name* is folded over for *slot*, as that fold's owner defines them."""
     if name == LEDGER_FOLD_NAME:
-        from kiro_crew import session_ledger
-
         return session_ledger.crew_log_units(slot)
+    if name == "work":
+        return _work_units(slot, session_ledger.work_crew_log_units(slot))
     return session_units_for_slot(slot)
+
+
+# --------------------------------------------------------------------------- #
+# A slot's folds on the projection kernel
+# --------------------------------------------------------------------------- #
+
+#: Slot folds kept warm between reads, keyed by (data home, slot, fold name). Bounded
+#: by COUNT: each cell is a bounded record, so what needs a ceiling is how many are
+#: retained, and the insertion order makes the oldest the one evicted. An evicted slot
+#: folds cold on its next read, which costs time and never correctness.
+SLOT_FOLD_CACHE_SLOTS: Final[int] = 64
+
+
+class _Ordinal(NamedTuple):
+    """One entry of a slot's concatenated stream, at a seq that grows across units.
+
+    A crew log's ``seq`` restarts at 1 in every unit file, while the kernel holds ONE
+    watermark per cell and drops an event at or below it. So the units' own seqs cannot
+    be handed over as they are: the second unit's entries all sit at or below the
+    first's and would be dropped as a re-fold -- the collision :func:`advance` names,
+    arriving for a legitimate reason. ``ordinal`` is what the kernel orders by instead:
+    the entry's own seq plus the heights of the units already streamed, which grows
+    across the whole concatenation.
+
+    Two properties come out of that, and both are needed. It never goes backwards, so
+    no entry is wrongly dropped. And one entry always maps to the SAME ordinal, so
+    re-driving a range costs the overlap and nothing else -- which a plain running
+    counter would lose, because a re-read entry would take a new number and be counted
+    a second time.
+
+    ``entry`` is the crew log entry untouched, so the fold sees exactly the record the
+    file holds.
+    """
+
+    ordinal: int
+    entry: Entry
+
+
+def _ordinal_seq(event: _Ordinal) -> int:
+    """The kernel's ordering number for one wrapped entry."""
+    return event.ordinal
+
+
+@dataclass(frozen=True)
+class _UnitMark:
+    """One unit's log identity, height and byte fingerprint, as the file reports them.
+
+    ``origin`` is :func:`log_origin`, the same value the session folds and the on-disk
+    savepoints compare with; ``None`` is an unknown identity and never matches, so a
+    unit whose log cannot be read folds cold. It is in the reuse test because a seq
+    alone cannot tell a log that GREW from one REMOVED AND RECREATED under the same id
+    whose seq has already climbed back to or past the remembered one.
+
+    ``size`` and ``mtime_ns`` are the stat-only fingerprint :func:`_log_identity`
+    already computes for the session fold, over exactly the segment set a walk would
+    read. They are here because identity and height together still describe a log only
+    by how FAR it goes, never by what it says: an already-folded entry rewritten in
+    place keeps its seq, so a mark without them compares equal to a log whose bytes
+    have changed underneath a cell, and the stale cell is then served to
+    :func:`rebuild_from_projection`, which writes it back over the record. A changed
+    fingerprint folds cold instead. Both come from the same call that yields
+    ``origin``, so carrying them costs no extra stat.
+
+    The fingerprint settles the units a continuation does not re-read. It cannot settle
+    the newest one, which a continuation exists to let GROW: an append moves size and
+    mtime by itself, so a stat has nothing left to compare there. That unit is settled
+    instead by :class:`_PrefixSeen`, a decode-free digest of the records already folded,
+    which is the only evidence that distinguishes a file that grew from one truncated
+    and regrown to the same reading.
+    """
+
+    origin: str | None
+    last_seq: int
+    size: int | None = None
+    mtime_ns: int | None = None
+
+
+def _unit_mark(unit_id: str) -> _UnitMark:
+    """*unit_id*'s log identity, newest seq and fingerprint, or an unknown mark.
+
+    ``origin`` is ``None`` for an unreadable or header-less log, and every caller
+    treats that as unknown and folds cold -- which is also why the fingerprint needs no
+    separate unknown test: :func:`_log_identity` returns an identity only when the same
+    stat calls that produced the fingerprint succeeded.
+    """
+    try:
+        handle = open_session_log(unit_id)
+        if handle is None:
+            return _UnitMark(None, 0)
+        origin, size, mtime_ns = _log_identity(handle)
+        # ``last_seq`` on a freshly opened handle is read off the file's tail, which
+        # is what makes it usable as a growth signal for a reader that never appends.
+        return _UnitMark(origin, int(getattr(handle, "last_seq", 0) or 0), size, mtime_ns)
+    except Exception:
+        return _UnitMark(None, 0)
+
+
+def _unit_marks(unit_ids: Sequence[str]) -> "tuple[_UnitMark, ...]":
+    """Every unit's mark, in the order they are folded."""
+    return tuple(_unit_mark(unit_id) for unit_id in unit_ids)
+
+
+#: Stands for "every record in the file" when a digest wants no boundary.
+#: :meth:`CrewLog.raw_prefix_digest` stops at end of file and reports the count it
+#: reached, so a boundary above any real log yields the whole-file digest.
+_ALL_RECORDS = 1 << 62
+
+
+class _PrefixSeen(NamedTuple):
+    """A digest of the newest unit's raw records, read at one known moment.
+
+    ``records`` is a RAW record count, not an entry span: a blank or unparseable
+    interior line is a record to the digest walk while the fold skips it, so the two
+    numbers differ and only the walk's own count can bound it.
+    """
+
+    records: int
+    sha: str
+
+
+def _unit_prefix(unit_id: str, records: int = _ALL_RECORDS) -> "_PrefixSeen | None":
+    """*unit_id*'s raw digest through *records*, or the whole file; ``None`` if unread.
+
+    Decode-free: :meth:`CrewLog.raw_prefix_digest` frames and hashes raw records
+    without parsing any of them, which is what makes this affordable on a read path.
+    A short walk reports the count it reached, and the caller compares counts.
+    """
+    try:
+        handle = open_session_log(unit_id)
+        if handle is None:
+            return None
+        sha, hashed = handle.raw_prefix_digest(records)
+        return _PrefixSeen(records=hashed, sha=sha)
+    except Exception:
+        return None
+
+
+def _prefix_holds(unit_id: str, seen: _PrefixSeen) -> bool:
+    """Whether *unit_id*'s first ``seen.records`` raw records still hash to *seen*.
+
+    Growth above them is not a change, because the walk stops at the count *seen*
+    names. This is the question a stat cannot answer: a size and an mtime say a file
+    moved, never whether the bytes a fold already consumed are the same bytes.
+    """
+    again = _unit_prefix(unit_id, seen.records)
+    return again is not None and again.records == seen.records and again.sha == seen.sha
+
+
+class _SlotFold:
+    """One SLOT-keyed crew-log fold as a :mod:`kiro_crew.projection` unit.
+
+    :class:`_SessionFold` with the two differences a concatenation of units brings.
+    The event arriving is an :class:`_Ordinal`, so ``apply`` unwraps before the fold
+    sees it -- the kernel orders by the wrapper's number and the fold reads the entry.
+    And the starting state is BOUND to the slot for a fold that declares ``bind_slot``,
+    so a slot-keyed fold knows which board it answers for before the first entry
+    instead of guessing it from whichever entry comes first.
+
+    The same-reference rule is kept the same way: an entry the fold cannot be moved by
+    returns the state untouched, and any other entry is stepped onto a copy.
+    """
+
+    def __init__(self, fold: _Fold, slot: str) -> None:
+        self._fold = fold
+        self._slot = slot
+        self.key = fold.name
+        self.state_version = FOLD_STATE_VERSION
+
+    def init(self) -> dict[str, Any]:
+        state = self._fold.start()
+        if self._slot and self._fold.bind_slot is not None:
+            self._fold.bind_slot(state, self._slot)
+        return state
+
+    def apply(self, state: dict[str, Any], event: _Ordinal) -> dict[str, Any]:
+        entry = event.entry
+        if not self._fold.touched_by(entry):
+            return state
+        grown = self._fold.copied(state)
+        self._fold.step(grown, entry)
+        return grown
+
+    def view(self, state: dict[str, Any]) -> dict[str, Any]:
+        return self._fold.render(state)
+
+
+class _SlotStream:
+    """A slot's units as one stream the kernel can order, oldest unit first.
+
+    Each unit's base is the total height of the units ALREADY STREAMED, counted as
+    this pass actually saw them rather than taken from a sampled height -- so an
+    append landing in an earlier unit while this runs still cannot push one of its
+    entries onto an ordinal a later unit has already used. A unit with no log
+    contributes nothing and is skipped, the same as the cold fold: a slot whose
+    oldest unit was collected by retention still folds the ones it has.
+
+    Iterating is a GENERATOR, so the kernel folds one entry at a time and a cold
+    fold of a long slot holds no more than that.
+
+    Two numbers the stream cannot return and its caller needs afterwards.
+    :attr:`heights` is the last seq FOLDED from each unit that had a log, which is
+    what lets the memo record what this pass really consumed instead of what was
+    sampled before it. :attr:`reached` is that height for the newest such unit, the
+    only figure a later read of the same slot can compare against and the one
+    :func:`fold_slot_checkpoint` has always answered with; it starts at *since*, so a
+    warm tail that turned out to be empty reports the position it resumed from rather
+    than dropping to zero.
+    """
+
+    def __init__(self, unit_ids: Sequence[str], *, base: int = 0, since: int = 0) -> None:
+        self._unit_ids = tuple(unit_ids)
+        self._base = base
+        self._since = since
+        self.reached = since
+        self.heights: dict[str, int] = {}
+
+    def __iter__(self) -> "Iterator[_Ordinal]":
+        base = self._base
+        for unit_id in self._unit_ids:
+            handle = open_session_log(unit_id)
+            if handle is None:
+                continue
+            top = base
+            reached = self._since
+            for entry in handle.iter_from(self._since + 1, known=KNOWN_TYPES):
+                ordinal = base + entry.seq
+                top = max(top, ordinal)
+                reached = max(reached, entry.seq)
+                yield _Ordinal(ordinal, entry)
+            base = top
+            self.heights[unit_id] = reached
+            self.reached = reached
+
+
+@dataclass
+class _SlotMemo:
+    """One slot fold kept warm: the kernel cell holding it, and what it folded over.
+
+    The registry is per (slot, fold), not one shared instance, and that is a
+    correctness requirement rather than a preference: ``prime`` folds and RESETS every
+    definition registered in it, so a shared registry would make a cold refold of one
+    fold discard another's warm cell -- and the three slot folds are read over
+    different unit lists, so they go stale independently.
+
+    ``marks`` is the per-unit watermark vector the reuse test compares, and the bases
+    the ordinals are built from are derived from it: unit *i*'s base is the total
+    height of the units before it. That derivation is what makes a warm continuation
+    land on the same ordinals the earlier pass used, and it holds because a memo is
+    only kept when every earlier unit's mark is unchanged.
+
+    A memo is never edited once stored. A read that carries one forward stores a NEW
+    memo over the SAME registry, so two reads racing on one slot cannot leave a pair of
+    fields half updated: the registry's cell is the single truth and holds its own lock,
+    and re-driving a range it has already folded is dropped on its watermark rather
+    than counted twice.
+    """
+
+    registry: ProjectionRegistry
+    store: str
+    units: "tuple[str, ...]"
+    marks: "tuple[_UnitMark, ...]"
+    reached: int
+    #: The NEWEST unit's raw digest as of the pass that built this cell, and the one
+    #: thing a continuation must check that a mark cannot. Every earlier unit is held
+    #: to whole-mark equality, so a rewrite there already folds cold; the newest unit is
+    #: admitted precisely because it GREW, and growth moves its size and mtime by
+    #: itself, which leaves a stat with nothing to say about the bytes underneath.
+    #: ``None`` means no digest is vouched for -- the file moved during the pass, or
+    #: could not be read -- and a continuation is refused rather than trusted.
+    prefix: "_PrefixSeen | None" = None
+
+
+_slot_memos: "dict[tuple[str, str, str], _SlotMemo]" = {}
+_slot_memo_guard = threading.Lock()
+
+
+def forget_slot_folds(slot: str = "", name: str = "") -> None:
+    """Drop warm slot folds, so the next read folds cold.
+
+    Everything when called with no argument; one slot's, or one fold of one slot's,
+    when named. The memo is an optimization with no answer of its own, so dropping it
+    costs time and never correctness -- which is what makes this safe as the read
+    path's own response to doubt, and what a test isolating one slot's log from
+    another's needs.
+    """
+    home = str(data_home())
+    with _slot_memo_guard:
+        if not slot and not name:
+            _slot_memos.clear()
+            return
+        for key in [
+            held
+            for held in _slot_memos
+            if held[0] == home and (not slot or held[1] == slot) and (not name or held[2] == name)
+        ]:
+            del _slot_memos[key]
+
+
+def _remember_slot_fold(key: "tuple[str, str, str]", memo: _SlotMemo) -> None:
+    """Keep *memo* under *key*, capped by count; the oldest slot is evicted first."""
+    with _slot_memo_guard:
+        _slot_memos[key] = memo
+        while len(_slot_memos) > SLOT_FOLD_CACHE_SLOTS:
+            _slot_memos.pop(next(iter(_slot_memos)))
+
+
+def _continuable(marks: "tuple[_UnitMark, ...]", held: "tuple[_UnitMark, ...]") -> bool:
+    """Whether *marks* is *held* with the newest unit grown, and nothing else moved.
+
+    The one shape a warm cell can be carried over, because its state was folded
+    through every earlier unit already. Everything else describes different bytes and
+    folds cold: a changed unit list, a unit whose identity changed or is unknown, an
+    EARLIER unit that grew (a forced reset tears a session down while a turn is still
+    appending through the handle it holds, so an earlier unit is not closed to writes),
+    an earlier unit whose bytes changed without its seq moving, and any unit whose seq
+    went backwards.
+
+    "Nothing else moved" is decided by whole-mark equality, so it covers each earlier
+    unit's stat fingerprint as well as its identity and height -- that is what makes an
+    in-place rewrite of an already-folded entry a cold fold rather than an equal
+    comparison. The newest unit is compared on identity and growth alone, because this
+    function exists to admit exactly its growth and an append moves its fingerprint by
+    itself.
+    """
+    return (
+        bool(marks)
+        and len(marks) == len(held)
+        and all(mark.origin is not None for mark in marks)
+        and marks[:-1] == held[:-1]
+        and marks[-1].origin == held[-1].origin
+        and marks[-1].last_seq > held[-1].last_seq
+    )
+
+
+def fold_slot_warm(name: str, unit_ids: Sequence[str], *, slot: str) -> Checkpoint:
+    """*name* folded over *slot*'s units, CONTINUED from where the last read left it.
+
+    :func:`fold_slot_checkpoint`'s answer, reached incrementally. Folding is O(the
+    log), not O(the record): the reader walks every line of every unit to find the few
+    that move this fold, and a slot's logs carry its message bodies. The readers that
+    pay that are loops that wake on a timer, so the fold is kept in memory per slot and
+    advanced over the entries that arrived since -- through the projection kernel,
+    whose watermark drops an entry already folded, so the resumed answer and the
+    from-scratch answer come out of one implementation.
+
+    A warm read reads ONE file: the newest unit, from its remembered position. A cold
+    read streams every unit. Both go through the kernel, so there is no second folding
+    path that could disagree with the first about the same bytes.
+
+    A continuation also HASHES that one file's already-folded records before trusting
+    them (:func:`_prefix_holds`). The store rewrites a committed prefix on two recovery
+    paths -- an unreachable chunk group is truncated away and closers are appended with
+    seqs continuing from the cut, and a failed append is truncated back after its bytes
+    reached the disk -- and a reader holds no append lock while either runs. Both leave
+    a file that has grown since the last read and reuses seqs the fold already consumed,
+    which is a pure append to every stat and to every seq comparison. The digest is
+    decode-free, so it costs a byte walk of one unit against the parse-and-fold walk of
+    every unit that a cold read would pay.
+
+    THE INVARIANT: the heights sampled before a pass reads are its READ PLAN, never the
+    cell's claim about itself. What a memo remembers is what the pass actually FOLDED
+    (:func:`_folded_marks`). Two things follow. An append landing mid-read is folded in
+    and the next read starts above it, so it is neither dropped nor counted twice. And a
+    slot that has not moved compares equal and is answered from the cell -- where a memo
+    holding the sample would sit permanently one entry short of itself and send every
+    later read back to the file for a tail it has already folded.
+
+    In memory rather than on disk, per process, and best-effort by contract: a second
+    process folds cold, and so does the first after an eviction. What must never happen
+    is a WRONG answer, so every condition :func:`_continuable` does not admit refolds
+    from empty rather than carrying state that describes other bytes.
+    """
+    require_name(name)
+    key = (str(data_home()), slot, name)
+    with _slot_memo_guard:
+        memo = _slot_memos.get(key)
+    marks = _unit_marks(unit_ids)
+    units = tuple(unit_ids)
+    known = all(mark.origin is not None for mark in marks)
+    if memo is not None and memo.units == units:
+        if known and memo.marks == marks:
+            return _slot_checkpoint(name, memo)
+        if (
+            _continuable(marks, memo.marks)
+            and memo.prefix is not None
+            and _prefix_holds(units[-1], memo.prefix)
+        ):
+            before = _unit_prefix(units[-1])
+            tail = _SlotStream(
+                units[-1:],
+                base=sum(mark.last_seq for mark in marks[:-1]),
+                since=memo.reached,
+            )
+            for event in tail:
+                memo.registry.drive(memo.store, event)
+            grown = _SlotMemo(
+                registry=memo.registry,
+                store=memo.store,
+                units=units,
+                marks=_folded_marks(units, marks, tail, carried=memo.marks),
+                reached=tail.reached,
+                prefix=_vouched(units[-1], before),
+            )
+            _remember_slot_fold(key, grown)
+            return _slot_checkpoint(name, grown)
+    cold = _SlotStream(units)
+    registry = ProjectionRegistry(seq_of=_ordinal_seq)
+    registry.register(_SlotFold(_FOLDS[name], slot))
+    before = _unit_prefix(units[-1]) if units else None
+    registry.prime(slot, cold)
+    fresh = _SlotMemo(
+        registry=registry,
+        store=slot,
+        units=units,
+        marks=_folded_marks(units, marks, cold),
+        reached=cold.reached,
+        prefix=_vouched(units[-1], before) if units else None,
+    )
+    if known:
+        _remember_slot_fold(key, fresh)
+    return _slot_checkpoint(name, fresh)
+
+
+def _vouched(unit_id: str, before: "_PrefixSeen | None") -> "_PrefixSeen | None":
+    """*before*, but only if *unit_id* is byte-identical now to what it was then.
+
+    A digest read only AFTER a pass would certify bytes the pass never read: an entry
+    rewritten while the fold was running would be hashed together with state folded
+    from its earlier value, every later continuation would recompute that same digest,
+    match, and keep serving the state. So the digest is taken before the pass and
+    confirmed after it, and a file that moved in between vouches for nothing -- which
+    costs the next read a cold fold and never a wrong answer.
+    """
+    if before is None:
+        return None
+    return before if _unit_prefix(unit_id) == before else None
+
+
+def _folded_marks(
+    units: "tuple[str, ...]",
+    sampled: "tuple[_UnitMark, ...]",
+    stream: _SlotStream,
+    *,
+    carried: "tuple[_UnitMark, ...] | None" = None,
+) -> "tuple[_UnitMark, ...]":
+    """*sampled*, with each streamed unit's height replaced by what was FOLDED.
+
+    This is where :func:`fold_slot_warm`'s invariant is applied: the sampled heights are
+    that read's plan, and what a memo remembers is what its pass consumed.
+
+    The FINGERPRINT is carried across as sampled, and deliberately not re-stat'ed after
+    the pass. A fingerprint taken afterwards would cover bytes this pass may not have
+    folded -- an entry appended between the last read and that stat -- and the next read
+    would then compare equal and serve a cell that is missing it. Sampled, the error can
+    only fall the other way: a slot whose bytes moved mid-pass fails the comparison, and
+    the next read folds cold, which costs time and not correctness.
+
+    *carried* is a warm continuation's earlier marks, which this pass did not read and
+    has already found unchanged; only the newest unit is re-stated from the stream.
+    """
+    base = list(carried if carried is not None else sampled)
+    return tuple(
+        _UnitMark(
+            sampled[index].origin,
+            stream.heights.get(unit, base[index].last_seq),
+            sampled[index].size,
+            sampled[index].mtime_ns,
+        )
+        for index, unit in enumerate(units)
+    )
+
+
+def _slot_checkpoint(name: str, memo: _SlotMemo) -> Checkpoint:
+    """*memo*'s kernel cell as the checkpoint this module's callers carry.
+
+    ``last_seq`` is the newest unit's OWN seq, not the kernel's ordinal, and that is
+    the contract rather than an implementation detail: a writer advances this
+    checkpoint over the entry it is appending to answer with the record that entry
+    produces, and that entry's seq comes from its file. An ordinal here would sit far
+    above it and :func:`advance` would refuse the entry as already folded.
+
+    The state comes back AS THE CELL HOLDS IT, not copied, which is what the folds'
+    own discipline makes safe: ``apply`` returns a new object rather than editing this
+    one, so a later read replaces the cell's state instead of moving what a caller
+    kept, and the callers that continue this checkpoint go through :func:`advance`,
+    which copies before its first step.
+    """
+    state, _watermark = memo.registry.cells(memo.store)[name]
+    return Checkpoint(name=name, last_seq=max(memo.reached, 0), state=state)
 
 
 def slot_of_session(session_id: str) -> str:
@@ -1938,6 +3251,506 @@ def slot_of_session(session_id: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# work -- the conductor work board, keyed by the conductor's slot
+# --------------------------------------------------------------------------- #
+
+
+def _work_units(slot: str, conductor_units: Sequence[str]) -> "tuple[str, ...]":
+    """The conductor's units followed by every bound worker's, oldest first.
+
+    A worker's report is appended to the WORKER's log, and that log's header names
+    the worker's own slot, so the header index alone never reaches it. The
+    conductor's ``bind`` entries carry ``worker_session_key``: each names a slot whose
+    units join the fold after the conductor's. A worker bound to several boards
+    carries the conductor's ``slot`` on every entry, and the fold keeps only the
+    entries naming this board, so the extra units add nothing that is not this
+    board's.
+    """
+    workers: list[str] = []
+    seen: set[str] = set()
+    for unit_id in conductor_units:
+        handle = open_session_log(unit_id)
+        if handle is None:
+            continue
+        for entry in handle.iter_from(1, known=KNOWN_TYPES):
+            if entry.type != WORK_ENTRY_TYPE:
+                continue
+            data = entry.data
+            if data.get("action") != "bind" or _as_str(data.get("slot")) != slot:
+                continue
+            worker = data.get("worker_session_key")
+            if isinstance(worker, str) and worker and worker not in seen:
+                seen.add(worker)
+                workers.append(worker)
+    units = list(conductor_units)
+    known = set(units)
+    for worker in workers:
+        for unit_id in session_ledger.work_crew_log_units(worker):
+            if unit_id not in known:
+                known.add(unit_id)
+                units.append(unit_id)
+    return tuple(units)
+
+
+def work_slots_naming_board(slot: str) -> "tuple[str, ...]":
+    """Every OTHER slot whose session units carry a ``work/recorded`` entry for *slot*.
+
+    The third way a board's workers are found, and the one that needs nothing but
+    the record. The fold reaches a worker through the conductor's recorded ``bind``,
+    and a rebuild also reaches it through the cached binding file; a worker bound
+    before the board was recorded has neither once the cache is lost, yet its own
+    log holds the baseline report that names the board. A rebuild that searched
+    only the first two would rebuild the board without that worker's item.
+
+    A whole-log walk, so it is for a rebuild (an operator's request), not for the
+    per-read fold: every other slot's units are opened, and each is left as soon as
+    one entry names the board. Ordered by slot name so the result is stable.
+    """
+    if not slot:
+        return ()
+    found: list[str] = []
+    for other, unit_ids in sorted(session_units_by_slot().items()):
+        if other == slot:
+            continue
+        for unit_id in unit_ids:
+            handle = open_session_log(unit_id)
+            if handle is None:
+                continue
+            names_board = False
+            for entry in handle.iter_from(1, known=KNOWN_TYPES):
+                if entry.type == WORK_ENTRY_TYPE and _as_str(entry.data.get("slot")) == slot:
+                    names_board = True
+                    break
+            if names_board:
+                found.append(other)
+                break
+    return tuple(found)
+
+
+#: Item records the fold retains per board. The WRITER caps a board at far fewer
+#: (it refuses a create past its own limit); this is the fold's own bound, so a
+#: log that somehow carries more still folds to a value of bounded size.
+WORK_ITEM_LIMIT: Final[int] = 256
+
+#: Newest event lines kept per item, the same tail the stored ledger kept.
+WORK_EVENT_LIMIT: Final[int] = 200
+
+#: Entries parked per item while its ``create`` is still in a unit not yet folded.
+WORK_PARKED_LIMIT: Final[int] = 64
+
+#: Longest event text a line carries, the store's own excerpt bound.
+WORK_EVENT_TEXT_LIMIT: Final[int] = 500
+
+#: Fields a conductor entry may set on an item, by action; a worker's are fixed.
+#: One table, shared with the write route through ``kiro_crew.work_vocab``.
+_WORK_CONDUCTOR_FIELDS: Final[dict[str, tuple[str, ...]]] = WORK_CONDUCTOR_FIELDS
+_WORK_WORKER_FIELDS: Final[tuple[str, ...]] = ("status", "summary", "artifacts", "pr")
+#: Every item field a baseline entry may carry: the conductor's and the worker's.
+_WORK_BASELINE_FIELDS: Final[tuple[str, ...]] = (
+    "title",
+    "acceptance",
+    "state",
+    "verdict",
+    "decision",
+    "worker_session_key",
+    "round",
+    "fails",
+    "status",
+    "summary",
+    "artifacts",
+    "pr",
+)
+
+
+def _work_iso(stamp_ms: int) -> str:
+    """An entry's epoch-millisecond ``time`` in the ledger's timestamp spelling.
+
+    Work and session ledgers read the same untrusted envelope field, so they use
+    one conversion policy: local time with offset and seconds precision, or the
+    empty string when the platform cannot represent the value.
+    """
+    return _ledger_iso(stamp_ms)
+
+
+def _work_stamp(committed: Any, stamp_ms: int) -> str:
+    """The committed stamp an entry carries, else the entry's own append time."""
+    if isinstance(committed, str) and committed:
+        return committed[:TEXT_LIMIT]
+    return _work_iso(stamp_ms)
+
+
+def _work_start() -> dict[str, Any]:
+    return {
+        "slot": "",
+        "goal": "",
+        "round": 0,
+        "goal_version": 0,
+        "depth": 0,
+        "parent_item": None,
+        "created_at": "",
+        "items": {},
+        "order": [],
+        "parked": {},
+        "omitted": 0,
+        "entries": 0,
+        "first_entry_at": "",
+        "generation": "",
+    }
+
+
+def _work_new_item(item_id: str, stamp_ms: int) -> dict[str, Any]:
+    return {
+        "item_id": item_id,
+        "title": "",
+        "acceptance": {},
+        "state": "open",
+        "verdict": None,
+        "decision": "",
+        "worker_session_key": None,
+        "round": 0,
+        "fails": 0,
+        "status": None,
+        "summary": "",
+        "artifacts": {},
+        "pr": None,
+        "last_report_at": None,
+        "created_at": _work_iso(stamp_ms),
+        "closed_at": None,
+        "events": [],
+    }
+
+
+def _work_reset_board(state: dict[str, Any]) -> None:
+    """A new board generation under the same slot: the earlier board's items,
+    header, parked entries and accumulators are dropped; the slot binding is kept.
+
+    ``entries`` and ``first_entry_at`` belong to the BOARD, not to the fold: they are
+    rendered as that board's metadata, and ``first_entry_at`` is the epoch that tells
+    an item created before the board's first recorded entry from one created after.
+    Carrying them across a reset gives the new board the old one's entry count and
+    the old one's epoch, which classifies its own items as predating it.
+    ``generation`` is excluded because the caller assigns the new one immediately.
+    """
+    fresh = _work_start()
+    for key, value in fresh.items():
+        if key not in ("slot", "generation"):
+            state[key] = value
+
+
+def _work_bind_slot(state: dict[str, Any], slot: str) -> None:
+    """The board this fold is of, as the reader names it, before the first entry."""
+    state["slot"] = slot
+
+
+def _work_step(state: dict[str, Any], entry: Entry) -> None:
+    if entry.type != WORK_ENTRY_TYPE:
+        return
+    data = entry.data
+    if not state["slot"]:
+        # Unbound (a caller that folded units without naming the board): only a
+        # conductor's OWN action names its board. A report this session filed
+        # as a worker names its parent's board and must not pick the fold's.
+        if data.get("actor") != "conductor":
+            return
+        state["slot"] = _as_str(data.get("slot"))
+    elif _as_str(data.get("slot")) != state["slot"]:
+        # A bound worker's log, or a nested conductor's, carries another
+        # board's entries; only this board's fold here.
+        return
+    generation = _as_str(data.get("generation"))
+    if not generation and state["generation"]:
+        # A stamped board is live, so an entry carrying NO generation cannot be its:
+        # the stamp is minted with the board and every entry of a stamped board
+        # carries it. It is a straggler from an earlier board under this slot --
+        # purged, or dropped by the reset below -- and the log is append-only, so it
+        # outlives that board forever. Applied, it silently resurrects that board's
+        # items on every fold, and the rebuild cannot refuse it either: that guard
+        # compares two generations and needs both non-empty. The mismatch branch
+        # below cannot catch this one, being reached only when the entry HAS a
+        # generation to disagree with. A board from before the stamp existed keeps
+        # working: it never adopts a generation, so `state["generation"]` stays
+        # empty and its own generationless entries still apply.
+        state["omitted"] += 1
+        return
+    if generation and generation != state["generation"]:
+        # Generations are opaque ids minted when a board's record is created, so
+        # they transition in LOG order, never by comparing them: the conductor's
+        # units fold first and in sequence, so a conductor entry with a new id is
+        # the next board under this slot and the earlier board is dropped; a
+        # worker entry whose id is not the current board's is a straggler from
+        # a purged board and is omitted.
+        if data.get("actor") != "conductor":
+            if state["generation"] or state["entries"]:
+                state["omitted"] += 1
+                return
+            # Nothing folded yet and the first entry is a worker's: a board from
+            # before the projection whose first recorded write is a report. Its
+            # generation is the board's; adopt it.
+        elif state["entries"]:
+            # Whatever came before -- a generation-stamped board or one from
+            # before the stamp existed -- was the earlier board; it is dropped.
+            _work_reset_board(state)
+        state["generation"] = generation
+    state["entries"] += 1
+    if not state["first_entry_at"]:
+        state["first_entry_at"] = _work_iso(entry.time)
+    if not state["created_at"] and data.get("actor") == "conductor":
+        state["created_at"] = _work_iso(entry.time)
+    action = _as_str(data.get("action"))
+    if action == "goal":
+        _work_apply_header(state, data)
+        return
+    item_id = _as_id(data.get("item_id"))
+    if not item_id:
+        state["omitted"] += 1
+        return
+    if action == "create":
+        if item_id in state["items"]:
+            state["omitted"] += 1
+            return
+        if len(state["items"]) >= WORK_ITEM_LIMIT:
+            state["omitted"] += 1
+            return
+        item = _work_new_item(item_id, entry.time)
+        item["round"] = state["round"]
+        item["created_at"] = _work_stamp(data.get("created_at"), entry.time)
+        state["items"][item_id] = item
+        state["order"].append(item_id)
+        _work_apply_header(state, data)
+        _work_apply(item, data, entry.time)
+        # Entries seen before the create belong to a unit folded earlier than the
+        # conductor's; they were kept aside and are applied now, in time order.
+        for parked in sorted(state["parked"].pop(item_id, ()), key=lambda p: p[0]):
+            _work_apply(item, parked[1], parked[0])
+        return
+    item = state["items"].get(item_id)
+    if item is None and data.get("baseline") is True:
+        # The entry carries the whole committed item (one the record never held
+        # whole before): materialise it here, then apply the action as usual.
+        if len(state["items"]) >= WORK_ITEM_LIMIT:
+            state["omitted"] += 1
+            return
+        item = _work_new_item(item_id, entry.time)
+        item["created_at"] = _work_stamp(data.get("created_at"), entry.time)
+        for name in _WORK_BASELINE_FIELDS:
+            if name in data:
+                item[name] = _work_field(name, data[name])
+        # The committed stamps ride along: an item with a report or a close from
+        # before the projection keeps them across a rebuild.
+        for name in ("last_report_at", "closed_at"):
+            if isinstance(data.get(name), str) and data[name]:
+                item[name] = _work_stamp(data[name], entry.time)
+        # The baseline carries the board's lineage and goal too, whoever wrote it.
+        _work_apply_header(state, data)
+        # Rendered, so a reader knows this item's history before the baseline is
+        # not in the record (its event tail starts at the baseline).
+        item["baseline"] = True
+        state["items"][item_id] = item
+        state["order"].append(item_id)
+        for parked_entry in sorted(state["parked"].pop(item_id, ()), key=lambda p: p[0]):
+            _work_apply(item, parked_entry[1], parked_entry[0])
+    if item is None:
+        parked = state["parked"].get(item_id)
+        if parked is None:
+            # A new key is retained only within the item bound: the parked map
+            # can hold no more distinct items than the board itself may.
+            if len(state["parked"]) >= WORK_ITEM_LIMIT:
+                state["omitted"] += 1
+                return
+            parked = state["parked"][item_id] = []
+        if len(parked) >= WORK_PARKED_LIMIT:
+            state["omitted"] += 1
+            return
+        parked.append([entry.time, dict(data)])
+        return
+    _work_apply(item, data, entry.time)
+
+
+def _work_apply_header(state: dict[str, Any], data: Mapping[str, Any]) -> None:
+    """The board-level fields a conductor entry may carry.
+
+    A conductor ``goal`` entry is the authoritative source for the goal text and round,
+    and it is version-stamped. A worker BASELINE carries the same fields for a board the
+    record never saw set, and it is not version-stamped -- so applying it last-writer-wins
+    let a stale baseline folded after a conductor goal regress the header, while
+    ``goal_version`` beside it was protected by ``max()``. The fold is deterministic, so a
+    regressed header is not a transient glitch: it re-derives identically on every later
+    rebuild and the wrong goal is what a resume reads.
+
+    Hence ``_from_baseline``: a baseline supplies header fields only while the record holds
+    no goal write for this board at all (``goal_version`` still 0). That is what "no newer
+    conductor goal has been folded" means here, and it keeps the baseline doing the one job
+    it exists for -- describing a board whose header was never recorded -- without letting
+    it speak over a board whose header was.
+    """
+    from_baseline = _as_str(data.get("action")) != "goal"
+    baseline_may_set = state["goal_version"] == 0
+    if isinstance(data.get("goal"), str) and (not from_baseline or baseline_may_set):
+        state["goal"] = _work_text("goal", data["goal"])
+    if "round" in data and data.get("action") == "goal":
+        state["round"] = _as_int(data.get("round"))
+    if "goal_version" in data and data.get("action") == "goal":
+        state["goal_version"] = max(state["goal_version"], _as_int(data.get("goal_version")))
+    if "depth" in data and not state["depth"]:
+        state["depth"] = _as_int(data.get("depth"))
+    if isinstance(data.get("parent_item"), str) and state["parent_item"] is None:
+        state["parent_item"] = _as_id(data["parent_item"])
+    # A baseline carries the board's own committed round and creation stamp under
+    # names of their own (``round`` on an item entry is the item's), so a board
+    # whose header the record never saw set rebuilds with them rather than with a
+    # zero round and the first entry's time.
+    if "board_round" in data and from_baseline and baseline_may_set:
+        state["round"] = _as_int(data.get("board_round"))
+    board_created = data.get("board_created_at")
+    if isinstance(board_created, str) and board_created:
+        stamp = _work_stamp(board_created, 0)
+        if not state["created_at"] or stamp < state["created_at"]:
+            state["created_at"] = stamp
+
+
+def _work_apply(item: dict[str, Any], data: Mapping[str, Any], stamp_ms: int) -> None:
+    """One entry's delta onto *item*: its fields, then its event line.
+
+    A conductor's and a worker's fields are disjoint, so applying the two parties'
+    entries in either relative order yields the same fields -- which is what lets
+    one board be folded unit by unit when the units interleave in time. The event
+    tail is the one place order shows, and it is kept in time order on insert.
+    """
+    action = _as_str(data.get("action"))
+    actor = _as_str(data.get("actor"))
+    if actor == "worker":
+        if action != "report":
+            return
+        for name in _WORK_WORKER_FIELDS:
+            if name in data:
+                item[name] = _work_field(name, data[name])
+        item["last_report_at"] = _work_stamp(data.get("last_report_at"), stamp_ms)
+    else:
+        allowed = _WORK_CONDUCTOR_FIELDS.get(action)
+        if allowed is None:
+            return
+        for name in allowed:
+            if name in data:
+                item[name] = _work_field(name, data[name])
+        if action == "close":
+            item["closed_at"] = _work_stamp(data.get("closed_at"), stamp_ms)
+    kind = _as_str(data.get("event_kind"))
+    if not kind:
+        return
+    status = data.get("status") if action == "report" else None
+    text = _as_str(data.get("event"))[:WORK_EVENT_TEXT_LIMIT]
+    # The store's own stamp and id when the entry carries them (every entry the
+    # routes write does); the append time and the content address otherwise.
+    ts = _work_stamp(data.get("event_ts"), stamp_ms)
+    event_id = data.get("event_id")
+    if not isinstance(event_id, str) or not event_id:
+        from kiro_crew.work_vocab import work_event_id
+
+        event_id = work_event_id(ts, item["item_id"], kind, text, status=status)
+    _work_add_event(
+        item,
+        {
+            "id": event_id[:TEXT_LIMIT],
+            "ts": ts,
+            "item_id": item["item_id"],
+            "kind": kind,
+            "status": status if isinstance(status, str) else None,
+            "text": text,
+            "_t": stamp_ms,
+        },
+    )
+
+
+def _work_field(name: str, value: Any) -> Any:
+    """*value* in the shape the record holds for *name*; the fold's own shape gate."""
+    if name in ("acceptance", "artifacts"):
+        if not isinstance(value, dict):
+            return {}
+        if name == "artifacts":
+            return {str(k): v for k, v in value.items() if isinstance(v, str)}
+        return dict(value)
+    if name in ("round", "fails", "pr"):
+        return _as_int(value) if value is not None else None
+    if name in ("verdict", "worker_session_key", "status"):
+        return _work_text(name, value) if value is not None else None
+    return _work_text(name, value)
+
+
+#: The store's own character caps for the work board's text fields. The shared
+#: ``TEXT_LIMIT`` (200) is a title's width; a decision or a goal the store took
+#: at 2000 must come back whole, so the fold cuts each field at the store's bound.
+_WORK_TEXT_LIMITS: Final[dict[str, int]] = {
+    "goal": 2000,
+    "decision": 2000,
+    "summary": 500,
+    "title": 200,
+}
+
+
+def _work_text(name: str, value: Any) -> str:
+    """*value* when it is a string, cut at the store's cap for *name*, else empty."""
+    if not isinstance(value, str):
+        return ""
+    return value[: _WORK_TEXT_LIMITS.get(name, TEXT_LIMIT)]
+
+
+def _work_add_event(item: dict[str, Any], event: dict[str, Any]) -> None:
+    """Insert *event* into the item's tail in time order and apply the store's rules:
+    two consecutive ``progress`` reports collapse to the newer, and the tail keeps
+    its newest :data:`WORK_EVENT_LIMIT` lines."""
+    events: list[dict[str, Any]] = item["events"]
+    at = len(events)
+    while at > 0 and events[at - 1]["_t"] > event["_t"]:
+        at -= 1
+    events.insert(at, event)
+    if _work_is_progress(event):
+        if at > 0 and _work_is_progress(events[at - 1]):
+            del events[at - 1]
+            at -= 1
+        if at + 1 < len(events) and _work_is_progress(events[at + 1]):
+            del events[at]
+    if len(events) > WORK_EVENT_LIMIT:
+        del events[: len(events) - WORK_EVENT_LIMIT]
+
+
+def _work_is_progress(event: Mapping[str, Any]) -> bool:
+    return event.get("kind") == "report" and event.get("status") == "progress"
+
+
+def _work_render(state: dict[str, Any]) -> dict[str, Any]:
+    """The board in the shape its readers already consume: the conductor header and
+    every item in creation order, each with its event tail."""
+    items = []
+    for item_id in state["order"]:
+        item = state["items"].get(item_id)
+        if item is None:
+            continue
+        rendered = {key: value for key, value in item.items() if key != "events"}
+        rendered["schema"] = 1
+        rendered["events"] = [
+            {key: value for key, value in event.items() if key != "_t"} for event in item["events"]
+        ]
+        items.append(rendered)
+    return {
+        "conductor": {
+            "schema": 1,
+            "slot_key": state["slot"],
+            "goal": state["goal"],
+            "round": state["round"],
+            "goal_version": state["goal_version"],
+            "depth": state["depth"],
+            "parent_item": state["parent_item"],
+            "created_at": state["created_at"],
+            "entries": state["entries"],
+            "first_entry_at": state["first_entry_at"],
+            "generation": state["generation"],
+        },
+        "items": items,
+        "omitted": state["omitted"] + sum(len(p) for p in state["parked"].values()),
+    }
 
 
 def _as_int(value: Any) -> int:
@@ -2034,14 +3847,159 @@ def _as_id(value: Any) -> str:
     return value
 
 
+# --------------------------------------------------------------------------- #
+# What each fold touches, and what its copy has to cover
+# --------------------------------------------------------------------------- #
+#
+# A session fold's ``step`` mutates the dict it is handed, and the projection kernel
+# drives a pure ``apply`` (:class:`_SessionFold`), so each fold declares two things
+# the wrapper needs. They are declared TOGETHER rather than beside their own folds
+# because they are read against each other: the question a reviewer asks is whether
+# one fold's copier covers every container its step reaches, and the answer is easier
+# to see with the six side by side than scattered through two thousand lines.
+#
+# A copier covers the containers a step MUTATES, not every container in the state. A
+# value the step only ever REPLACES whole -- ``status``'s ``open_turn``, ``approvals``'
+# ``last``, a frame put into ``open`` or ``pending`` -- needs no copy of its own: the
+# old object is dropped rather than edited, so the state it came from keeps it intact.
+
+
+#: Entry types ``usage`` bills. A turn's cost, the context composed for it,
+#: compaction, and step time.
+USAGE_TYPES: Final[frozenset[str]] = frozenset(
+    {"turn/completed", "context/composed", "compaction/applied", "step/completed"}
+)
+
+#: Entry types ``tools`` pairs: a call and the completion that closes it.
+TOOL_TYPES: Final[frozenset[str]] = frozenset({"tool/called", "tool/completed"})
+
+#: Entry types ``approvals`` pairs: a request and the decision that answers it.
+APPROVAL_TYPES: Final[frozenset[str]] = frozenset({"approval/requested", "approval/decided"})
+
+
+def _flat_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """A copy for a fold whose step writes only top-level keys.
+
+    ``status`` and ``class``. Every nested value either is a scalar or is replaced
+    whole, so nothing under the top level is ever edited in place.
+    """
+    return dict(state)
+
+
+def _timeline_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """``moments`` is appended to and trimmed from the front; a moment is never edited."""
+    grown = dict(state)
+    grown["moments"] = list(state["moments"])
+    return grown
+
+
+def _usage_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """Per-dimension, per-model and per-source rows are all incremented in place."""
+    grown = dict(state)
+    grown["tokens"] = dict(state["tokens"])
+    grown["by_model"] = {model: dict(row) for model, row in state["by_model"].items()}
+    grown["context_by_source"] = {
+        source: dict(row) for source, row in state["context_by_source"].items()
+    }
+    grown["omitted_models"] = list(state["omitted_models"])
+    return grown
+
+
+def _tools_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """A per-name row is incremented, and its two server lists are appended to.
+
+    The deepest copy of the six, and still bounded: ``TOOL_NAME_LIMIT`` rows each
+    holding at most ``SERVERS_PER_TOOL_LIMIT`` names, plus ``OPEN_RETAIN_LIMIT``
+    frames whose dict is rebuilt but whose frames are only ever added and removed.
+    """
+    grown = dict(state)
+    grown["by_name"] = {
+        name: {
+            **row,
+            "servers": list(row["servers"]),
+            "servers_over": list(row["servers_over"]),
+        }
+        for name, row in state["by_name"].items()
+    }
+    grown["open"] = dict(state["open"])
+    grown["omitted_names"] = list(state["omitted_names"])
+    return grown
+
+
+def _approvals_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """``pending`` gains and loses frames, and ``by_decision`` counts per decision."""
+    grown = dict(state)
+    grown["pending"] = dict(state["pending"])
+    grown["by_decision"] = dict(state["by_decision"])
+    return grown
+
+
 _FOLDS: Final[dict[str, _Fold]] = {
-    "status": _Fold("status", _status_start, _status_step, _status_render),
-    "usage": _Fold("usage", _usage_start, _usage_step, _usage_render),
-    "timeline": _Fold("timeline", _timeline_start, _timeline_step, _timeline_render),
-    "tools": _Fold("tools", _tools_start, _tools_step, _tools_render),
-    "approvals": _Fold("approvals", _approvals_start, _approvals_step, _approvals_render),
-    "class": _Fold("class", _class_start, _class_step, _class_render),
-    "ledger": _Fold("ledger", _ledger_start, _ledger_step, _ledger_render),
+    # ``affects=None``: every entry moves these two. ``status`` counts entries and
+    # keeps the newest time, and ``class`` records the seq it saw so a gap in the
+    # history reads as damage.
+    "status": _Fold("status", _status_start, _status_step, _status_render, copy_state=_flat_copy),
+    "usage": _Fold(
+        "usage",
+        _usage_start,
+        _usage_step,
+        _usage_render,
+        affects=USAGE_TYPES,
+        copy_state=_usage_copy,
+    ),
+    "timeline": _Fold(
+        "timeline",
+        _timeline_start,
+        _timeline_step,
+        _timeline_render,
+        affects=TIMELINE_TYPES,
+        copy_state=_timeline_copy,
+    ),
+    "tools": _Fold(
+        "tools",
+        _tools_start,
+        _tools_step,
+        _tools_render,
+        affects=TOOL_TYPES,
+        copy_state=_tools_copy,
+    ),
+    "approvals": _Fold(
+        "approvals",
+        _approvals_start,
+        _approvals_step,
+        _approvals_render,
+        affects=APPROVAL_TYPES,
+        copy_state=_approvals_copy,
+    ),
+    "class": _Fold("class", _class_start, _class_step, _class_render, copy_state=_flat_copy),
+    # The SLOT-keyed folds each answer to exactly ONE entry type -- their ``step``
+    # returns on its first line for anything else -- so ``affects`` names that type and
+    # the kernel skips both the copy and the step for every other entry. A slot's log
+    # is mostly message bodies and tool rows, so that is nearly all of it. They declare
+    # no ``copy_state`` and fall back to the deep copy, which every fold state here is
+    # bounded by construction for.
+    "ledger": _Fold(
+        "ledger",
+        _ledger_start,
+        _ledger_step,
+        _ledger_render,
+        affects=frozenset({LEDGER_ENTRY_TYPE}),
+    ),
+    "radar": _Fold(
+        "radar",
+        _radar_start,
+        _radar_step,
+        _radar_render,
+        affects=frozenset({RADAR_ENTRY_TYPE}),
+    ),
+    "work": _Fold(
+        "work",
+        _work_start,
+        _work_step,
+        _work_render,
+        bind_slot=_work_bind_slot,
+        affects=frozenset({WORK_ENTRY_TYPE}),
+    ),
 }
 
 if tuple(_FOLDS) != FOLD_NAMES:  # pragma: no cover - import-time consistency

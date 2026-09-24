@@ -19,6 +19,7 @@ def _make_cfg(
     import_onboarded: bool = False,
     language: str = "",
     privacy_acked: bool = False,
+    crewmates_onboarded: bool = False,
 ):
     """Build a mock KiroCrewConfig with dashboard display fields.
 
@@ -34,6 +35,7 @@ def _make_cfg(
     cfg.dashboard.import_onboarded = import_onboarded
     cfg.dashboard.language = language
     cfg.dashboard.privacy_acked = privacy_acked
+    cfg.dashboard.crewmates_onboarded = crewmates_onboarded
     return cfg
 
 
@@ -54,6 +56,7 @@ async def test_theme_boot_returns_defaults() -> None:
         "onboarded": False,
         "import_onboarded": False,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
 
 
@@ -78,6 +81,7 @@ async def test_theme_boot_returns_configured_values() -> None:
         "onboarded": True,
         "import_onboarded": True,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
 
 
@@ -103,6 +107,7 @@ async def test_theme_config_get() -> None:
         "onboarded": True,
         "import_onboarded": True,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
 
 
@@ -132,6 +137,7 @@ async def test_theme_config_put_updates_and_saves() -> None:
         "onboarded": True,
         "import_onboarded": True,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
     cfg.save.assert_called_once()
 
@@ -196,6 +202,40 @@ async def test_theme_config_put_validates_privacy_acked_boolean() -> None:
 
 
 @pytest.mark.asyncio
+async def test_theme_config_put_persists_crewmates_onboarded() -> None:
+    """The route must persist the Meet CrewMates first-run flag.
+
+    The flow is gated server-side so a second machine does not replay it; the
+    browser's localStorage mirror is only a render cache the gateway cannot see.
+    """
+    cfg = _make_cfg()
+    with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
+        mock_cls.load.return_value = cfg
+        req = MagicMock(spec=web.Request)
+        req.method = "PUT"
+        req.json = AsyncMock(return_value={"crewmates_onboarded": True})
+        resp = await core_mod.api_theme_config(req)
+    assert resp.status == 200
+    assert cfg.dashboard.crewmates_onboarded is True
+    assert json.loads(resp.body)["crewmates_onboarded"] is True
+    cfg.save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_theme_config_put_validates_crewmates_onboarded_boolean() -> None:
+    """A truthy string must not silently mark the Meet CrewMates flow as done."""
+    cfg = _make_cfg()
+    with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
+        mock_cls.load.return_value = cfg
+        req = MagicMock(spec=web.Request)
+        req.method = "PUT"
+        req.json = AsyncMock(return_value={"crewmates_onboarded": "true"})
+        with pytest.raises(web.HTTPBadRequest):
+            await core_mod.api_theme_config(req)
+    cfg.save.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_theme_config_put_no_change_no_save() -> None:
     """PUT /api/config/theme with same values does not call save."""
     cfg = _make_cfg(
@@ -242,6 +282,7 @@ async def test_theme_config_put_serializes_full_load_modify_save_transaction() -
         "onboarded": False,
         "import_onboarded": False,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
     json_waiters = 0
     both_parsed = asyncio.Event()
@@ -255,6 +296,7 @@ async def test_theme_config_put_serializes_full_load_modify_save_transaction() -
             self.dashboard.onboarded = persisted["onboarded"]
             self.dashboard.import_onboarded = persisted["import_onboarded"]
             self.dashboard.privacy_acked = persisted["privacy_acked"]
+            self.dashboard.crewmates_onboarded = persisted["crewmates_onboarded"]
 
         def save(self) -> None:
             persisted.update(
@@ -265,6 +307,7 @@ async def test_theme_config_put_serializes_full_load_modify_save_transaction() -
                     "onboarded": self.dashboard.onboarded,
                     "import_onboarded": self.dashboard.import_onboarded,
                     "privacy_acked": self.dashboard.privacy_acked,
+                    "crewmates_onboarded": self.dashboard.crewmates_onboarded,
                 }
             )
 

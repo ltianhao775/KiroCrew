@@ -177,6 +177,40 @@ def test_probe_tombstone_maps_to_failed_and_cancelled(tmp_path: Path, clock: Clo
         s.close()
 
 
+def test_a_parent_end_or_stage_cancel_tombstone_settles_the_row_cancelled(
+    tmp_path: Path, clock: Clock
+) -> None:
+    """The reap writes `parent_end` / `stage_cancel` as deliberate stops.
+
+    Reconciliation reads the tombstone cause through
+    ``tombstone_terminal_state`` and must settle such a row CANCELLED like a
+    user stop -- an unmapped cause would leave a deliberately ended run to be
+    recovered on the next boot.
+    """
+    from kiro_crew.subagent_manager.admission.types import tombstone_terminal_state
+
+    assert tombstone_terminal_state("parent_end") == model.CANCELLED
+    assert tombstone_terminal_state("stage_cancel") == model.CANCELLED
+
+    path = tmp_path / "t.db"
+    s = TaskStore(path, clock=clock, network_fs=False).open()
+    s.accept([_rec("pe"), _rec("sc")])
+    for tid in ("pe", "sc"):
+        g = s.claim(tid).generation
+        s.transition(tid, model.STARTING, generation=g)
+    s.close()
+    causes = {"pe": "parent_end", "sc": "stage_cancel"}
+    s = _crash_and_reopen(path, clock)
+    try:
+        report = reconcile_on_boot(
+            s, artifact_probe=lambda r: tombstone_terminal_state(causes[r.id])
+        )
+        assert report.settled_cancelled == 2
+        assert s.state_of("pe") == model.CANCELLED and s.state_of("sc") == model.CANCELLED
+    finally:
+        s.close()
+
+
 # ── legacy import ─────────────────────────────────────────────────────────────
 
 

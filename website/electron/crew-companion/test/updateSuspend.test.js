@@ -45,6 +45,7 @@ function loadCompanion(wiring) {
     closePanelWindow() { calls.closePanel += 1; },
     closeGalleryWindow() { calls.closeGallery += 1; },
     petWindowCount: () => (windowOpen ? 1 : 0),
+    rearmBlankedCompanionWindows: () => 0,
     startHitboxPoll() {}, stopHitboxPoll() {},
   };
 

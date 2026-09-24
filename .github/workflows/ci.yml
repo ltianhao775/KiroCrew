@@ -54,7 +54,14 @@ jobs:
   changes:
     name: Detect changed surface
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    # 15, not 5: the job's own work is seconds, but its `fetch-depth: 0`
+    # checkout (paths-filter and the leaf resolver diff against the merge base
+    # with local git) is a full-history fetch of a large repository, and on a
+    # slow hosted runner that fetch alone has run past 5 minutes and had the
+    # job CANCELLED mid-checkout. Every test lane `needs` this job, so that one
+    # cancel skipped the whole matrix and failed Coverage Gate with nothing to
+    # read (#13111). The budget covers a slow fetch; a hung one still ends.
+    timeout-minutes: 15
     # dorny/paths-filter runs with `token: ''` (below), so it detects changes
     # with local git instead of the REST API and needs no pull-requests:read.
     # Job-level permissions REPLACE the top-level grant, so contents:read is
@@ -730,9 +737,9 @@ jobs:
             GATES=()
             while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then GATES+=("$line"); fi; done <<< "$LEAF_GATES"
             CHANGED=()
-            for target in "${TARGETS[@]}"; do
+            for target in ${TARGETS[@]+"${TARGETS[@]}"}; do
               keep=1
-              for gate in "${GATES[@]}"; do
+              for gate in ${GATES[@]+"${GATES[@]}"}; do
                 if [ "$target" = "$gate" ]; then keep=0; break; fi
               done
               if [ "$keep" = "1" ]; then CHANGED+=("$target"); fi
@@ -743,24 +750,24 @@ jobs:
             fi
             if [ "${#GATES[@]}" -gt 0 ]; then
               echo "::group::leaf corpus gates (${#GATES[@]} file(s), once)"
-              pytest "${PROGRESS[@]}" -q -n auto --timeout=120 --no-cov -m "not ipv6_required" "${GATES[@]}"
+              pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -q -n auto --timeout=120 --no-cov -m "not ipv6_required" ${GATES[@]+"${GATES[@]}"}
               echo "::endgroup::"
             fi
             for pass in $(seq 1 "$LEAF_REPEAT"); do
               echo "::group::leaf changed files, pass $pass/$LEAF_REPEAT"
-              pytest "${PROGRESS[@]}" -q -n auto --timeout=120 --no-cov -m "not ipv6_required" "${CHANGED[@]}"
+              pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -q -n auto --timeout=120 --no-cov -m "not ipv6_required" ${CHANGED[@]+"${CHANGED[@]}"}
               echo "::endgroup::"
             done
             exit 0
           fi
           if [ "$REDUCED" = "true" ]; then
-            python -m pytest "${PROGRESS[@]}" -p scripts.ci_file_shards -q -n auto --timeout=120 -m "not ipv6_required" \
+            python -m pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -p scripts.ci_file_shards -q -n auto --timeout=120 -m "not ipv6_required" \
               --file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }} \
               --no-cov \
-              "${TARGETS[@]}"
+              ${TARGETS[@]+"${TARGETS[@]}"}
             exit 0
           fi
-          python -m pytest "${PROGRESS[@]}" -p scripts.ci_file_shards -q -n auto --timeout=120 -m "not ipv6_required" \
+          python -m pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -p scripts.ci_file_shards -q -n auto --timeout=120 -m "not ipv6_required" \
             --file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }} \
             --cov=kiro_crew --cov=sage_lib \
             --cov=src/kiro_crew/apps/builtins/aws_control/crew/packaging \
@@ -975,7 +982,7 @@ jobs:
           if [ "$LEAF_TESTS" = "true" ]; then REPEAT=3; fi
           for pass in $(seq 1 "$REPEAT"); do
             python -m pytest -q -n0 --timeout=120 -m ipv6_required \
-              "${COVERAGE[@]}" --junitxml="$RUNNER_TEMP/ipv6.xml" \
+              ${COVERAGE[@]+"${COVERAGE[@]}"} --junitxml="$RUNNER_TEMP/ipv6.xml" \
               test/test_meetings_providers.py test/test_platform_compat.py
             python - <<'PY'
           import os
@@ -1058,7 +1065,7 @@ jobs:
           if [ "$LEAF_TESTS" = "true" ]; then REPEAT=3; fi
           for pass in $(seq 1 "$REPEAT"); do
             python -m pytest -q -n0 --timeout=120 \
-              "${COVERAGE[@]}" --junitxml="$RUNNER_TEMP/kernel-lock-owner.xml" \
+              ${COVERAGE[@]+"${COVERAGE[@]}"} --junitxml="$RUNNER_TEMP/kernel-lock-owner.xml" \
               "test/test_gateway_lock.py::TestLockHolder::test_live_holder_is_named_and_alive" \
               "test/test_gateway_lock_diagnosis.py::test_flock_is_held_by_a_fork_orphan"
             python - <<'PY'
@@ -2425,6 +2432,27 @@ jobs:
           npm run lint:phantom-classes -- --test
           npm run lint:phantom-classes
 
+      - name: Check no file restyles more ui/ primitives than the baseline allows
+        # `shadcn/no-restyle` stays off in eslint.config.js: the tree carries a
+        # few hundred call sites that restyle ui/ primitives and the eslint gate
+        # is a hard zero. Off means the backlog can grow silently, so this step
+        # runs the rule through its own config and holds each file at the count
+        # recorded in website/scripts/restyle-baseline.json — a rise or a new
+        # file fails; a fall fails too until `--update-baseline` records it, so
+        # progress is locked in rather than left to a log line. That flag never
+        # raises a number. Whole-tree, no base ref: the baseline is committed,
+        # so the gate is complete for regression without a diff. Not eslint's
+        # own bulk suppressions: the Node API editors use ignores that file, and
+        # the CLI loads it for every config, so the i18n eslint run would fail
+        # on "unused" entries (both measured; see the script header).
+        working-directory: website
+        run: |
+          # Self-test first: it plants one restyled primitive and asserts the
+          # rule fires under this config, so a plugin or parser change that
+          # silences the rule fails here instead of passing every count as 0.
+          npm run lint:restyle-ratchet -- --test
+          npm run lint:restyle-ratchet
+
   # Prove `npm ci` still works on the OLDEST Node the frontend claims to support.
   # Every other job here runs the .nvmrc toolchain (Node 24 / npm 11), and npm 11
   # and npm 10 (Node 22) build different ideal trees for an OPTIONAL PEER
@@ -2699,7 +2727,7 @@ jobs:
             # or summary; the second reporter keeps a human-readable verdict in
             # this job's own log.
             npx vitest run --reporter=blob --reporter=default --passWithNoTests \
-              --shard=${{ matrix.shard }}/"$SHARD_COUNT" "${TARGETS[@]}"
+              --shard=${{ matrix.shard }}/"$SHARD_COUNT" ${TARGETS[@]+"${TARGETS[@]}"}
           else
             # --reporter=blob stores results + per-shard coverage under
             # website/.vitest-reports/; the frontend-coverage-merge job stitches

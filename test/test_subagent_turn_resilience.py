@@ -206,6 +206,83 @@ async def test_transient_error_pretoken_retries_same_prompt():
 
 
 @pytest.mark.asyncio
+async def test_registration_rate_limited_death_retries_pretoken_and_recovers():
+    """A pre-token AcpRegistrationRateLimited (runtime death whose stderr shows
+    a throttled dynamic registration) rides the same zero-activity ladder as any
+    transient: the SAME prompt is re-sent after backoff and the run completes,
+    instead of surfacing a terminal generic process death."""
+    from kiro_crew.acp.client import registration_rate_limited_error
+
+    calls: list[str] = []
+    throttled = registration_rate_limited_error(
+        "Runtime process died during prompt",
+        "Dynamic registration failed: Registration failed: HTTP 429 Too Many Requests",
+    )
+
+    def stream_factory(msg: str, *a, **kw):
+        calls.append(msg)
+
+        async def _gen():
+            if len(calls) <= 2:
+                raise throttled
+            yield _text_event("registered and recovered")
+            yield _complete_event()
+
+        return _gen()
+
+    mgr = _manager(_mock_sessions(stream_factory))
+    # The typed message names a throttle, so the dependency adapters would
+    # classify it and park the run on a coordinator wake this harness does not
+    # drive; a null coordinator pins the IN-TURN ladder, which is the seam
+    # under test.
+    mgr.dependency_coordinator_async = AsyncMock(return_value=None)
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.error == ""
+    assert "registered and recovered" in info.result
+    # Zero activity on every failed attempt: the original prompt is replayed,
+    # never a continuation that could assume prior work.
+    assert calls == ["built_message"] * 3
+
+
+@pytest.mark.asyncio
+async def test_registration_rate_limited_exhaustion_surfaces_typed_message():
+    """Persistent registration throttling fails after the bounded budget with
+    the typed message (guidance, one retained cause) — not a stderr wall."""
+    from kiro_crew.acp.client import registration_rate_limited_error
+
+    calls: list[str] = []
+
+    def stream_factory(msg: str, *a, **kw):
+        calls.append(msg)
+
+        async def _gen():
+            raise registration_rate_limited_error(
+                "Runtime process died during prompt",
+                "Dynamic registration failed: Registration failed: HTTP 429 Too Many Requests",
+            )
+            yield  # noqa: unreachable — async generator marker
+
+        return _gen()
+
+    mgr = _manager(_mock_sessions(stream_factory))
+    # Same in-turn pin as the recovery test above: the message would otherwise
+    # classify as a dependency signal and wait on an undriven coordinator.
+    mgr.dependency_coordinator_async = AsyncMock(return_value=None)
+    with (
+        patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0),
+        patch("kiro_crew.subagent.configured_fallback_chain", return_value=()),
+    ):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.done is True
+    assert "rate-limited" in info.error
+    assert "retry later" in info.error
+    assert len(calls) == 1 + TRANSIENT_RETRIES  # initial + bounded retries
+
+
+@pytest.mark.asyncio
 async def test_transient_error_posttoken_sends_continue_prompt():
     """A transient error AFTER tokens streamed sends the CONTINUE prompt."""
     calls: list[str] = []

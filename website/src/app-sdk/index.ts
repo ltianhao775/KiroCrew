@@ -20,6 +20,11 @@ import {
 // builtin page — can mount it on its own, and so it stays off this barrel (see
 // the note at the bottom of this file on what the barrel publishes).
 import { AppIdentityProvider, useAppIdentity, type AppOrigin } from './identity'
+// The cache boundary, kept in its own module for the same reason as the two
+// layers above: an app's own query client is decided by origin, and that rule is
+// worth reading and testing on its own. Off this barrel — publishing a way to
+// name a cache client is the opposite of what it does.
+import { AppQueryClientProvider } from './appQueryClient'
 // The scoped-API layer, kept in its own module so it is NOT published on this
 // barrel -- see the header of ./scopedApi for why.
 import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo } from './scopedApi'
@@ -76,7 +81,7 @@ const WS_SLOT_SCOPED_EVENTS = new Set([
   // Chat content
   'chat_chunk', 'chat_thinking', 'chat_status', 'chat_message', 'chat_done',
   'chat_segment', 'chat_append', 'chat_message_update', 'chat_variant_switch',
-  'chat.side_result', 'heartbeat', 'context_usage',
+  'chat.side_result', 'chat.thread_reply', 'heartbeat', 'context_usage',
   // Tool / queue
   'tool_call', 'tool_result',
   'queue_push', 'queue_cancel', 'queue_edit', 'queue_pop', 'queue_reorder',
@@ -434,7 +439,20 @@ export function AppApiProvider({
     children,
   })
   if (existing) return scoped
-  return React.createElement(AppIdentityProvider, { appId: appName, origin, children: scoped })
+  // Identity outside, cache client inside: the client to hand over is decided by
+  // the origin this provider is publishing, and an app's subtree must sit below
+  // both. An app that already carries a host-published identity took the branch
+  // above and is therefore already inside the client that identity chose.
+  return React.createElement(AppIdentityProvider, {
+    appId: appName,
+    origin,
+    children: React.createElement(AppQueryClientProvider, {
+      appId: appName,
+      origin,
+      sessionKey,
+      children: scoped,
+    }),
+  })
 }
 
 export { useChatSession } from './useChatSession'

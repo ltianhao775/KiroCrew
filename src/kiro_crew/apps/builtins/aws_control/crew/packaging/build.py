@@ -920,13 +920,14 @@ def _tree_hash(root: Path) -> str:
     return _sha(json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-#: Extra ``os.open`` flags for reading a file that must not be a symlink, guarded
-#: because NEITHER constant exists on every platform. ``O_NOFOLLOW`` is the security
+#: Extra flags for a DESCRIPTOR-RELATIVE ``os.open`` of a file that must not be a symlink,
+#: guarded because NEITHER constant exists on every platform. ``O_NOFOLLOW`` is the security
 #: half (refuse a final-component link at open time) and ``O_NONBLOCK`` is the
 #: liveness half (a FIFO would otherwise block the open forever, before any check
 #: runs). Windows has neither, and getattr'ing only one of them is precisely the bug
 #: that reddened five tests on the Windows shard: two platform-specific constants on
-#: one line, one of them guarded.
+#: one line, one of them guarded. A read taken by PATH does not use these: it borrows
+#: ``platform_compat.open_file_no_reparse``, which carries the same refusal on both platforms.
 _NOFOLLOW_READ_FLAGS: int = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 
 
@@ -1253,6 +1254,70 @@ def _resolve_prompt_path(raw: str, agents_dir: Path, *, resolved_root: Path | No
     return path
 
 
+def _dir_fd_closed(fd: int) -> bool:
+    """Answer whether *fd* names a directory -- and CLOSE it when it does.
+
+    Every leaf open in this module can hand back a directory descriptor: ``O_NOFOLLOW``
+    refuses a SYMLINK at the final component, not a directory, and the shared opener's POSIX
+    branch is an ``O_RDONLY`` open that a directory satisfies. The failure then lands on the
+    reader's ``os.fdopen``, which raises ``IsADirectoryError`` BEFORE the file object it would
+    return owns the descriptor -- so a reader written as ``with os.fdopen(fd, ...)`` reaches
+    no close for it, and every read against a directory strands one while still answering
+    correctly. A build walking a tree of them exhausts the descriptor table with no wrong
+    answer anywhere to show why.
+
+    One authority for every leaf open in this module (the shared-opener borrow, the anchored
+    walk, the marker read's own ``os.open``, and the descriptor-relative read of a captured
+    tree), for the same reason the no-follow refusal is one: a per-site copy is a place for one
+    site to drift. A descriptor that cannot be ``fstat``-ed is closed and reported unusable,
+    because every refusal in this module fails closed.
+    """
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            return False
+    except OSError:
+        os.close(fd)
+        return True
+    os.close(fd)
+    return True
+
+
+def _open_leaf_no_reparse(path: Path) -> "int | None":
+    """Open *path* for reading, refusing a reparse point at the final name in that same open.
+
+    One borrow of ``platform_compat.open_file_no_reparse`` for the whole module, so the three
+    leaf readers below cannot drift apart on which authority refuses a redirect. That opener
+    settles the last component in the operation that opens it: an ``O_NOFOLLOW`` open on
+    POSIX, and on Windows a ``FILE_FLAG_OPEN_REPARSE_POINT`` handle whose reparse and
+    directory attributes are read off the descriptor that was opened. An ``lstat`` taken
+    before a separate ``os.open`` answers about the name instead, and the swap an adversary
+    plants lands between the two -- on Windows a junction naming a UNC share turns the read
+    into an outbound SMB/NTLM exchange, so the window is a credential surface and not merely
+    a wrong read.
+
+    ``None`` is every refusal: a redirect, a directory, a missing path, an unreadable one.
+    An environment where the shared module is not importable is among them, for the reason
+    every other borrowed authority in this module fails closed -- approximating the check
+    locally is the check-then-open window itself, not a smaller version of it.
+
+    A directory is refused through ``_dir_fd_closed``, the one authority every leaf open in this
+    module shares, because the two platforms disagree about where a directory
+    surfaces: the shared opener's Windows branch raises on the handle's directory attribute,
+    while its POSIX ``O_RDONLY`` open succeeds and yields a usable descriptor.
+    """
+    try:
+        from kiro_crew.platform_compat import open_file_no_reparse
+    except ImportError:
+        return None
+    try:
+        fd = open_file_no_reparse(path, nonblocking=True)
+    except OSError:
+        return None
+    if _dir_fd_closed(fd):
+        return None
+    return fd
+
+
 def _read_text_nofollow(path: Path) -> str | None:
     """Read text through one descriptor, refusing a final-component redirect at the open.
 
@@ -1262,28 +1327,25 @@ def _read_text_nofollow(path: Path) -> str | None:
     against: each words its own refusal, which is why the agent-spec path says "agent spec"
     where the plan path says "curation plan".
 
+    The refusal comes from ``_open_leaf_no_reparse`` on every platform, so there is no path
+    inspected ahead of the open and no window between a verdict and the read it authorises.
+
     There is no anchored-walk variant here. The prompt read, the only caller that wanted one,
     goes through ``hooks.safe_read_file_bytes_nolink``, which verifies the OPENED descriptor's
     real path against a containment root -- a stronger check than re-walking a name, and one
     authority instead of two. A local per-component opener stack existed for that caller and
     was deleted with it: 191 lines reachable only from tests once the prompt read moved.
     """
-    # Windows has no atomic no-follow open (``O_NOFOLLOW`` is 0 there), so a reparse point
-    # would be followed and a junction naming a share is an outbound SMB/NTLM probe. Fail
-    # closed on that platform: ``lstat`` first and refuse a redirect before opening.
-    # ``_is_redirecting_entry`` sees a junction, which ``is_symlink`` does not.
-    if not getattr(os, "O_NOFOLLOW", 0) and _is_redirecting_entry(path):
-        return None
-    try:
-        fd = os.open(str(path), os.O_RDONLY | _NOFOLLOW_READ_FLAGS)
-    except OSError:
+    fd = _open_leaf_no_reparse(path)
+    if fd is None:
         return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
-        # Only when O_NONBLOCK was actually applied. On Windows neither that flag nor
-        # set_blocking() works on a regular-file descriptor -- it raises WinError 87.
-        if getattr(os, "O_NONBLOCK", 0) and _NOFOLLOW_READ_FLAGS & os.O_NONBLOCK:
+        # Only where O_NONBLOCK exists, which is where the shared opener applies it. On
+        # Windows neither that flag nor set_blocking() works on a regular-file descriptor --
+        # it raises WinError 87.
+        if getattr(os, "O_NONBLOCK", 0):
             os.set_blocking(fd, True)
         # No byte ceiling here. This reader serves the skill scan, the plan read and the
         # agent-spec read as well as nothing else, and a limit named for PROMPTS has no
@@ -1318,23 +1380,25 @@ def _read_text_openat(root: Path, rel: Path, *, refuse_hard_link: bool = False) 
     O_NOFOLLOW`` relative to the last directory fd.
 
     Falls back to ``_read_text_nofollow`` where ``dir_fd`` is unsupported (Windows), the same
-    trade the rest of this module makes; there the final-component ``O_NOFOLLOW`` still holds
-    and only the intermediate anchoring is lost, on the platform whose links differ anyway.
+    trade the rest of this module makes; there the final component is still settled by the
+    shared no-reparse opener and only the intermediate anchoring is lost, on the platform
+    whose links differ anyway.
     Returns ``None`` on any redirect, missing component, special file, or non-UTF-8 body.
     """
     parts = rel.parts
     if not parts:
         return None
     if not _dir_fd_supported():
-        # Windows has neither ``dir_fd`` nor a working ``O_NOFOLLOW`` (it is ``0`` here), so
-        # the openat walk below is unavailable and ``_read_text_nofollow`` alone would guard
-        # nothing -- an intermediate junction swapped under a component would be followed into
-        # an untrusted file. Fail closed instead of best-effort: ``lstat`` every component
-        # from ``root`` down and refuse if ANY is a reparse point (a junction is not a symlink,
-        # so ``_is_redirecting_entry`` is the check, not ``is_symlink``). A residual
-        # check-then-read window remains on this platform -- there is no atomic no-follow open
-        # to close it -- but a planted or swapped-before-the-walk redirect is refused rather
-        # than traversed, which is the fail-closed posture the openat path gives elsewhere.
+        # Windows has no ``dir_fd``, so the openat walk below is unavailable and the leaf
+        # reader anchors only the last component -- an intermediate junction swapped under a
+        # component would be followed into an untrusted file. Fail closed instead of
+        # best-effort: ``lstat`` every component from ``root`` down and refuse if ANY is a
+        # reparse point (a junction is not a symlink, so ``_is_redirecting_entry`` is the
+        # check, not ``is_symlink``). The leaf itself is settled by the open the reader takes,
+        # so what remains on this platform is a check-then-read window on the INTERMEDIATE
+        # components alone: a redirect planted there before the walk is refused rather than
+        # traversed, which is the fail-closed posture the openat path gives elsewhere, and one
+        # swapped in after the walk is the window a descriptor-relative open would close.
         if _redirect_between(root, root / rel) is not None:
             return None
         # This is the only return on the no-``dir_fd`` path, and like every other one it
@@ -1383,7 +1447,9 @@ def _open_leaf_nofollow_at(root: Path, rel: Path) -> "int | None":
     ``O_RDONLY | O_NOFOLLOW`` relative to the last -- so a component swapped for a redirect
     fails its own open with no path string re-resolved after a check. The caller owns the
     returned fd and must close it (the text/bytes readers below wrap it in ``fdopen``).
-    Returns ``None`` on any redirect, missing component, or non-directory intermediate.
+    Returns ``None`` on any redirect, missing component, non-directory intermediate, or a
+    DIRECTORY at the leaf -- the last because ``O_NOFOLLOW`` refuses a symlink and not a
+    directory, and a directory descriptor is one no reader here can wrap.
     """
     parts = rel.parts
     if not parts:
@@ -1408,9 +1474,12 @@ def _open_leaf_nofollow_at(root: Path, rel: Path) -> "int | None":
             cur_fd = os.open(part, dir_flags, dir_fd=cur_fd)
             open_dirs.append(cur_fd)
         try:
-            return os.open(parts[-1], os.O_RDONLY | _NOFOLLOW_READ_FLAGS, dir_fd=cur_fd)
+            leaf_fd = os.open(parts[-1], os.O_RDONLY | _NOFOLLOW_READ_FLAGS, dir_fd=cur_fd)
         except OSError:
             return None
+        if _dir_fd_closed(leaf_fd):
+            return None
+        return leaf_fd
     except OSError:
         # A redirect (ELOOP), a missing or non-directory component: none is a file to read.
         return None
@@ -1433,9 +1502,8 @@ def _read_bytes_openat(root: Path, rel: Path) -> "bytes | None":
     if not _dir_fd_supported():
         if _redirect_between(root, root / rel) is not None:
             return None
-        try:
-            fd = os.open(root / rel, os.O_RDONLY | _NOFOLLOW_READ_FLAGS)
-        except OSError:
+        fd = _open_leaf_no_reparse(root / rel)
+        if fd is None:
             return None
         try:
             with os.fdopen(fd, "rb") as fh:
@@ -1503,38 +1571,43 @@ def _nofollow_primitive_available() -> bool:
 
     Every path this builder reads, stats, enumerates or mutates has to be judged without
     following a reparse point, because following one that names a UNC share is an outbound
-    SMB probe carrying an NTLM exchange. On POSIX that primitive exists: descriptor-relative
-    ``O_NOFOLLOW`` opens (``_dir_fd_supported`` plus a working ``os.O_NOFOLLOW``) refuse a
-    reparse component atomically. On Windows ``os.O_NOFOLLOW`` is ``0`` and there is no
-    descriptor-relative open, so the fallback for every entry point follows -- the guarantee
-    is absent, not merely narrower.
+    SMB probe carrying an NTLM exchange. The LEAF READ is settled everywhere: it borrows
+    ``platform_compat.open_file_no_reparse``, which refuses a reparse point at the final name
+    in the operation that opens it on both platforms. What this predicate asks about is the
+    DESCRIPTOR-RELATIVE half, which a walk, a stat, an enumeration and a mutation each need:
+    on POSIX ``_dir_fd_supported`` plus a working ``os.O_NOFOLLOW`` gives an open taken
+    relative to a directory descriptor, so a component swapped for a link fails its own open.
+    Windows offers no such open at all, so those fallbacks follow -- the guarantee is absent
+    there, not merely narrower.
 
-    Feature-detected, NOT ``os.name == "nt"``: the day ``kiro_crew.hooks`` grows a real
-    no-follow handle (a ``FILE_FLAG_OPEN_REPARSE_POINT`` open) and this builder adopts it,
-    this predicate turns True on its own and the entry-point guard lifts without anyone
-    remembering it exists. A bare platform check would strand the guard after the fix.
+    Feature-detected, NOT ``os.name == "nt"``, so the guard lifts by itself the day the
+    platform answers yes rather than waiting for someone to remember this function exists.
+    Adopting a leaf opener does not answer this question, which is why the two halves are
+    named apart: one is a property of the final component, the other of every component above
+    it.
     """
     return _dir_fd_supported() and bool(getattr(os, "O_NOFOLLOW", 0))
 
 
 def _refuse_without_nofollow_primitive() -> None:
-    """Refuse at the entry point on a platform with no atomic no-follow primitive.
+    """Refuse at the entry point on a platform with no descriptor-relative no-follow open.
 
     One entry-point guard, because the alternative -- hardening each of the builder's ~15
     filesystem entry points against reparse-following on the Windows fallback branch -- is a
     site list, and a site list is complete only until the next one is found. The guarantee
     this builder needs (no read/stat/enumerate/mutate ever follows a reparse point to a share)
     is a property of the platform's primitives, so it is checked once where the primitive is
-    absent rather than re-argued at every call. This is a deliberate hold with a tracked exit,
-    not a bug: the builder is POSIX-only until the primitive lands.
+    absent rather than re-argued at every call. A deliberate hold whose exit is the predicate
+    above, not a bug: the builder is POSIX-only for as long as that predicate answers no.
     """
     if not _nofollow_primitive_available():
         raise ExportRefused(
-            "the crew bundle builder is POSIX-only for now: this platform has no atomic "
-            "no-follow filesystem primitive, so its filesystem entry points would follow a "
-            "reparse point (a Windows junction to a UNC share) and leak an SMB/NTLM exchange "
-            "during ordinary packaging. Refusing rather than ship that surface. Tracked in "
-            "issue #9496; the guard lifts automatically when the primitive is available."
+            "the crew bundle builder is POSIX-only for now: this platform has no "
+            "descriptor-relative no-follow open, so the walks, stats, enumerations and writes "
+            "behind packaging would follow a reparse point (a Windows junction to a UNC "
+            "share) and leak an SMB/NTLM exchange during ordinary packaging. Refusing rather "
+            "than ship that surface. The guard lifts automatically once the platform offers "
+            "that open."
         )
 
 
@@ -2255,24 +2328,26 @@ def _marker_is_ours(path: Path) -> bool:
     reason the write does: a link here would let the answer come from a file outside the
     directory being judged.
 
-    Falls back to a plain read where ``dir_fd`` is unsupported (Windows), matching the
-    write. The token check still holds there; what is lost is the anchoring, and losing it
-    on the platform whose links behave differently anyway is the same trade the rest of
+    Reads through the shared no-reparse opener where ``dir_fd`` is unsupported (Windows),
+    which refuses a redirect at the marker path in the open itself. The token check still
+    holds there; what is lost is the anchoring of the components ABOVE the marker, and losing
+    it on the platform whose links behave differently anyway is the same trade the rest of
     this module already makes.
     """
     if not _dir_fd_supported():
-        # Judged by ``lstat`` before the open, because this branch has no anchoring to lose
-        # the race with: ``path.open`` follows a symlink AND a junction, so a marker path
+        # The redirect refusal is the OPEN, because this branch has no anchoring to lose the
+        # race with: a by-name read follows a symlink AND a junction, so a marker path
         # someone planted a redirect over would be read through to its target. The verdict
         # matches the anchored branch below, where ``O_NOFOLLOW`` answers ELOOP and this
         # function returns False -- a redirect at the marker path is not a marker this run
         # wrote, on either platform.
-        if _is_redirecting_entry(path):
+        fd = _open_leaf_no_reparse(path)
+        if fd is None:
             return False
         try:
-            with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            with os.fdopen(fd, "r", encoding="utf-8", errors="replace", newline="") as fh:
                 return _marker_lines_are_this_run(fh)
-        except OSError:
+        except (OSError, UnicodeError):
             return False
     try:
         parent_fd = _open_dir_nofollow_pinned(path.parent)
@@ -2301,14 +2376,18 @@ def _marker_is_ours(path: Path) -> bool:
         return False
     finally:
         os.close(parent_fd)
-    # The read is inside its own guard because ``os.open(O_RDONLY)`` SUCCEEDS on a
-    # directory and it is ``fdopen`` in text mode that fails, with an IsADirectoryError
-    # naming a file descriptor. Guarding only the open let that escape as a raw traceback
-    # from a question whose answer is simply "no".
+    # ``os.open(O_RDONLY)`` SUCCEEDS on a directory and it is ``fdopen`` in text mode that
+    # fails, with an ``IsADirectoryError`` raised BEFORE the file object it would return owns
+    # the descriptor -- so the ``with`` below reaches no close for it and each such answer
+    # strands one fd. Taking the verdict on the DESCRIPTOR settles both halves at once: the
+    # answer is still simply "no", and the fd is released here instead of by a wrapper that
+    # was never built. A raw traceback escaping a bool-returning function is the other half.
+    if _dir_fd_closed(fd):
+        return False
     try:
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace", newline="") as fh:
             return _marker_lines_are_this_run(fh)
-    except (IsADirectoryError, UnicodeError):
+    except UnicodeError:
         return False
 
 
@@ -2693,8 +2772,11 @@ def _validated_crew_name(name: str) -> str:
     outside the source they named is never what they meant.
 
     Kept deliberately narrow: separators of either platform, parent steps, absolute paths,
-    a Windows drive, and the empty name. Everything else a filesystem accepts in a filename
-    is still a legal crew name.
+    a Windows drive, and the empty name. THIS check asks only whether the name can address
+    a path, and it deliberately does not ask whether a launch can use the name --
+    ``_refuse_unless_launchable`` owns that, against a charset it imports rather than
+    restates. So a name that clears this one is a name that stays inside the source
+    directory, which is not the same thing as a name a bundle is allowed to carry.
     """
     if not name or name in {".", ".."}:
         raise ExportRefused(f"crew name {name!r} is empty or a directory reference.")
@@ -2713,6 +2795,58 @@ def _validated_crew_name(name: str) -> str:
     return name
 
 
+def _refuse_unless_launchable(name: str) -> None:
+    """Refuse a crew name no launch can derive its AWS resources from.
+
+    ``_validated_crew_name`` above asks whether the name can address a path. This
+    asks the other question a bundle owes the operator who builds it: whether the
+    crew it names can become the resources that run it. A bundle exists to be
+    launched on Fargate -- the container supervisor is its only reader -- and the
+    launch derives both IAM role names, the task-definition family, the secret
+    namespace and the log group from the crew name. The charset those derivations
+    need is therefore the charset a bundle has to satisfy, and a name outside it
+    describes a bundle with no reachable future.
+
+    Asking HERE is the point. Bundling is where the operator decides: it selects
+    skills and MCP servers and prints the deny-by-default report, it exits 0, and
+    it hands back a digest, all of which read as confirmation that the crew is
+    deployable. The launch-side refusals land at a CloudFormation parameter error
+    or a task-definition refusal, and neither mentions a bundle, so the remedy --
+    rename the member and rebuild -- is not visible from either message.
+
+    The charset is IMPORTED rather than restated. ``cloud/fargate/identity.py``
+    owns it, and ``cloud/templates/kirocrew-fargate-crew.yaml`` mirrors it as a
+    CloudFormation ``AllowedPattern`` only because YAML cannot import; a third copy
+    spelled here is the drift this refusal exists to close. So an unimportable
+    validator refuses the build, the same direction every other mandatory authority
+    in this module fails: a build that cannot check the name cannot claim the
+    bundle is launchable either.
+    """
+    try:
+        from kiro_crew.cloud.fargate.identity import DocumentRefused, validated_crew_name
+    except Exception as exc:
+        raise ExportRefused(
+            f"cannot check whether crew name {name!r} is one a launch can use: this "
+            f"repository's own crew-name charset "
+            f"(kiro_crew.cloud.fargate.identity.validated_crew_name) is not importable "
+            f"here. The charset is owned there so the builder and the launch cannot "
+            f"disagree about it, and restating it in this module is the drift that check "
+            f"exists to prevent. Refusing rather than bundling a crew whose launchability "
+            f"is unknown."
+        ) from exc
+    try:
+        validated_crew_name(name, source="--crew")
+    except DocumentRefused as exc:
+        raise ExportRefused(
+            f"crew name {name!r} cannot be launched: {exc}. Both IAM role names, the "
+            f"task-definition family, the secret namespace and the log group are derived "
+            f"from this name, and the per-crew CloudFormation stack constrains its own "
+            f"Crew parameter to the same charset, so a bundle built under this name has "
+            f"no deployment that accepts it. Rename the member to a conforming name and "
+            f"build again."
+        ) from exc
+
+
 def resolve_crew(name: str, source: Path | None) -> ResolvedCrew:
     """Resolve a crew's agent spec and skills root.
 
@@ -2722,6 +2856,12 @@ def resolve_crew(name: str, source: Path | None) -> ResolvedCrew:
     and skills under ``$KIROCREW_HOME``. Never a temp dir.
     """
     name = _validated_crew_name(name)
+    # Two questions, asked in this order, because they refuse for different reasons: the
+    # one above is about what a name can address on THIS filesystem, and this one is about
+    # what a launch can derive from it. Both verbs come through here -- ``plan`` as much as
+    # ``build`` -- because ``plan`` is the step that writes the review template the operator
+    # fills in, and a review of a crew that can never launch is work spent on nothing.
+    _refuse_unless_launchable(name)
     if source is not None:
         # ONE guard, not two. A containment assertion on the resolved spec path was here as
         # defence in depth, and it is unreachable: with the name check above in place no
@@ -4259,10 +4399,17 @@ def _read_regular_leaf_fd(dir_fd: int, name: str) -> "bytes | None":
     own open and yields ``None`` with no path re-resolved. Returns ``None`` on a redirect, a
     special file, or a read error -- the same shape ``_read_bytes_openat`` gives, but reached
     through a descriptor the caller already holds rather than by walking a path from a root.
+
+    The caller reads the entry's shape from its dirent before calling, and the held directory
+    fd pins the directory but not the NAME inside it, so a regular file swapped for a directory
+    between that stat and this open is still open to the same ``fdopen`` strand every leaf read
+    here is: hence the same ``_dir_fd_closed`` verdict, taken on the descriptor.
     """
     try:
         fd = os.open(name, os.O_RDONLY | _NOFOLLOW_READ_FLAGS, dir_fd=dir_fd)
     except OSError:
+        return None
+    if _dir_fd_closed(fd):
         return None
     try:
         with os.fdopen(fd, "rb") as fh:

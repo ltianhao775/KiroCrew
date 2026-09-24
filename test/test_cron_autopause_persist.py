@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from kiro_crew.cron import _AUTO_PAUSE_THRESHOLD, CronJob, CronSchedule, CronService
+from kiro_crew.cron import _AUTO_PAUSE_THRESHOLD, CronJob, CronSchedule, CronService, _RunClaim
 
 
 class TestRecordFailureSuccess:
@@ -248,7 +248,8 @@ class TestAutoPausePersistence:
 
         svc._on_job = retried_twice
         svc._jobs = [job]
-        asyncio.run(svc._run_job_isolated(job))  # every=60s: sub-hourly, no jitter sleep
+        # every=60s: sub-hourly, no jitter sleep
+        asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         svc2 = CronService(base_dir=tmp_path)
         svc2._load()
@@ -457,9 +458,31 @@ class TestExecuteSuccessResetsCounter:
             return None  # gateway cancelled branch: no bookkeeping, no last_status
 
         svc._on_job = cancelled_shape
-        svc._cancelled_jobs.add(job.id)
+        meta = _RunClaim(trigger="scheduled", claimed_at=0.0)  # the marker keys on identity
+        svc._cancelled_jobs.mark(job.id, meta)
         try:
-            asyncio.run(svc._execute(job))
+            asyncio.run(svc._execute(job, meta))
         finally:
-            svc._cancelled_jobs.discard(job.id)
+            svc._cancelled_jobs.consume(job.id, meta)
         assert job.consecutive_failures == 3
+
+    def test_another_runs_cancel_marker_does_not_suppress_the_reset(self, tmp_path: Path) -> None:
+        # The marker is keyed by run, not by job: one left by a cancelled prior
+        # run whose finalizer is still pending is not THIS run's, so a clean
+        # return from this run still resets the counter.
+        svc = CronService(base_dir=tmp_path)
+        job = self._job()
+        job.consecutive_failures = 3
+
+        async def succeeding(j: CronJob) -> None:
+            return None
+
+        svc._on_job = succeeding
+        prior_run = _RunClaim(trigger="manual", claimed_at=0.0)
+        this_run = _RunClaim(trigger="manual", claimed_at=1.0)
+        svc._cancelled_jobs.mark(job.id, prior_run)
+        try:
+            asyncio.run(svc._execute(job, this_run))
+        finally:
+            svc._cancelled_jobs.consume(job.id, prior_run)
+        assert job.consecutive_failures == 0

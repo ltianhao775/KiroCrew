@@ -928,8 +928,8 @@ class TestReexecExecutableParameter:
         assert captured["path"] == "/x/bin/python3"
         argv = captured["argv"]
         assert isinstance(argv, list)
-        assert argv[1:4] == ["-s", "-m", "kiro_crew"]
-        assert argv[4:] == ["--flag"]
+        assert argv[1:5] == ["-s", "-P", "-m", "kiro_crew"]
+        assert argv[5:] == ["--flag"]
 
     def test_reexec_defaults_to_sys_executable(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from kiro_crew import platform_compat

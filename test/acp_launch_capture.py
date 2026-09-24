@@ -70,6 +70,14 @@ _PI_ACP_ARGV = ["/opt/bin/node", "/opt/lib/pi-acp/index.js"]
 _PI_BIN = "/opt/bin/pi"
 _PI_LAUNCHER = "/opt/run/pi-launcher.sh"
 _PI_EXTENSION = "/opt/run/kiro_crew_tool_gate.ts"
+# The DeepSeek Harness gate artifacts, pinned the same way and for the same reason:
+# both are real files in the owner-only run directory, and the golden records the
+# argv rather than the filesystem.
+_DSH_EXTENSION = "/opt/run/kiro_crew_tool_gate.mjs"
+_DSH_PATCH = "/opt/run/kiro_crew_dsh_gate.patch.yml"
+#: The private scratch window the DeepSeek gate marker is written into. Fixed so
+#: the capture names no host path; see the ``allocate_scratch`` stub below.
+_DSH_SCRATCH = Path("/opt/scratch/dsh-session")
 _OPENCODE_BIN = "/opt/bin/opencode"
 _GOOSE_BIN = "/opt/bin/goose"
 _DEEPSEEK_BIN = "/opt/bin/dsh"
@@ -82,6 +90,7 @@ VOLATILE_ENV = {
     "PATH": "<augmented-path>",
     "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
     "KIROCREW_PI_GATE_SESSION": "<nonce>",
+    "KIROCREW_DSH_GATE_SESSION": "<nonce>",
     # Minted from ``secrets`` on every client, so it can never match a golden twice.
     # That a one-session client's child RECEIVES it is the fact being pinned: it is
     # how a control-plane MCP server on that child resolves its own session.
@@ -237,7 +246,7 @@ _ASYNC_PASSTHROUGH_STUBS: dict[str, Callable[[dict[str, Any]], Any]] = {
 }
 
 
-def _stub_common(stack: list, rec: _Recorder, tmp_path: Path) -> None:
+def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "") -> None:
     """Patch every collaborator that is not the answer under test."""
     proc = MagicMock()
     proc.pid = 4242
@@ -294,7 +303,40 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path) -> None:
             patch.object(client_mod, "browser_socket_env", return_value={}),
             patch.object(client_mod, "inject_xdist_auto_cap", return_value=None),
             patch.object(client_mod, "_get_child_pids", return_value=[]),
-            patch.object(client_mod.agent_scratch, "allocate_scratch", return_value=None),
+            # A per-process temp root the sandbox masks, so every harness that does
+            # not need one is captured without it. The DeepSeek arm DOES need one:
+            # its gate's load marker is written by the child into this private
+            # window, because the gate-artifact leaf is sealed read-only against the
+            # child, and a session with nowhere to put the marker is refused rather
+            # than run ungated.
+            patch.object(
+                client_mod.agent_scratch,
+                "allocate_scratch",
+                return_value=_DSH_SCRATCH if backend == ACP_BACKEND_DEEPSEEK else None,
+            ),
+            # The env that window contributes, pinned to placeholders rather than to
+            # this host's spelling of it. Two things vary by platform and neither is
+            # the fact the golden exists to hold. ``str(Path("/opt/scratch/x"))``
+            # renders backslash-separated on Windows, so a literal path would fail
+            # there on separators alone; and ``KIRO_CHAT_LOG_FILE`` is set only where
+            # the log cap can bound it, which is every platform except Windows, so its
+            # KEY presence varies too. Stubbing the whole contribution keeps one
+            # golden for both platforms while still pinning what matters -- that the
+            # child's temp, scratch and log all point INTO its own private window.
+            # ``shared`` is the session tree's shared window, which the real
+            # function folds into the same contribution; accepted and folded into
+            # the same placeholders here, for the same reason.
+            patch.object(
+                client_mod.agent_scratch,
+                "scratch_env",
+                side_effect=lambda path, shared=None: {
+                    "TMPDIR": "<scratch>",
+                    "TMP": "<scratch>",
+                    "TEMP": "<scratch>",
+                    "KIROCREW_SCRATCH": "<scratch>",
+                    "KIRO_CHAT_LOG_FILE": "<scratch-log>",
+                },
+            ),
             patch.object(client_mod, "_run_preflight_bounded", new=AsyncMock(return_value=())),
             patch("kiro_crew.session._track_pid", return_value=None),
             patch("kiro_crew.session._track_session_pid", return_value=None),
@@ -339,6 +381,10 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path) -> None:
             patch.object(client_mod, "_seal_pi_gate_extension", return_value=_PI_EXTENSION),
             patch.object(client_mod, "_ensure_pi_gate_launcher", return_value=_PI_LAUNCHER),
             patch.object(AcpClient, "_verify_pi_gate", return_value=("", "")),
+            patch.object(client_mod, "_seal_deepseek_gate_extension", return_value=_DSH_EXTENSION),
+            patch.object(client_mod, "_write_deepseek_gate_patch", return_value=_DSH_PATCH),
+            patch.object(client_mod, "_pi_gate_artifact_dir", return_value="/opt/run"),
+            patch.object(AcpClient, "_verify_deepseek_gate", return_value=("", "")),
             patch.object(AcpClient, "_verify_opencode_routing", return_value=("", "")),
             patch.object(AcpClient, "_opencode_routing_config", return_value=_OPENCODE_CONFIG),
             patch.object(client_mod, "_unlink_readback_launcher", return_value=None),
@@ -351,6 +397,16 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path) -> None:
             # variable keeps the capture host-independent, which is the property the
             # fixed parent exists to give it.
             patch.object(config_paths, "_resolve_default_home", lambda: tmp_path / "default-home"),
+            # ... and the breadcrumb that default resolution drops OUTSIDE the data
+            # home, at ``~/.kirocrew.breadcrumb``. Pinning the resolver relocates the
+            # data home but not that file: it is written under ``Path.home()``, which
+            # this capture deliberately does not relocate (``fixed_parent_env`` carries
+            # HOME through so the interpreter and the OS still work).
+            # ``conftest._breadcrumb_guard`` fails the run for exactly that write, and
+            # stubbing the writer is the remedy it names -- the breadcrumb is not a
+            # launch answer, and the DeepSeek arm reaches ``config_dir()`` to read its
+            # ``agent.deepseek_env`` provider-key mapping.
+            patch.object(config_paths, "_write_recovery_breadcrumb", lambda _home: None),
             patch.object(
                 client_mod,
                 "_resolve_self_served_bin",
@@ -504,6 +560,16 @@ def _capture_runtime_served(backend: str, tmp_path: Path, parent_env: dict) -> d
             patch.object(codex_harness_mod, "_sandbox_wrapper_generations", return_value=0),
             # Same default-home pin as the client capture, for the same reason.
             patch.object(config_paths, "_resolve_default_home", lambda: tmp_path / "default-home"),
+            # ... and the breadcrumb that default resolution drops OUTSIDE the data
+            # home, at ``~/.kirocrew.breadcrumb``. Pinning the resolver relocates the
+            # data home but not that file: it is written under ``Path.home()``, which
+            # this capture deliberately does not relocate (``fixed_parent_env`` carries
+            # HOME through so the interpreter and the OS still work).
+            # ``conftest._breadcrumb_guard`` fails the run for exactly that write, and
+            # stubbing the writer is the remedy it names -- the breadcrumb is not a
+            # launch answer, and the DeepSeek arm reaches ``config_dir()`` to read its
+            # ``agent.deepseek_env`` provider-key mapping.
+            patch.object(config_paths, "_write_recovery_breadcrumb", lambda _home: None),
         ]
     )
     saved_caches = snapshot_bin_caches()
@@ -566,7 +632,7 @@ def capture(backend: str, tmp_path: Path) -> dict[str, Any]:
     saved_caches = snapshot_bin_caches()
     _reset_bin_caches()
     stack: list = [patch.dict(os.environ, parent_env, clear=True)]
-    _stub_common(stack, rec, tmp_path)
+    _stub_common(stack, rec, tmp_path, backend)
     entered: list = []
     # The environment the child inherits, read back from ``os.environ`` inside the
     # patched context (see :func:`_env_delta`).

@@ -451,6 +451,84 @@ def test_the_stall_prefix_is_unchanged_on_posix(monkeypatch) -> None:
     assert security._stall_prefix("rel/path/file") == "rel/path"
 
 
+def test_the_stall_prefix_never_ends_on_a_container_of_homes(monkeypatch) -> None:
+    """A host whose homes sit one level deeper than ``/home`` reproduced the ``C:\\Users``
+    collapse on POSIX: two components of ``/local/home/<user>/...`` is ``/local/home``,
+    one key for every user, workspace, checkout, data home and credential store on
+    the machine, so one stall anywhere under it refused the whole host for the
+    cooldown (kirodotdev/KiroCrew#12386).  The key must not stop on a container of
+    homes; it takes the user too, which is exactly the key ``/home/<user>`` gets.
+    Driven through ``posixpath`` so the layout is asserted on every platform.
+    """
+    monkeypatch.setattr(security.paths.os, "path", posixpath)
+    monkeypatch.setattr(security.paths.os, "sep", posixpath.sep)
+
+    # The issue's reproduction, inverted: two users, two keys.
+    alice = security._stall_prefix("/local/home/alice/.aws/credentials")
+    bob = security._stall_prefix("/local/home/bob/project/file.py")
+    assert alice == "/local/home/alice"
+    assert bob == "/local/home/bob"
+    assert alice != bob
+    # Every layout that puts the homes one level deeper keeps the word.
+    assert security._stall_prefix("/usr/home/x/f") == "/usr/home/x"
+    assert security._stall_prefix("/var/home/x/f") == "/var/home/x"
+    assert security._stall_prefix("/export/home/x/f") == "/export/home/x"
+    # The container alone is still its own key: there is no user to take.
+    assert security._stall_prefix("/local/home") == "/local/home"
+    assert security._stall_prefix("/home") == "/home"
+    # A home at the usual depth, a mount and a plain directory are untouched: the
+    # rule only fires when the key WOULD have ended on the container.
+    assert security._stall_prefix("/home/x/ws/f") == "/home/x"
+    assert security._stall_prefix("/Volumes/share/x/y") == "/Volumes/share"
+    assert security._stall_prefix("/tmp/x/y") == "/tmp/x"
+
+
+class _StallsOneHome:
+    """Wedged for one user's tree, healthy for every other path."""
+
+    def __init__(self, wedged_under: str) -> None:
+        self.wedged_under = wedged_under
+        self.release = threading.Event()
+        self.calls: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, expanded: str) -> set[str]:
+        with self._lock:
+            self.calls.append(expanded)
+        if expanded.startswith(self.wedged_under):
+            self.release.wait()
+        return {expanded}
+
+
+def test_a_stall_under_one_home_leaves_a_sibling_home_resolving(monkeypatch) -> None:
+    """kirodotdev/KiroCrew#12386, consequence 1: the blast radius is one home, not the host.
+
+    Through the real cooldown machinery, not the key alone.  A key that stops on the
+    container charges Alice's stall to ``/local/home`` and refuses Bob's path for
+    free, without probing, because every home on the host shares that container.
+    Bob's tree is its own key, so its resolution is submitted and answered while
+    Alice's cooldown is open.
+    """
+    resolver = _StallsOneHome("/local/home/alice/")
+    monkeypatch.setattr(security, "_resolved_spellings", resolver)
+    try:
+        with pytest.raises(security.PathResolutionStalled) as info:
+            security._candidate_forms("/local/home/alice/.aws/credentials")
+        # Alice's tree is refused for free for the rest of the cooldown ...
+        with pytest.raises(security.PathResolutionStalled):
+            security._candidate_forms("/local/home/alice/project/file.py")
+        assert len(resolver.calls) == 1, "the cooldown must not re-probe the stalled home"
+        # ... while Bob's is untouched: the resolution runs and its answer is used.
+        forms = security._candidate_forms("/local/home/bob/project/file.py")
+    finally:
+        resolver.release.set()
+    assert "/local/home/bob/project/file.py" in forms
+    assert resolver.calls[-1] == "/local/home/bob/project/file.py"
+    assert os.path.normpath("/local/home/bob") not in security._path_resolve_degraded
+    # The stall was charged to Alice's home, not to the container both homes share.
+    assert info.value.prefix == os.path.normpath("/local/home/alice")
+
+
 def test_unc_paths_are_recognised_in_both_spellings() -> None:
     assert security._is_unc_path("\\\\server\\share\\project\\readme.md")
     assert security._is_unc_path("//server//share//project//readme.md")
@@ -1128,7 +1206,10 @@ def test_a_stalled_rebuild_refuses_even_with_a_warm_cache(monkeypatch, tmp_path)
     security._home_targets_cache.clear()
     warm = security._home_dir_targets(security._SENSITIVE_HOME_DIRS)  # canonical
     assert str(crew_home / "token_signing.key").casefold() in warm
-    clock[0] += security._HOME_TARGETS_TTL_SECS + 0.01  # the slot expires
+    # The EFFECTIVE expiry, read through the adaptive law rather than off the
+    # floor constant: under a frozen clock the warm build above measures as
+    # costing nothing, so the law returns its floor.
+    clock[0] += security._home_targets_ttl(0.0) + 0.01  # the slot expires
     logical_home = str(security.Path.home())
     stalled = _StalledRealpath()
     monkeypatch.setattr(security, "_realpath_or_none", stalled)
@@ -1192,7 +1273,7 @@ def test_a_repointed_override_root_is_never_served_stale_through_a_stall(
     monkeypatch.setattr(security.time, "monotonic", lambda: clock[0])
     security._home_targets_cache.clear()
     assert security.is_sensitive_path(str(real_a / "security_policy.json")) is True  # warm on A
-    clock[0] += security._HOME_TARGETS_TTL_SECS + 0.01
+    clock[0] += security._home_targets_ttl(0.0) + 0.01
     link.unlink()
     link.symlink_to(real_b, target_is_directory=True)  # repointed...
     real_resolver = security._realpath_or_none

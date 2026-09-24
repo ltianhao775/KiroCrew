@@ -255,6 +255,10 @@ class _FakeRequest(dict):
         # The handler's session-recognition gate refuses a request with no
         # X-Session-Key; the browser UI's static key is the recognised caller.
         self.headers: dict[str, str] = {"X-Session-Key": "dashboard:ui"}
+        # ``read_bounded_json`` reads both: whether a body is there, and whether
+        # it declares JSON (415 when it does not). A real request always has them.
+        self.can_read_body = True
+        self.content_type = "application/json"
         self._body = body
 
     async def json(self) -> dict:

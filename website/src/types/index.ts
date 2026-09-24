@@ -1291,6 +1291,16 @@ export interface ChatFolder {
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
+  /** Extra steering directories loaded, in addition to the global and project
+   *  steering, for every chat whose folder is in this folder's subtree.
+   *  ACCUMULATIVE up the parent_id chain (unlike `project_dir`, which is
+   *  nearest-wins). Absent = none, mirroring the optional `tags`. */
+  steering_dirs?: string[]
+  /** Principal that owns the folder: an app's name, `member:<store>` for a
+   *  crew member, absent/empty for the person. Folder steering from an
+   *  ancestor owned by ANOTHER principal is never delivered to this folder's
+   *  chats, so the inherited list filters on it. */
+  owner_app?: string
   /** Channel namespace when this folder was created by per-channel session filing (e.g. 'discord'). */
   channel?: string
 }
@@ -1407,12 +1417,25 @@ export interface SubagentActivity {
   result?: string
 }
 
+/** Where `clampToolOutput` (store/chatSlice.ts) removed the middle of a tool
+ *  payload: the stored string is `head + '\n' + tail`, `at` is the offset of
+ *  the tail (right after that newline) and `count` is how many characters were
+ *  dropped between the two. Renderers put the localized marker there at view
+ *  time, so the store never holds a rendered string and the marker follows a
+ *  later language switch. */
+export interface ToolPayloadCut {
+  at: number
+  count: number
+}
+
 export interface ToolActivity {
   type: string
   text: string          // tool name (or approval / activity label)
   purpose?: string      // tool purpose
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
+  input_cut?: ToolPayloadCut   // set only when `input` was clamped
+  output_cut?: ToolPayloadCut  // set only when `output` was clamped
   ts: number
   execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call

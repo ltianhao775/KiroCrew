@@ -64,7 +64,7 @@ from .process import ProcessGroup, spawn_process_group
 log = logging.getLogger("container.supervisor.backend")
 
 # --- Invocation (spelling-sensitive, see module docstring) ------------------
-BACKEND_LAUNCHER: tuple[str, ...] = (sys.executable, "-m", "kiro_crew")
+BACKEND_LAUNCHER: tuple[str, ...] = (sys.executable, "-P", "-m", "kiro_crew")
 GATEWAY_SUBCOMMAND: str = "gateway"
 FLAG_NO_CRONS: str = "--no-crons"
 # The flags that turn the dashboard off. We must pass NEITHER. Verified against

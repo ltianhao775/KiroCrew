@@ -11,7 +11,7 @@ import { DRAFT_SAVE_DEBOUNCE_MS } from '../utils/draftConstants'
 
 import { i18nT } from '../i18n/t'
 import { fmtTimeNumeric } from '../i18n/format'
-import { type AutoNudgeLoop, cycleText as loopCycleText, nextCycleText, AUTONUDGE_LOOPS_QUERY_KEY } from './autoNudgeLoop'
+import { type AutoNudgeLoop, cycleText as loopCycleText, nextCycleText, judgeReading, judgeVerdictTime, AUTONUDGE_LOOPS_QUERY_KEY } from './autoNudgeLoop'
 export type { AutoNudgeLoop } from './autoNudgeLoop'
 
 interface Props {
@@ -348,6 +348,20 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
   const stopFileHelpId = useId()
 
   const cycleText = loopCycleText(loop)
+  const judge = judgeReading(loop)
+  // A localized word per verdict outcome. The backend's token is a stable
+  // identifier in a line every armed-loop owner reads, and an owner reading a
+  // localized sentence should not meet an English identifier inside it. Keyed by
+  // the kernel's four-value outcome set, with a word for the record's own
+  // "unknown" so an unmapped token still reads as a word.
+  const JUDGE_OUTCOME_WORD: Record<string, string> = {
+    quiet: i18nT('components.autoNudgePopover.judge_outcome_quiet'),
+    wake: i18nT('components.autoNudgePopover.judge_outcome_wake'),
+    terminal: i18nT('components.autoNudgePopover.judge_outcome_terminal'),
+    fallback: i18nT('components.autoNudgePopover.judge_outcome_fallback'),
+  }
+  const judgeOutcomeWord = (outcome: string) =>
+    JUDGE_OUTCOME_WORD[outcome] ?? i18nT('components.autoNudgePopover.judge_outcome_unknown')
 
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
@@ -582,6 +596,51 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
               {i18nT('components.autoNudgePopover.last_fire')} {loop.last_fire_ts ? fmtTimeNumeric(loop.last_fire_ts) : i18nT('components.autoNudgePopover.never')}
               {countdownText && <span> · {countdownText}</span>}
             </div>
+            {/* The judge's own line, under the schedule it modifies. Drawn only for a
+                loop that carries a brief, so a plain timer gains no row. The verdict
+                half is omitted until one exists: "no verdict yet" is a different
+                statement from a quiet answer, and reading a fresh judge as quiet
+                would say a tick was skipped that never happened. What it shows is
+                the outcome, the item COUNT and the time -- never the evidence, and
+                never a probability, which lives in the decisions log where the
+                thresholds are tuned. */}
+            {/* ``break-words`` because the criterion is the owner's own sentence and may hold a
+                token with no spaces in it -- a URL, a sha, a pasted blob. Without it such a
+                criterion does not wrap, it OVERFLOWS the popover horizontally. Wrapping
+                rather than clamping: the row shows the whole criterion on purpose, so the
+                owner can confirm what they armed. */}
+            {judge.kind === 'armed' && (
+              <div className="text-muted text-[11px] break-words" data-testid="judge-line">
+                {i18nT(
+                  judge.sense === 'wake'
+                    ? 'components.autoNudgePopover.judge_wake_when'
+                    : 'components.autoNudgePopover.judge_quiet_while',
+                  { criterion: judge.criterion },
+                )}
+                {judge.verdict ? (
+                  <span>
+                    {' · '}
+                    {/* Two spellings because the time is the only segment that can be
+                        absent: a record with no timestamp renders no clock reading, and
+                        one interpolated string would leave its separator hanging with
+                        nothing after it. A conditional inside the string is not
+                        available to a translator, so the choice is made here. */}
+                    {judgeVerdictTime(judge.verdict.at)
+                      ? i18nT('components.autoNudgePopover.judge_verdict', {
+                        outcome: judgeOutcomeWord(judge.verdict.outcome),
+                        count: judge.verdict.items,
+                        time: judgeVerdictTime(judge.verdict.at),
+                      })
+                      : i18nT('components.autoNudgePopover.judge_verdict_untimed', {
+                        outcome: judgeOutcomeWord(judge.verdict.outcome),
+                        count: judge.verdict.items,
+                      })}
+                  </span>
+                ) : (
+                  <span> · {i18nT('components.autoNudgePopover.judge_no_verdict')}</span>
+                )}
+              </div>
+            )}
             {loop.active ? (
               <button
                 type="button"

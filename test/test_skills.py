@@ -1637,7 +1637,14 @@ class TestTriggerPerformance:
             "tiny-url",
             f"---\nname: tiny-url\ndescription: d\ntriggers: {triggers}\n---\n# x\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        # A positive cap: the denial is a DENY only where the match could have
+        # been a grant. At the shipped cap of 0 the same veto is not audited
+        # (see test_zero_cap_writes_no_denied_audit_row).
+        loader = SkillsLoader(
+            skills_path=skills_dir,
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
 
         fake_sel = MagicMock()
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
@@ -1663,7 +1670,12 @@ class TestTriggerPerformance:
             "tiny-url",
             "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        # A positive cap so the scan actually runs; at 0 there is no walk to cache.
+        loader = SkillsLoader(
+            skills_path=skills_dir,
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
 
         calls = {"n": 0}
@@ -1690,7 +1702,11 @@ class TestTriggerPerformance:
             "tiny-url",
             "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = SkillsLoader(
+            skills_path=skills_dir,
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
         monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
 
         calls = {"n": 0}
@@ -1724,6 +1740,116 @@ class TestTriggerPerformance:
 
         triggered = loader.get_triggered_skills("shorten url")
         assert len(triggered) == 2
+
+    def test_zero_cap_skips_the_scan_entirely(self, tmp_path, monkeypatch):
+        """At the shipped default (``max_triggered = 0``) the matcher is off: no
+        skill is walked, read or scored, because every score would be sliced away.
+        The per-message cost is one cap read, and the result is the same ``[]``."""
+        from unittest.mock import MagicMock
+
+        skills_dir = tmp_path / "skills"
+        _create_skill(
+            skills_dir,
+            "tiny-url",
+            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
+        )
+        loader = SkillsLoader(
+            skills_path=skills_dir,
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=0)),
+        )
+        fake_sel = MagicMock()
+        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
+        walk = MagicMock(return_value=[])
+        monkeypatch.setattr(loader, "_iter_visible", walk)
+        read = MagicMock(return_value={})
+        monkeypatch.setattr(loader, "_cached_frontmatter", read)
+
+        assert loader.get_triggered_skills("shorten this url") == []
+        walk.assert_not_called()
+        read.assert_not_called()
+        assert fake_sel.log_tool_invocation.call_count == 0
+
+    def test_zero_cap_writes_no_denied_audit_row(self, tmp_path, monkeypatch):
+        """A ``!`` veto at cap 0 excludes nothing that could have been injected, so
+        it is not a permission DENY and writes no ``skill_trigger`` row -- unlike
+        the same veto under a positive cap (test_negative_trigger_exclusion_is_audited)."""
+        from unittest.mock import MagicMock
+
+        skills_dir = tmp_path / "skills"
+        _create_skill(
+            skills_dir,
+            "tiny-url",
+            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url, !test\n---\n# x\n",
+        )
+        loader = SkillsLoader(
+            skills_path=skills_dir,
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=0)),
+        )
+        fake_sel = MagicMock()
+        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
+
+        assert loader.get_triggered_skills("shorten url for this test") == []
+        assert fake_sel.log_tool_invocation.call_count == 0
+
+    def test_zero_cap_still_consults_select(self, tmp_path, monkeypatch):
+        """The zero-cap skip belongs to the matcher, not to ``select``: a
+        selection point still runs, owns its own zero-cap refusal, and a pick it
+        returns is injected and audited as a selection."""
+        from unittest.mock import MagicMock
+
+        skills_dir = tmp_path / "skills"
+        _create_skill(
+            skills_dir,
+            "tiny-url",
+            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
+        )
+        loader = SkillsLoader(
+            skills_path=skills_dir,
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=0)),
+        )
+        fake_sel = MagicMock()
+        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
+        select = MagicMock(return_value=["tiny-url"])
+
+        assert loader.get_triggered_skills("hello there friend", select=select) == ["tiny-url"]
+        select.assert_called_once_with()
+        assert fake_sel.log_tool_invocation.call_count == 1
+        _, kwargs = fake_sel.log_tool_invocation.call_args
+        assert kwargs["outcome"] == "triggered"
+        assert kwargs["metadata"]["selected"] == "true"
+        assert kwargs["metadata"]["skills"] == "tiny-url"
+
+    def test_zero_cap_is_read_live_so_raising_it_turns_the_scan_back_on(
+        self, tmp_path, monkeypatch
+    ):
+        """The skip reads the cap from the live snapshot, so ``kirocrew config set
+        skills.max_triggered 3`` re-enables the scan for the very next message
+        without rebuilding the loader."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew.config import live
+
+        skills_dir = tmp_path / "skills"
+        _create_skill(
+            skills_dir,
+            "tiny-url",
+            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
+        )
+        loader = SkillsLoader(
+            skills_path=skills_dir,
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=0)),
+        )
+        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
+
+        assert loader.get_triggered_skills("shorten this url") == []
+        cfg = KiroCrewConfig()
+        cfg.skills.max_triggered = 3
+        live.watch().prime(cfg)
+        assert loader.get_triggered_skills("shorten this url") == ["tiny-url"]
 
 
 class TestResolveDollarSkills:

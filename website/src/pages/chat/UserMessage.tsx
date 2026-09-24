@@ -1,6 +1,6 @@
 import { memo, useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff, X } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
@@ -41,6 +41,8 @@ interface UserMessageProps {
   mode?: string
   pinned?: boolean
   onTogglePin?: () => void
+  /** Open (or start) the reply thread on this message. Only a crewmate's chat offers it. */
+  onReplyInThread?: () => void
   /** Whether the slot currently has a running turn. Gates the pending-steer
    *  indicator: the backend settle is best-effort, so a row can be stranded in
    *  `written` forever, and a perpetual "Steering…" pulse on an idle slot
@@ -57,7 +59,7 @@ interface UserMessageProps {
   hideSteerBadge?: boolean
 }
 
-const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin, slotRunning, hideSteerBadge }: UserMessageProps) {
+const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge }: UserMessageProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
@@ -230,18 +232,24 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     e.preventDefault()
   }, [meta])
 
+  const canEditResend = !!(canEdit && onEditResend)
+
+  // Declared before the editing early-return so hook order stays stable across
+  // the read-only and editing renders.
+  const handleDoubleClick = useCallback(() => { startEdit() }, [startEdit])
+
   if (editing) {
     return (
       <div data-role="user" className="group/msg flex flex-col items-end max-w-full">
         {/* `edit-grow` is a CSS grid auto-sizer: a hidden ::after mirror (fed by
             data-replicated-value) drives the grid track so the textarea grows
             with its own content — width AND height — exactly like the read-only
-            bubble it replaces, capped at 550px or the column, whichever is
-            smaller. No JS measurement. */}
+            bubble it replaces, capped at the content column (Settings → Chat →
+            Content Width, via the row's --mc-content-width). No JS measurement. */}
         <div
-          className="edit-grow user-bubble px-4 py-2 text-sm leading-6 rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline-solid outline-2 -outline-offset-2 outline-accent/60"
+          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-full outline-solid outline-2 -outline-offset-2 outline-accent/60 focus-within:outline-accent"
           data-replicated-value={draft}
-          style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
+          style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}
         >
           <textarea
             ref={taRef}
@@ -250,7 +258,8 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             // focus-cue-ok: the cue is the wrapping .edit-grow frame above, which
             // paints a 2px accent outline for the whole edit session; a second
             // ring on the textarea would double-paint the one control.
-            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-hidden text-sm leading-6"
+            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-hidden leading-relaxed"
+            style={{ fontSize: 'var(--mc-message-font-size, 14px)' }}
             value={draft}
             onChange={e => setDraft(e.target.value)}
             {...ime.bindComposition()}
@@ -278,7 +287,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
-    <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-2 text-sm leading-6 rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+    // `max-w-full`, not a pixel cap: the bubble's maximum is the content column
+    // the transcript row clamps to --mc-content-width, so Settings → Chat →
+    // Content Width governs it exactly as it governs agent output (#8398), while
+    // `w-fit` keeps a short message hugging its text.
+    // Disable is safe: the keyboard-accessible edit path is the aria-labelled
+    // pencil button in the action row below, not this bubble.
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+    <div ref={userRef} onCopy={handleCopy} onDoubleClick={canEditResend ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
           correct for the audio key above, which wants the optimistic bubble's own
           identity, but this value is COMPARED against server-clock slot mint
@@ -315,14 +331,15 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               decision behind it. */}
           {steerDecision && <SteerDecisionLine record={steerDecision} />}
           <motion.div
-            /* Same width cap as the bubble, not just max-w-full: this wrapper
-               sits between the content column and the bubble, and a percentage
-               cap only bites once EVERY box in that chain carries one (see the
-               root's comment). With only max-w-full, intrinsic sizing treats
-               the bubble's percentage max-width as none, the wrapper inflates
-               to the full column, and the capped bubble inside lands at its
-               LEFT edge while the badge stays right. */
-            className="relative w-fit max-w-[min(550px,100%)]"
+            /* Same width cap as the bubble (the column, `max-w-full`): this
+               wrapper sits between the content column and the bubble, and a
+               percentage cap only bites once EVERY box in that chain carries
+               one (see the root's comment). During intrinsic sizing a
+               percentage max-width is treated as none, so a wrapper whose cap
+               differed from the bubble's would inflate to the full column and
+               the capped bubble inside would land at its LEFT edge while the
+               badge stays right; one shared cap resolves both to one width. */
+            className="relative w-fit max-w-full"
             initial={playSteer ? { opacity: 0, x: 16 } : false}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.32, ease: 'easeOut' }}
@@ -390,6 +407,17 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           icon + 10px padding); hover-capable pointers keep the reveal-on-hover
           behavior and the compact 14px icons untouched. */}
       <div className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`}>
+        {onReplyInThread && (
+          <button
+            onClick={onReplyInThread}
+            className="text-muted hover:text-text p-0.5 rounded transition-colors"
+            data-testid="reply-in-thread"
+            title={i18nT('pages.chat.thread.reply_in_thread')}
+            aria-label={i18nT('pages.chat.thread.reply_in_thread')}
+          >
+            <MessageSquare size={14} />
+          </button>
+        )}
         <button
           onClick={() => {
             const pastes = (meta?.pastes as PasteBlock[] | undefined) || []

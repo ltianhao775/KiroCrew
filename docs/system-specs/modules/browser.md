@@ -1,35 +1,48 @@
 ## Browser Module
 
-Website browsing through `playwright-cli`, the Playwright agent CLI. An agent
-drives a browser by running shell commands; Kiro Crew owns the install flow, the
-snapshot directory, and the dashboard surface that displays and hands over a live
-session.
+Website browsing has two agent paths. In the desktop app, the `browser` MCP
+tool drives the Browser panel's native embedded Chromium view. When no native
+panel serves the session, or `dashboard.use_builtin_browser` is off, the tool
+directs the agent to the `playwright-cli` shell path. Kiro Crew owns the CLI
+install flow, snapshot directory, command bus, and dashboard surfaces.
 
 ### Architecture
 
-The browser is a **shell capability, not a tool namespace.** Each browser action
-is one `playwright-cli` invocation on the agent's ordinary command path, so there
-is no MCP server to register, no tool schemas re-sent per request, and no
-per-message browse marker. The agent decides per task whether a browser is
-warranted or whether `web_fetch` answers the question.
+The native path is a **single MCP tool, not a Playwright tool namespace.** Its
+`op` enum exposes `navigate`, `snapshot`, `click`, `type`, `press_key`, `hover`,
+`select_option`, `screenshot`, `wait_for`, `back`, and `console`. The MCP shim
+posts one bounded command to the gateway's in-memory bus; Electron long-polls the
+bus, runs the operation in the panel it owns, and posts the result. A missing
+panel fails fast to the CLI fallback. The agent still decides per task whether a
+browser is warranted or whether `web_fetch` answers the question.
 
 ```
-agent turn ──shell──▶ playwright-cli <verb> …
-                          │
-                          ├─▶ stdout: page URL, page title, path to a snapshot YAML
-                          └─▶ disk:   .../page-<timestamp>.yml   (the accessibility tree)
-
-agent reads the YAML with its own file tools ONLY when it needs the tree
+agent turn ──MCP browser(op, args)──▶ gateway command bus ──▶ Electron native view
+     │                                      │
+     │                                      └─ no panel / built-in disabled
+     └─shell fallback──▶ playwright-cli <verb> …
+                              │
+                              ├─▶ stdout: page URL, title, snapshot YAML path
+                              └─▶ disk:   .../page-<timestamp>.yml
 ```
 
-The gateway itself runs exactly two kinds of CLI command, neither of them on an
-agent's behalf: the `show` dashboard it supervises ([Dashboard
+The native route is session-bound. The MCP shim sends the namespaced session key
+in the authenticated request header and the bare slot key in the body, matching
+the panel registration. The gateway bounds queues to 32 commands per session,
+uses 15-second operation timeouts (60 seconds for `navigate` and `wait_for`), and
+expires panel liveness after 30 seconds without a drain or result. The three
+internal routes are `/api/browser/command`, `/api/browser/command-drain`, and
+`/api/browser/command-result`; all require internal-secret authentication and do
+not accept dashboard-cookie callers.
+
+The gateway also runs exactly two kinds of CLI command, neither on an agent's
+behalf: the `show` dashboard it supervises ([Dashboard
 integration](#dashboard-integration)), and the browsing verb behind the Browser
 panel's address bar ([Address bar launcher](#address-bar-launcher)), which a
-HUMAN triggers by pressing Enter in an authenticated dashboard. Everything an
-agent does with a browser still goes through its shell.
+HUMAN triggers by pressing Enter in an authenticated dashboard. Agent CLI
+fallback actions still go through the ordinary shell approval path.
 
-**The stdout line is the contract.** Every command prints the resulting page URL,
+**The CLI stdout line is the contract.** Every CLI command prints the resulting page URL,
 the page title, and a filesystem path to a snapshot YAML. Roughly 250 characters
 of stdout carry a complete action result, and the accessibility tree stays on
 disk until the agent decides it needs it. This is why no compression layer
@@ -80,10 +93,12 @@ ladder. A dashboard session must receive an interactive command grant, a
 trusted-command pattern, or an explicit trust/auto-approve mode before the
 command runs without a prompt.
 
-There is no separate capability toggle or flag file because the CLI exposes no
-capability gating of its own: once an approved shell turn runs the binary, all of
-its verbs are reachable. That limitation does not turn binary presence into
-consent for automatic execution.
+The CLI exposes no capability toggle of its own: once an approved shell turn
+runs the binary, all of its verbs are reachable. `dashboard.use_builtin_browser`
+(default `true`) selects the native MCP path in the desktop app; turning it off
+routes allowed browsing to the CLI and does not override the governance
+`capabilities.browse` denial. That limitation does not turn binary presence into
+consent for automatic CLI execution.
 
 #### Approval boundary
 
@@ -94,10 +109,16 @@ withholds writes to the whole prefix. Gateway code never consumes that PATH. A
 shim planted in `~/.local/bin`, the project, the workspace, or another writable
 PATH directory is diagnosed once at WARNING and ignored.
 
-The first agent command prompts under normal mode. The operator can approve once,
+The first CLI command prompts under normal mode. The operator can approve once,
 trust the command pattern for the session, or deliberately enable wider
 auto-approval. The last two choices are ordinary audited trust decisions and
-remain subject to the deny and governance gates.
+remain subject to the deny and governance gates. The native `browser` tool has a
+separate bounded surface: governance is checked before dispatch, and `navigate`
+auto-drives only public HTTP(S) targets. Literal loopback, private, link-local,
+reserved, alternate-encoded IP, non-ASCII host, parser-differential, and non-HTTP
+forms are refused and directed to the approval-gated CLI path; DNS names are not
+resolved, so public-name-to-private-address rebinding remains an accepted
+residual.
 
 ### Install flow
 
@@ -764,11 +785,24 @@ host still goes to the native view. While the gateway is launching, the panel
 shows an opening state; on success the CLI view takes the panel, and the framed
 dashboard's own URL bar, tab bar and remote input carry navigation from there —
 the panel adds no second address bar beside a surface that already has one. The
-view header names this chat's browser by its `panel-…` session; one sentence
-under it says how the next site is opened (the padlock above the page unlocks
-the frame's own address bar; the monitor button brings the preview bar back)
-and is dismissed once per browser; and when the answer says the reveal did not
-attach (`attached: false`), one line names the session to pick in the frame's
+view header names the session THIS CHAT LAUNCHED into, by its `panel-…` name,
+and states that as a launch fact ("Opened from this chat") rather than as
+ownership of what the frame is showing (#5940). The distinction is load-bearing
+because the reveal above is one machine-wide switch: an agent or the CLI opening
+a page for another chat's session, or a second dashboard tab, moves the single
+viewport with no signal this panel can observe. A header reading "this chat's
+browser" therefore described, routinely, a page the reader was not looking at.
+Naming the session the frame is ACTUALLY on would need the view status to carry
+it — `/api/browser/view` answers `status`, `url`, `port` and `reason`, and the
+frame is cross-origin, so the panel has no other source — and that field does not
+exist yet; the open half of #5940 owns it. A window event between mounted panels
+is NOT a substitute: the dashboard mounts one panel per browsing context (every
+`SidePanel` is passed the single active slot), so it would reach no listener, and
+none of the supersedings above is a mounted panel. One sentence
+under the header says how the next site is opened (the padlock above the page
+unlocks the frame's own address bar; the monitor button brings the preview bar
+back) and is dismissed once per browser; and when the answer says the reveal did
+not attach (`attached: false`), one line names the session to pick in the frame's
 sidebar — said only in that case. On
 failure the panel hands back to the preview body and renders the gateway's text
 through `ErrorNotice` (dismiss on the notice, one retry action). A URL with a
@@ -781,12 +815,28 @@ skipped that check, is a rejected request and renders the same sentence through
 `ErrorNotice`. Only the newest
 launch on a slot may paint: every launch takes a sequence number, a slot change
 bumps it, and a late answer from an older launch (a mistyped address that fails
-after the corrected one succeeded, or a slot the user left) paints nothing. The view URL is
-loopback on the GATEWAY host, so from a browser on another machine it is dead
-unless `dashboard.browser_view_port` is pinned and forwarded: the panel probes it
-with the same no-cors liveness check it uses for a dev server and, on two
-strikes, replaces the frame with an `ErrorNotice` naming the URL and the setting
-rather than showing the browser's own connection-refused page.
+after the corrected one succeeded, or a slot the user left) paints nothing. The
+panel frames the view through the **same-origin relay** whenever the gateway
+publishes one: `/api/browser/view` answers a root-relative `path`
+(`/browser-view/<token>/`), the panel prefers it over the direct `url`, and the
+frame is served through the dashboard's own port — so a remote or tunneled
+dashboard reaches the view through the one forward it already has, with no
+extra configuration. The direct loopback `url` remains as the fallback for an
+old gateway whose payload carries no `path`: that URL is loopback on the
+GATEWAY host, dead from a browser on another machine unless
+`dashboard.browser_view_port` is pinned and that port forwarded — the panel
+probes it with the same no-cors liveness check it uses for a dev server and, on
+two strikes, replaces the frame with an `ErrorNotice` naming the URL and the
+setting rather than showing the browser's own connection-refused page. (The
+relay path never gets that probe: it is same-origin, so its health is the
+dashboard's own.) The relay rewrites the view SPA's root-absolute references
+and its `?ws=` socket parameter to stay under the tokened prefix; those
+rewrites are pinned to the current playwright-cli bundle shape (double-quoted
+`src`/`href` attributes, `url(/…)` in CSS, the `'/' + ws` socket-URL
+construction), so **after a playwright-cli upgrade, open the Browser panel once
+on a remote dashboard and confirm the view boots through the relay** — an
+upstream bundle-shape change would silently restore the direct-URL breakage
+this path exists to fix.
 
 ### Security
 
@@ -794,7 +844,9 @@ rather than showing the browser's own connection-refused page.
 |---------|----------------|
 | Capability availability | Vetted absolute launcher identity only: `<data-home>/playwright-cli` first, then fixed system locations whose direct launcher, Node and package-entry hierarchies the gateway user cannot write. The managed prefix is on the sensitive-path floor and `_CREW_READONLY_LEAVES`, so agent file tools cannot read or replace it and every agent sandbox can execute but not modify it. Linux precreation requires the launcher leaf itself to be a real directory before and after the create race; a resolving symlink is refused because a bind mount would follow its target and leave the name replaceable. PATH, `~/.local/bin`, project and workspace candidates are ignored. On every OS gateway-owned calls use an attributed direct pair: managed `gateway-node`/`node.exe` plus contained `playwright-cli.js`, or a fixed-system Node and package entry whose complete hierarchies are non-writable. POSIX shebangs, PATH Node, and Windows batch files never receive gateway request data. See [Capability model](#capability-model) for why availability is not approval |
 | Dashboard exposure | `show` is bound to `127.0.0.1`; `0.0.0.0` is never passed, because the served view carries remote input |
+| Browser view relay (`/browser-view/…`) | The one token-auth bypass that proxies foreign content. Auth is a per-instance capability token in the path: minted fresh at every view-server start, disclosed only through the cookie-authed owner-gated `/api/browser/view` payload, constant-time-compared against a lock-free snapshot BEFORE the supervisor lock or its OS-level ownership probes are touched — an invalid candidate can never contend either, and the probes themselves run outside the lock on a consistent snapshot. Every unauthenticated miss answers a uniform 404; a caller already holding the current token that lands in a start window (supervisor lock held past the bounded wait) gets a retryable 503 instead — safe to distinguish precisely because only token holders can reach it. Every allow/deny is SEL-audited. Ownership is re-proved after each upstream connection is established, before any byte or frame goes downstream, closing the proof→connect race (a dead child's freed port cannot be inherited by a squatter; a restarted view's new port marks held connections stale). Every relayed non-script response is stamped with the CSP `sandbox` + `nosniff` (+ `Access-Control-Allow-Origin: *` — the token gates access, CORS only gates readability), and the panel frames it in an opaque-origin sandbox, so relayed content never runs with the dashboard origin's ambient authority |
 | Address bar launcher (`POST /api/browser/open`) | Owner-only (cookie/token), on no internal-path list, and the handler refuses an internal-secret caller outright, so an agent cannot use it to skip the shell approval ladder. The URL is re-validated (`http`/`https`, host, and no secret-bearing userinfo, query, or fragment — argv is world-readable) before it is the one free argv element; the session name is derived hex; no sandbox flag is ever added and no config written — the operator's `PLAYWRIGHT_MCP_CONFIG` is inherited as-is. Only sessions this gateway opened are closed at shutdown, never `close-all`/`kill-all`. **Accepted residual:** a token carried in the URL *path* still reaches argv for the life of the CLI process; paths stay allowed because refusing them refuses most ordinary pages. The residual closes when the CLI takes the URL outside argv — #9854 tracks that switch and its version floor |
+| Native `browser` MCP tool | The tool is always advertised but re-checks the vetted CLI availability and `capabilities.browse` governance at call time. It dispatches one enum-bounded operation to the calling slot's Electron panel through internal-secret-only routes. `dashboard.use_builtin_browser=false`, an unresolved session, a missing panel, HTTP 404/503, or a transport miss returns CLI fallback guidance; governance denial never falls back. `navigate` accepts only public HTTP(S) targets as described above. Arguments are scalar or lists of scalars, result text is credential/exfiltration-URL redacted and capped, and screenshot data is not inlined into the model response. **Accepted residual:** the lenient session resolver can map a subagent process to its parent slot, so a subagent tool call may drive the parent's native panel; this stays same-user/same-machine and public-navigation-only |
 | Agent reach into a `panel-` session | **Accepted residual.** A `panel-` browser can hold logins the human typed into it, and an agent drives the same CLI through its shell. What separates the populations is structural but not an enforcement boundary: an agent process runs under its own generated `PWTEST_DAEMON_SESSION_DIR`/`PWTEST_SOCKETS_DIR` namespace (see [Generated session reachability](#generated-session-reachability)), so a bare `playwright-cli -s=panel-… goto` from an agent shell resolves no session and its `list` does not show one; reaching the human's browser takes a command that also names the CLI's default registry and the gateway's socket root, both readable by a same-user process. The control on that command is the ordinary shell approval ladder, exactly as for every other `playwright-cli` invocation; the reserved prefix and the `web-browse` skill's rule are the conventions on top. An enforced isolation would be a per-population credential on the daemon socket, which the CLI does not offer |
 | Reveal | One JSON line to the `show` dashboard's own singleton socket under the gateway-owned socket root both children run with, only when the installed bundle carries that layout, after a successful launch; fails closed when there is no listener. `show -s=<name>` (no port) is never run, since with a stale socket it launches a Chromium app window on the host |
 | Saved state files | Owner-only permissions; they hold live session credentials |
@@ -957,5 +1009,6 @@ absent) and 16 (browser download blocked).
   opening a page so the user can see it.
 - [web-verify](../../../src/kiro_crew/builtin_skills/web-verify/SKILL.md) for
   screenshotting a front-end change as evidence.
-- [mcp](../../architecture/mcp.md) for why browsing is deliberately not an MCP
-  server.
+- [mcp](../../architecture/mcp.md) for MCP registration, transport, and trust
+  boundaries. The `browser` tool is a thin native-panel command proxy; the
+  Playwright fallback remains a shell capability.

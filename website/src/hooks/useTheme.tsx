@@ -16,6 +16,12 @@ import { ApiError } from '../api/apiError'
 import { pendingRefresh } from '../api/refreshOnce'
 import { reportSeamCollision } from '../apps/seamCollision'
 import { safeSetItem } from '../utils/safeStorage'
+import {
+  clearCachedThemeData,
+  readCachedThemeData,
+  renderCacheProjection,
+  writeCachedThemeData,
+} from './themeRenderCache'
 // Every stylesheet TEXT this hook injects is built there, so the i18n gate does
 // not read CSS as user-visible copy. The DOM side (which <style> tag, when, and
 // when to revert it) stays here, as does every string this file SHOWS a user —
@@ -494,6 +500,14 @@ export interface ThemeContextValue {
    * dismissal-based — it clears on its own once the pack is fixed.
    */
   overridesDropReport: OverridesDropReport | null
+  /**
+   * True while the catalog lists the active custom theme but its detail is not
+   * loaded. Derived from the selection, the catalog and the detail map (not a
+   * stored flag), so it follows the selection and every catalog/detail change:
+   * switching to a listed pack whose detail failed earlier is true at once, and
+   * switching back to a loaded pack is false again.
+   */
+  installedThemeLoadFailed: boolean
   allThemes: ThemeEntry[]
   /** Active installed theme's branding bot-name, or null for built-ins / L0. */
   brandName: string | null
@@ -518,10 +532,15 @@ export interface ThemeContextValue {
    * chapter while the boot fetch is in flight.
    */
   privacyAcked: boolean
+  /** Has the first-run Meet CrewMates flow been finished or dismissed? Server-backed like the other first-run flags; localStorage is only the render cache. */
+  crewmatesOnboarded: boolean
   themeBootReady: boolean
   markOnboarded: () => void
   markImportOnboarded: () => void
   markPrivacyAcked: () => void
+  /** Resolves when the server has the flag; rejects on a failed PUT so the
+   *  caller can render the failure (the local mark is set either way). */
+  markCrewmatesOnboarded: () => Promise<void>
   addCustomTheme: (data: Omit<CustomThemeData, 'slug'> & { slug?: string }) => Promise<CustomThemeData>
   deleteCustomTheme: (slug: string) => Promise<void>
   loadCustomThemes: () => Promise<void>
@@ -553,6 +572,45 @@ export function useOptionalTheme(): ThemeContextValue | null {
   return useContext(ThemeContext)
 }
 
+/** The installed-pack slug behind a `custom-<slug>` selection, else null. */
+function activeCustomSlug(colorTheme: ColorTheme): string | null {
+  return colorTheme.startsWith('custom-') ? colorTheme.slice('custom-'.length) : null
+}
+
+/**
+ * Seed the custom-theme map from the render cache so the first paint of a
+ * cold load is already themed. Runs inside a `useState` initializer: the CSS
+ * injection is idempotent by element id, so a repeated initializer (StrictMode)
+ * is harmless. `customThemesLoaded` is deliberately NOT set from here — the
+ * self-repair effect must still wait for the real catalog, because a cached
+ * pack may have been uninstalled since.
+ */
+function seedFromRenderCache(
+  colorTheme: ColorTheme,
+  mode: ResolvedMode,
+  pref: ModePreference,
+): Map<string, CustomThemeData> {
+  const map = new Map<string, CustomThemeData>()
+  const slug = activeCustomSlug(colorTheme)
+  if (!slug) return map
+  const cached = readCachedThemeData(slug)
+  if (!cached) return map
+  // The validator in themeRenderCache is the first line of defense; this is
+  // the guarantee: a cache entry can never take the shell down twice. Any
+  // throw here drops the entry (and a half-injected style) and mounts unthemed.
+  try {
+    injectCustomThemeCSS(cached)
+    injectThemeFonts(cached)
+    map.set(cached.slug, cached)
+    applyTheme(colorTheme, mode, pref)
+    return map
+  } catch {
+    clearCachedThemeData()
+    removeCustomThemeCSS(slug)
+    return new Map<string, CustomThemeData>()
+  }
+}
+
 /**
  * Internal state hook — ONLY called once, by ThemeProvider. All theme state,
  * effects, listeners, and API calls live here. Consumers reach this via
@@ -568,7 +626,9 @@ function useThemeState(): ThemeContextValue {
   )
   const [resolved, setResolved] = useState<ResolvedMode>(() => resolveMode(mode))
   const [customThemes, setCustomThemes] = useState<ThemeEntry[]>([])
-  const [customThemeDataMap, setCustomThemeDataMap] = useState<Map<string, CustomThemeData>>(new Map())
+  const [customThemeDataMap, setCustomThemeDataMap] = useState<Map<string, CustomThemeData>>(
+    () => seedFromRenderCache(colorTheme, resolved, mode)
+  )
   // Monotonic counter bumped on any change that affects computed CSS vars on
   // documentElement: mode change, color-theme change, and in-place edits to
   // the active custom theme (same slug, new values). Consumers that read the
@@ -610,15 +670,68 @@ function useThemeState(): ThemeContextValue {
   const [privacyAcked, setPrivacyAcked] = useState(
     () => !!localStorage.getItem('mc-privacy-acked') || !!localStorage.getItem('mc-onboarded'),
   )
+  // Seeded from `mc-onboarded` as well as its own flag, like `privacyAcked`: a
+  // workspace that finished first run before this chapter existed is an
+  // EXISTING user, who reaches the flow from the Crew Members page instead of
+  // being interrupted by it. `mc-crewmates-pending` tells the two apart: the
+  // tour's own completion (`markOnboarded`) sets it on this browser, so a NEW
+  // user who reloads or restarts between the tour and this chapter is still
+  // due the chapter -- only a workspace onboarded with no such mark (before
+  // this shipped, or from another machine) counts as done. Cleared when the
+  // chapter is marked, so the mark cannot outlive its purpose.
+  const [crewmatesOnboarded, setCrewmatesOnboarded] = useState(
+    () =>
+      !!localStorage.getItem('mc-crewmates-onboarded') ||
+      (!!localStorage.getItem('mc-onboarded') && !localStorage.getItem('mc-crewmates-pending')),
+  )
   const legacyOnboardedRef = useRef(
     !!localStorage.getItem('mc-onboarded') && !localStorage.getItem('mc-import-onboarded'),
   )
   const legacyMigrationStartedRef = useRef(false)
   const [themeBootReady, setThemeBootReady] = useState(false)
+  // The serialized active detail last applied by the branding/overrides effect.
+  // Every reload after the first resets this guard at its START (before the
+  // early active-detail fetch) because a reinstalled pack can change assets on
+  // disk without changing its detail JSON. Resetting up front means one reload
+  // applies exactly once whether or not the detail changed: the early fetch's
+  // effect run applies and re-arms the guard, and the catalog pass that follows
+  // carries the same serialized data and is skipped.
+  const appliedActiveRef = useRef<string | null>(null)
+  const loadGenerationRef = useRef(0)
 
   const loadCustomThemes = useCallback(async (replayed = false): Promise<void> => {
     try {
+      // Every await may resume after a newer reload has started; re-check the
+      // generation before writing any observable state, DOM, or cache data.
+      const generation = ++loadGenerationRef.current
+      if (generation > 1) appliedActiveRef.current = null
+      // The ACTIVE pack's detail is the one request that gates a themed paint,
+      // so it goes out alongside the catalog instead of one round trip behind
+      // it; the moment it lands its CSS/fonts are injected and it is merged into
+      // the map so the overrides.css fetch starts too. A failure here is not a
+      // verdict — the catalog below rules on whether the pack still exists —
+      // and it is started inside a promise chain so that no failure of the
+      // early request, synchronous or not, can take the catalog load with it.
+      const activeSlug = activeCustomSlug(colorThemeRef.current)
+      const earlyDetail: Promise<CustomThemeData | null> = activeSlug
+        ? Promise.resolve()
+            .then(() => api.themeDetail(activeSlug))
+            .then((d: CustomThemeData) => {
+              if (loadGenerationRef.current !== generation) return d
+              injectCustomThemeCSS(d)
+              injectThemeFonts(d)
+              setCustomThemeDataMap((prev) => new Map(prev).set(d.slug, d))
+              // An injection and its version bump are inseparable: consumers
+              // that snapshot the computed vars (widget/app frames, artifact
+              // previews) re-read on this counter, and the catalog pass below
+              // may never reach its own bump if /api/themes fails.
+              bumpThemeVersion()
+              return d
+            })
+            .catch(() => null)
+        : Promise.resolve(null)
       const res = await api.themes()
+      if (loadGenerationRef.current !== generation) return
       const themes: ThemeEntry[] = (res.themes || []).map(
         (t: { slug: string; name: string; emoji: string; source?: string }) => ({
           value: `custom-${t.slug}`,
@@ -629,11 +742,20 @@ function useThemeState(): ThemeContextValue {
       )
       setCustomThemes(themes)
 
-      // Fetch all theme details in parallel to avoid serial waterfall
+      const catalogSlugs = new Set<string>((res.themes || []).map((t: { slug: string }) => t.slug))
+      const early = await earlyDetail
+      if (loadGenerationRef.current !== generation) return
+      // Fetch all theme details in parallel to avoid serial waterfall; the
+      // active pack already came back above, so it is not fetched twice.
       const dataMap = new Map<string, CustomThemeData>()
-      const results = await Promise.allSettled(
-        (res.themes || []).map((t: { slug: string }) => api.themeDetail(t.slug))
+      if (early && catalogSlugs.has(early.slug)) dataMap.set(early.slug, early)
+      const pendingDetails = (res.themes || []).filter(
+        (t: { slug: string }) => !dataMap.has(t.slug),
       )
+      const results = await Promise.allSettled(
+        pendingDetails.map((t: { slug: string }) => api.themeDetail(t.slug)),
+      )
+      if (loadGenerationRef.current !== generation) return
       for (const r of results) {
         if (r.status === 'fulfilled') {
           dataMap.set(r.value.slug, r.value)
@@ -641,7 +763,39 @@ function useThemeState(): ThemeContextValue {
           injectThemeFonts(r.value)
         }
       }
-      setCustomThemeDataMap(dataMap)
+      // A catalog row proves the pack is still installed. If its detail failed,
+      // keep the user's selection instead of treating the absent detail as an
+      // uninstall and persisting the default; `installedThemeLoadFailed` is
+      // derived from the catalog and the map, so the notice follows from the
+      // state written below without a flag of its own. The rejection itself is
+      // not kept: a gateway message ("invalid installed theme") is developer
+      // vocabulary and a fetch `TypeError` is transport noise, so the notice
+      // names the recovery (reinstall, or pick another theme) instead.
+      // The last good detail (render-cache seed or an earlier load) is kept in
+      // the map until a load succeeds, so the themed paint it produced stays up
+      // while the notice explains the state.
+      const currentSlug = activeCustomSlug(colorThemeRef.current)
+      // The pack that was active when this load began is gone from the catalog:
+      // its early-injected CSS is stale whatever is selected now, so it goes.
+      // The render cache holds one key, for the CURRENT selection: if the user
+      // moved onto another installed pack while this load was in flight, the
+      // apply effect already wrote that pack's projection, and the map write
+      // below carries byte-identical data, so nothing would rewrite it. Clear
+      // only when the vanished pack is still the selection; self-repair below
+      // then resets it.
+      if (activeSlug && !catalogSlugs.has(activeSlug)) {
+        if (activeSlug === currentSlug) clearCachedThemeData()
+        removeCustomThemeCSS(activeSlug)
+      }
+      if (loadGenerationRef.current !== generation) return
+      setCustomThemeDataMap((prev) => {
+        const next = new Map(dataMap)
+        if (currentSlug && catalogSlugs.has(currentSlug) && !next.has(currentSlug)) {
+          const kept = prev.get(currentSlug)
+          if (kept) next.set(currentSlug, kept)
+        }
+        return next
+      })
       setCustomThemesLoaded(true)
       bumpThemeVersion()
     } catch (e) {
@@ -669,13 +823,14 @@ function useThemeState(): ThemeContextValue {
     return () => window.removeEventListener(CUSTOM_THEMES_CHANGED_EVENT, handler)
   }, [loadCustomThemes])
 
-  const { mutate: persistTheme } = useMutation({
+  const { mutate: persistTheme, mutateAsync: persistThemeAsync } = useMutation({
     mutationFn: (body: {
       mode?: string
       color?: string
       onboarded?: boolean
       import_onboarded?: boolean
       privacy_acked?: boolean
+      crewmates_onboarded?: boolean
     }) => api.updateThemeConfig(body),
   })
 
@@ -750,16 +905,53 @@ function useThemeState(): ThemeContextValue {
             localStorage.removeItem('mc-import-onboarded')
           }
         }
+        // Server value wins, set forward only: clearing it locally would re-open
+        // the Meet CrewMates flow mid-session on a stale read. A workspace the
+        // server already reports as onboarded is an existing one (same seed
+        // rule as the state initialiser, same `mc-crewmates-pending` exception
+        // for a first run this browser is mid-way through), so it counts as
+        // done locally too — without persisting, so the server flag keeps
+        // meaning "the flow ran".
+        if (
+          bootData.crewmates_onboarded === true ||
+          (bootData.onboarded === true && !localStorage.getItem('mc-crewmates-pending'))
+        ) {
+          setCrewmatesOnboarded(true)
+          if (bootData.crewmates_onboarded === true) safeSetItem('mc-crewmates-onboarded', '1')
+        }
       }
     }
     setThemeBootReady(true)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bootData, themeBootFetched])
 
+  // Derived, not stored: a flag set inside `loadCustomThemes` and reset on a
+  // selection change went stale the moment the picker moved to a LISTED pack
+  // whose detail had already failed — nothing recomputed it until the next
+  // catalog load, so the custom attribute was applied with no injected block.
+  // Computed from the same inputs on every render, it is right for the current
+  // selection whenever the catalog or the detail map changes. False until the
+  // catalog has loaded so an uncached cold load keeps its custom attribute.
+  const activeSlugForFailure = activeCustomSlug(colorTheme)
+  const installedThemeLoadFailed =
+    customThemesLoaded
+    && activeSlugForFailure !== null
+    && customThemes.some((t) => t.value === colorTheme)
+    && !customThemeDataMap.has(activeSlugForFailure)
+
   useEffect(() => {
-    applyTheme(colorTheme, resolved, mode)
+    // A kept custom selection whose pack is listed but whose detail failed has
+    // no injected `[data-theme="custom-<slug>-<mode>"]` block to match, so the
+    // attribute would fall through to the bare `:root` (dark) palette — in
+    // light mode, no readable surface. Paint the default built-in's attribute
+    // instead while leaving `colorTheme` (the selection) untouched, so the
+    // picker still shows the user's choice and the notice explains the state.
+    // A pack whose detail is merely pending (no error yet) keeps its custom
+    // attribute, as does the render-cache seed path.
+    const unstyledFailure = installedThemeLoadFailed
+    applyTheme(unstyledFailure ? DEFAULT_COLOR_THEME : colorTheme, resolved, mode)
     bumpThemeVersion()
-  }, [resolved, colorTheme, mode, bumpThemeVersion])
+  }, [resolved, colorTheme, mode, bumpThemeVersion, installedThemeLoadFailed])
 
   // Tell the Electron shell which mode PREFERENCE is active, so it can set
   // `nativeTheme.themeSource` to match ('system' under Auto). Pushed on change
@@ -860,10 +1052,32 @@ function useThemeState(): ThemeContextValue {
   // for built-ins / L0. (Fonts are injected at load, scoped by data-theme.)
   // When a switch flipped `themeSwitching` on, clear it once the async
   // overrides fetch settles — held for a ~150ms minimum so it doesn't flicker.
+  // The active pack's detail as last applied, serialized. A re-run that carries
+  // byte-identical data (render-cache seed -> early fetch -> full catalog on one
+  // cold load) must not tear down and refetch overrides.css: it has nothing to
+  // settle and would only blink the overrides off and on. Superseding is by
+  // generation counter rather than a per-run cleanup flag, because React runs
+  // the previous cleanup even when the new run is skipped — a flag there would
+  // orphan the in-flight settle and wedge the "Applying…" indicator.
+  const applyGenerationRef = useRef(0)
   useEffect(() => {
     const active = colorTheme.startsWith('custom-')
       ? customThemeDataMap.get(colorTheme.slice('custom-'.length))
       : undefined
+    const serialized = active ? JSON.stringify(renderCacheProjection(active)) : null
+    if (serialized !== null && serialized === appliedActiveRef.current) return
+    // Persist only when this effect will apply changed active data. A built-in
+    // selection leaves nothing to seed from, so its fixed cache key is removed.
+    // A custom selection with no data is NOT a reason to clear: the pack may be
+    // listed but its detail failed (installedThemeLoadFailed), or may still be
+    // pending, and the cache is exactly what keeps the next cold load themed.
+    // The only other clear path is `loadCustomThemes`, when the cached slug has
+    // left the catalog.
+    if (active) writeCachedThemeData(active)
+    else if (!colorTheme.startsWith('custom-')) clearCachedThemeData()
+    appliedActiveRef.current = serialized
+    const generation = ++applyGenerationRef.current
+    const superseded = () => applyGenerationRef.current !== generation
     try {
       const appliedBranding = applyThemeBranding(active)
       setBrandName(active?.assets?.branding?.botName ?? null)
@@ -876,27 +1090,23 @@ function useThemeState(): ThemeContextValue {
       setBrandLogo(null)
       setBrandFavicon(null)
     }
-    let cancelled = false
     applyThemeOverrides(active)
       .then((report) => {
         // Publish (or clear) the drop report for the ACTIVE theme only — a
-        // resolve from a superseded switch is filtered by the cancel flag, and
-        // applyThemeOverrides itself returns null for a superseded token.
-        if (!cancelled) setOverridesDropReport(report)
+        // resolve from a superseded switch is filtered by the generation check,
+        // and applyThemeOverrides itself returns null for a superseded token.
+        if (!superseded()) setOverridesDropReport(report)
       })
       .finally(() => {
-        if (cancelled) return
+        if (superseded()) return
         const remaining = Math.max(0, 150 - (Date.now() - switchStartRef.current))
         window.setTimeout(() => {
-          if (!cancelled) setThemeSwitching(false)
+          if (!superseded()) setThemeSwitching(false)
         }, remaining)
       })
-    return () => {
-      cancelled = true
-    }
   }, [colorTheme, customThemeDataMap])
 
-  // Self-repair: a persisted selection that is no longer valid falls back to
+  // Self-repair: a persisted selection that is no longer listed falls back to
   // the default built-in — a quick pre-apply validity check at boot (and after
   // any theme-list refresh). Two dangling cases:
   //   1. An unknown *built-in* value (e.g. a theme removed in a newer build,
@@ -935,11 +1145,11 @@ function useThemeState(): ThemeContextValue {
         setColorTheme(slug)
         return
       }
-      if (!customThemeDataMap.has(slug)) {
+      if (!customThemes.some(t => t.value === colorTheme)) {
         setColorTheme(DEFAULT_COLOR_THEME)
       }
     }
-  }, [customThemesLoaded, colorTheme, customThemeDataMap, customThemes, setColorTheme])
+  }, [customThemesLoaded, colorTheme, customThemes, setColorTheme])
 
   /** Add a new custom theme via API, inject CSS, and select it. */
   const addCustomTheme = useCallback(async (data: Omit<CustomThemeData, 'slug'> & { slug?: string }) => {
@@ -953,11 +1163,16 @@ function useThemeState(): ThemeContextValue {
     return theme
   }, [loadCustomThemes, setColorTheme])
 
-  /** Delete a custom theme via API. */
+  /**
+   * Delete a custom theme via API. The render cache holds one pack, the
+   * active one, so it is only stale when that pack is the one being deleted;
+   * deleting another pack leaves the next cold load's themed first paint alone.
+   */
   const deleteCustomTheme = useCallback(async (slug: string) => {
     await api.deleteTheme(slug)
     removeCustomThemeCSS(slug)
     if (colorTheme === `custom-${slug}`) {
+      clearCachedThemeData()
       setColorTheme(DEFAULT_COLOR_THEME)
     }
     await loadCustomThemes()
@@ -994,10 +1209,15 @@ function useThemeState(): ThemeContextValue {
   ]
 
   const markOnboarded = useCallback(() => {
+    // Only a FIRST completion marks the Meet CrewMates chapter pending (so it
+    // survives a reload, see the `crewmatesOnboarded` seed): an existing user
+    // replaying the tour from Settings was already onboarded, and must not be
+    // handed the first-run chapter on their next reload.
+    if (!onboarded && !localStorage.getItem('mc-crewmates-onboarded')) safeSetItem('mc-crewmates-pending', '1')
     safeSetItem('mc-onboarded', '1')
     setOnboarded(true)
     persistTheme({ onboarded: true })
-  }, [persistTheme])
+  }, [onboarded, persistTheme])
 
   const markImportOnboarded = useCallback(() => {
     safeSetItem('mc-import-onboarded', '1')
@@ -1013,6 +1233,21 @@ function useThemeState(): ThemeContextValue {
     persistTheme({ privacy_acked: true })
   }, [persistTheme])
 
+  // Persisted server-side as well as locally so a second machine does not replay
+  // the Meet CrewMates flow this user already finished or dismissed.
+  const markCrewmatesOnboarded = useCallback(async () => {
+    // Awaited, unlike the sibling marks, and the local completion state is
+    // applied ONLY after the server accepted the write: a refused PUT leaves
+    // the render cache, the pending mark and the in-memory flag exactly as
+    // they were, so a reload re-offers the chapter instead of seeding "done"
+    // from a completion the server never recorded. The Meet CrewMates flow
+    // renders the refusal as an ErrorNotice (see useMeetCrewmatesGate).
+    await persistThemeAsync({ crewmates_onboarded: true })
+    safeSetItem('mc-crewmates-onboarded', '1')
+    localStorage.removeItem('mc-crewmates-pending')
+    setCrewmatesOnboarded(true)
+  }, [persistThemeAsync])
+
   return {
     theme: resolved,
     preference: mode,
@@ -1022,6 +1257,7 @@ function useThemeState(): ThemeContextValue {
     setColorTheme,
     themeSwitching,
     overridesDropReport,
+    installedThemeLoadFailed,
     allThemes,
     brandName,
     brandLogo,
@@ -1032,10 +1268,12 @@ function useThemeState(): ThemeContextValue {
     onboarded,
     importOnboarded,
     privacyAcked,
+    crewmatesOnboarded,
     themeBootReady,
     markOnboarded,
     markImportOnboarded,
     markPrivacyAcked,
+    markCrewmatesOnboarded,
     addCustomTheme,
     deleteCustomTheme,
     loadCustomThemes,

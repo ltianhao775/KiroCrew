@@ -2,12 +2,15 @@ import { useEffect, useRef, useCallback } from 'react'
 import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { isArtifactEditing } from '../utils/artifactEditGuard'
 import { isReconcileNote } from '../lib/noteContract'
+import { approvalNotificationBody } from '../lib/approvalNotificationBody'
 import { useAppDispatch, useAppSelector } from '../store'
 import { store } from '../store'
 import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, sseMcpReportUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, remoteSlotRead, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications, fetchNotifications, markBootNotificationsFetched } from '../store/notificationsSlice'
-import { dispatchMcNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
+import { dispatchMcNotification, dispatchLiveNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
 import { shouldNotifyOnChatComplete } from './chatCompleteNotify'
+import { postNativeNotification } from '../lib/nativeNotify'
+import { isChatPath } from './notificationBanner'
 import { emitThemeSound } from './themeSound'
 import { streamingFlushHoldMs } from '../lib/streamHold'
 import { registerPendingChunkDrain } from '../lib/pendingChunkDrain'
@@ -18,7 +21,7 @@ import { reportVoiceFailure } from '../lib/voiceFailure'
 import {
   fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setAutomations, sseAutomation, removeAutomation, sseSideQueue, reconcileWorkflowRuns,
 } from '../store/chatSlice'
-import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
+import { selectSidebarSubagentCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys, queueEntryAttachments } from '../store/chatSlice'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
@@ -28,6 +31,8 @@ import { forgetUnobservedMemberThreads } from '../api/membersQuery'
 import { observedPaneSlots } from '../api/slotMessagesQuery'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../api/membersQuery'
 import { memberProjectionStore } from '../state/memberProjectionStore'
+import { threadLiveStore, type ThreadReplyFrame } from '../state/threadLiveStore'
+import { threadQueryKey, threadsQueryKey } from '../api/threads'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
@@ -61,12 +66,8 @@ type LogCallback = ((data: { level: string; msg: string }) => void) | null
  *  of the stale-badge defect. Deliberate gestures (switchSlot,
  *  mark-as-read) need no gate — they only occur on surfaces that show the
  *  slot, under real focus. */
-const isChatSurfaceVisible = (): boolean => {
-  if (typeof window === 'undefined') return false
-  const path = window.location.pathname
-  return path === '/' || path === '/chat' || path.startsWith('/chat/')
-    || path.startsWith('/popout/chat') || path.startsWith('/embed/chat')
-}
+const isChatSurfaceVisible = (): boolean =>
+  typeof window !== 'undefined' && isChatPath(window.location.pathname)
 /** True when *slot* is the thread this window is displaying: the chat
  *  surfaces' `chat.activeSlot`, or the thread a non-chat surface (the Crew
  *  Members page) registered in `viewedThread`. The unread-marker's gate: a
@@ -818,7 +819,7 @@ export function useWebSocket() {
         dispatch(addNotification({
           kind: 'approval',
           title: i18nT('hooks.useWebSocket.tool_approval', { name: a.tool || i18nT('hooks.useWebSocket.unknown') }),
-          body: `**Source:** ${a.source || 'agent'}\n\n${a.tool_input || ''}`.trim(),
+          body: approvalNotificationBody(a.source, a.tool_input),
           ts: String(a.ts || Date.now() / 1000),
           approval_id: a.id,
         } as Notification))
@@ -1253,6 +1254,15 @@ export function useWebSocket() {
         // comes back with its folders missing.
         queryClient.invalidateQueries({ queryKey: ['artifacts'] })
         queryClient.invalidateQueries({ queryKey: ['artifact-folders'] })
+        // Same one-shot problem for a reply thread on a crewmate chat message:
+        // the terminal `chat.thread_reply` frame of a reply that finished while
+        // the socket was down was never delivered, so the live store would show
+        // a partial reply forever and the stored row would never be refetched.
+        // Drop every live row (streamed text only; the stored replies are the
+        // truth) and refetch every observed thread and footer count.
+        threadLiveStore.reset()
+        queryClient.invalidateQueries({ queryKey: ['chat-thread'] })
+        queryClient.invalidateQueries({ queryKey: ['chat-threads'] })
         // A dropped socket is the one client-visible sign the gateway may have
         // restarted — and a restart drops an unmessaged member slot while its
         // binding survives. The Crew Members page mounts a cached thread key
@@ -1626,6 +1636,15 @@ export function useWebSocket() {
             if (!n.silenced && n.priority !== 'passive') {
               dispatchMcNotification(n.kind)
             }
+            // The in-app banner hears LIVE arrivals only. A reconnect catch-up
+            // replays every frame missed while the socket was down, and those
+            // notes are already in the bell (the reconnect refetch lands them);
+            // bannering them would re-announce history as news — the same
+            // suppression the turn-done chime applies via `reconnectingRef`.
+            // The boot snapshot never reaches here at all (it arrives through
+            // `fetchNotifications`, not this frame), so mount replay is
+            // excluded by construction.
+            if (!reconnectingRef.current) dispatchLiveNotification(n)
             break
           }
           case 'panel_published': {
@@ -1668,24 +1687,34 @@ export function useWebSocket() {
             if (!reconnectingRef.current) {
               dispatchMcNotification(APPROVAL_KIND)
             }
-            // Browser notification when tab not focused (permission must be granted via UI interaction elsewhere)
-            if (typeof Notification !== 'undefined' && document.hidden && Notification.permission === 'granted') {
-              // Android Chrome throws "Illegal constructor" for page-context
-              // Notification; an uncaught throw here kills the whole message
-              // handler, so the native toast is best-effort.
-              try {
-                new Notification(i18nT('hooks.useWebSocket.approval_required'), { body: data.tool || i18nT('hooks.useWebSocket.a_task_needs_your_decision'), silent: true, tag: 'kirocrew-approval' })
-              } catch {
-                /* unsupported platform */
-              }
-            }
-            dispatch(addNotification({
+            // No OS toast here. The addNotification below is what reaches the
+            // OS: useNativeNotification watches the unacked count and posts ONE
+            // toast per new note, tagged with its approval_id, only while the
+            // user is away from the window. A second constructor on this path
+            // carried a different tag, so the OS showed two banners for one
+            // approval.
+            //
+            // The owning slot rides on the note so the in-app banner's
+            // `targetsCurrentView` gate can tell "this chat is on screen" (the
+            // inline permission card below already shows it there) from "the
+            // user is on another surface" (the banner is the interrupt).
+            const approvalSlot = typeof data.slot === 'string' && data.slot ? data.slot : ''
+            const approvalNote = {
               kind: 'approval',
               title: i18nT('hooks.useWebSocket.tool_approval', { name: data.tool || i18nT('hooks.useWebSocket.unknown') }),
-              body: `**Source:** ${data.source || 'agent'}\n\n${data.tool_input || ''}\n\n${data.tool_purpose || ''}`.trim(),
+              body: approvalNotificationBody(data.source, data.tool_input, data.tool_purpose),
               ts: String(data.ts || Date.now() / 1000),
               approval_id: data.id,
-            } as Notification))
+              ...(approvalSlot ? { slot: approvalSlot } : {}),
+            } as Notification
+            dispatch(addNotification(approvalNote))
+            // The in-app banner hears LIVE arrivals only, same as the
+            // `notification` frame above: a reconnect catch-up replays
+            // approvals the bell already holds. While the window is focused
+            // this banner is the visible interrupt for a blocking approval
+            // (the OS toast stays quiet for a focused window); away from the
+            // window the toast takes over and `shouldBannerNote` skips it.
+            if (!reconnectingRef.current) dispatchLiveNotification(approvalNote)
             // Inject inline in the OWNING chat only. An approval with no
             // explicit slot has no owning conversation (an unowned cron /
             // taskrunner command): falling back to activeSlot planted the card
@@ -1694,7 +1723,7 @@ export function useWebSocket() {
             // 404'd as soon as the short background window elapsed. Unowned
             // approvals live on the global surface (notification feed) only —
             // the addNotification above already delivered it there.
-            const targetSlot = data.slot || ''
+            const targetSlot = approvalSlot
             if (targetSlot) {
               dispatch(sseChatMessage({
                 slot: targetSlot,
@@ -1839,7 +1868,7 @@ export function useWebSocket() {
               voiceProgressRef.current = null
             }
             if (!isPassiveNote && data.slot && (data.role === 'user' || data.role === 'inject' || data.role === 'subagent')) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
             }
             break
           case 'chat_message_update':
@@ -1892,9 +1921,12 @@ export function useWebSocket() {
             // which is keyed on `mid`, resolves this row -- without it that patch
             // matches nothing and the state never moves until a reload.
             const steerMid = (data as { mid?: unknown }).mid
+            const steerMeta = (data as { meta?: unknown }).meta
+            const steerFiles = steerMeta && typeof steerMeta === 'object' ? (steerMeta as { files?: unknown }).files : undefined
+            const steerDirs = steerMeta && typeof steerMeta === 'object' ? (steerMeta as { dirs?: unknown }).dirs : undefined
             dispatch(appendSlotMessage({
               slot: (data as { slot?: string }).slot || store.getState().chat.activeSlot || '',
-              message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true, ...(typeof steerSid === 'string' && steerSid ? { sendId: steerSid } : {}), ...(typeof steerState === 'string' && steerState ? { steerState } : {}), ...(typeof steerMid === 'string' && steerMid ? { mid: steerMid } : {}) }, ts: (data as { ts?: string }).ts },
+              message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true, ...(typeof steerSid === 'string' && steerSid ? { sendId: steerSid } : {}), ...(typeof steerState === 'string' && steerState ? { steerState } : {}), ...(typeof steerMid === 'string' && steerMid ? { mid: steerMid } : {}), ...(Array.isArray(steerFiles) ? { files: steerFiles } : {}), ...(Array.isArray(steerDirs) ? { dirs: steerDirs } : {}) }, ts: (data as { ts?: string }).ts },
             }))
             // Steering is the other way to type into a busy session, so it
             // settles the rank exactly like a queued send. The server appends a
@@ -1921,7 +1953,10 @@ export function useWebSocket() {
             syncPendingQuestions()
             break
           case 'queue_edit':
-            dispatch(editQueuedMessage(data))
+            // The frame's `meta` is the entry's post-edit attachment lists;
+            // `attachments` (present even when empty) tells the reducer this
+            // is the server's word on them, not an optimistic local edit.
+            dispatch(editQueuedMessage({ ...data, attachments: queueEntryAttachments((data as { meta?: unknown }).meta) }))
             break
           case 'queue_reorder':
             dispatch(reorderQueuedMessages(data))
@@ -1959,7 +1994,7 @@ export function useWebSocket() {
               // The gateway generation that numbered the seqs (see floorForGen).
               if (typeof data.gen === 'string') entry.gen = data.gen
               if (store.getState().chat.slotStatusDetail[cs]?.kind !== 'streaming') {
-                dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', text: 'Streaming', ts: Date.now() }))
+                dispatch(setSlotStatusDetail({ slot: cs, kind: 'streaming', ts: Date.now() }))
               }
               // A hidden window never runs the scheduled frame; past the
               // threshold, drain now so the buffer cannot hold a whole turn.
@@ -1986,10 +2021,10 @@ export function useWebSocket() {
               // tools run in parallel a refinement of one cannot inherit a
               // sibling's purpose.
               //
-              // `text` holds the PURPOSE ALONE and stays empty when the agent
+              // `purpose` holds the PURPOSE ALONE and stays empty when the agent
               // supplied none — the fallback to the tool title belongs to
               // toolStatusLabel, which owns the label rule. Storing the title
-              // in `text` instead would make the two indistinguishable here,
+              // in `purpose` instead would make the two indistinguishable here,
               // and a purpose-less call would then pin the initial stub title
               // ("Terminal") for the whole call instead of advancing to the
               // refined command.
@@ -2025,7 +2060,7 @@ export function useWebSocket() {
               dispatch(setSlotStatusDetail({
                 slot: data.slot,
                 kind: 'tool',
-                text: purpose || mergeInto?.text || '',
+                purpose: purpose || mergeInto?.purpose || '',
                 toolName: toolName || mergeInto?.toolName || '',
                 derivedTitle: derivedTitle || mergeInto?.derivedTitle || '',
                 ...(derivedAction
@@ -2257,6 +2292,20 @@ export function useWebSocket() {
           case 'chat.side_result':
             dispatch(sseSideResult(data as { slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; final?: boolean; is_error?: boolean; steer?: boolean }))
             break
+          case 'chat.thread_reply': {
+            // A reply landing in a thread on a crewmate chat message. Streamed
+            // deltas go to the live store the thread panel reads; a stored row
+            // (the user's reply, or the crewmate's terminal frame) refreshes the
+            // thread and the per-slot footer counts through React Query.
+            const frame = data as ThreadReplyFrame
+            if (typeof frame.slot !== 'string' || typeof frame.mid !== 'string') break
+            threadLiveStore.apply(frame)
+            if (frame.role === 'user' || frame.final) {
+              queryClient.invalidateQueries({ queryKey: threadQueryKey(frame.slot, frame.mid) })
+              queryClient.invalidateQueries({ queryKey: threadsQueryKey(frame.slot) })
+            }
+            break
+          }
           case 'chat.side_queue': {
             // `raw` marks content the LOCAL client typed; broadcast payloads are scrubbed by
             // definition. Stripped rather than merely left out of the cast, so a future
@@ -2308,7 +2357,7 @@ export function useWebSocket() {
             // made explicit.
             const detailKind = data.slot ? store.getState().chat.slotStatusDetail[data.slot]?.kind : undefined
             if (data.slot && detailKind !== 'streaming' && detailKind !== 'thinking') {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: 'Thinking…', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', ts: Date.now() }))
             }
             break
           }
@@ -2324,7 +2373,7 @@ export function useWebSocket() {
           }
           case 'chat_status':
             if (data.slot && data.status) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', text: data.status, ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'thinking', label: data.status, ts: Date.now() }))
             }
             break
           case 'chat_variant_switch':
@@ -2395,14 +2444,10 @@ export function useWebSocket() {
               const doneBody = completionNeedsInput
                 ? i18nT('hooks.useWebSocket.waiting_for_input')
                 : i18nT('hooks.useWebSocket.response_ready')
-              // Android Chrome throws "Illegal constructor" for page-context
-              // Notification; an uncaught throw here kills the whole message
-              // handler, so the native toast is best-effort (same as approval).
-              try {
-                new Notification(doneTitle, { body: doneBody, tag: `kirocrew-chat-done:${doneSlot}`, silent: questionPending })
-              } catch {
-                /* unsupported platform */
-              }
+              // Best-effort (same as approval): the helper swallows Android
+              // Chrome's "Illegal constructor" and relays to the parent frame
+              // when this dashboard is an embedded instance pane.
+              postNativeNotification(doneTitle, { body: doneBody, tag: `kirocrew-chat-done:${doneSlot}`, silent: questionPending })
             }
             if (data.slot && !isSlotOnScreen(data.slot) && !reconnectingRef.current) {
               dispatch(markSlotUnread({ slot: data.slot, ts: (data as { ts?: string }).ts || undefined }))
@@ -2419,7 +2464,7 @@ export function useWebSocket() {
               emitSlotRead(data.slot, doneTs)
             }
             if (data.slot) {
-              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle', text: 'Ready', ts: Date.now() }))
+              dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle', ts: Date.now() }))
             }
             if (data.slot) dispatch(refreshSlot(data.slot))
             if (data.slot) {

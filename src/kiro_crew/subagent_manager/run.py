@@ -73,6 +73,7 @@ if TYPE_CHECKING:
         fire_tool_hooks,
         hook_gate_kwargs,
         identity_grant_covers_child,
+        is_runtime_death,
         logger,
         name_grant,
         provider_fallback_active,
@@ -490,7 +491,56 @@ class RunEventCoordinator(ManagerComponent):
                     self._manager._write_tombstone(info, "cancelled")
             logger.info("Subagent %s cancelled", info.id)
         except Exception as exc:
-            if not info.reaped:
+            if info._reap_started and is_runtime_death(exc):
+                # The ECHO of our own teardown, not a fault of the run.
+                # ``_force_reap`` resets the run's session (or shuts its shared
+                # handle) BEFORE it cancels this task, so the in-flight stream
+                # observes the runtime it lives on being killed and raises
+                # ``AcpProcessDied`` -- "killed (provider shutdown)" -- first.
+                # Recording that text as the run's error made every user stop,
+                # every parent end and every deadline reap read as a runtime
+                # death in the tombstone and an ERROR in the gateway log; four
+                # field reports chased it to the provider and the OOM killer.
+                # Only the runtime death is the echo: any OTHER exception under
+                # a reap is a fault of the run that the teardown merely
+                # interrupted, and keeps the traceback below.
+                # The record instead names the stop: a user/parent stop stays
+                # neutral (``error`` unset, ``outcome == "stopped"``), a
+                # deadline reap is a failure that names the deadline, and the
+                # tombstone carries the reap's own cause. Setting ``done`` here
+                # is what wins the first-arrival record over the reaper's own
+                # synthesis (guard 1 in ``_force_reap``), so the whole record --
+                # error, stat, tombstone -- is written HERE, as it was before.
+                origin = info._stop_origin or "the reaper"
+                if not info.done:
+                    # Neutrality follows the FIRST stopper. A Stop that lands
+                    # while a deadline reap already owns the teardown sets
+                    # ``user_stopped`` too; the record still belongs to the
+                    # deadline, so the flag is put back and the failure kept.
+                    neutral = info.stop_is_neutral
+                    if not neutral:
+                        info.user_stopped = False
+                        if not info.error:
+                            info.error = (
+                                f"{origin} — the runtime was torn down before the run finished"
+                            )
+                    if not info.result and info.streaming_text:
+                        info.result = info.streaming_text
+                    info.done = True
+                    if not neutral:
+                        Stats().inc_subagent_failed()
+                    self._manager._write_tombstone(info, info._reap_reason or "reaped")
+                # One attributable line, at the level the action deserves: a
+                # user's own stop is routine; a parent end or a deadline reap
+                # discarded live work the user did not ask to lose.
+                log = logger.info if info._reap_reason == "user_stop" else logger.warning
+                log(
+                    "Subagent %s stopped mid-turn by %s (the stream reported: %s)",
+                    info.id,
+                    origin,
+                    _describe_exception(exc),
+                )
+            else:
                 # Story appended INSIDE the cap: info.error reaches a WS frame
                 # and the Subagents panel, so the rendered total stays bounded
                 # by _MAX_ERROR_DETAIL_LEN exactly as before — and the budget
@@ -502,7 +552,7 @@ class RunEventCoordinator(ManagerComponent):
                 info.done = True
                 Stats().inc_subagent_failed()
                 self._manager._write_tombstone(info, "error")
-            logger.exception("Subagent %s failed", info.id)
+                logger.exception("Subagent %s failed", info.id)
         finally:
             # Guard 3 of 3 — the terminal REPORT, owned by the finalize claim.
             # Taken (and the report task SPAWNED) before the teardown awaits
@@ -652,17 +702,49 @@ class RunEventCoordinator(ManagerComponent):
         """
         return await self._manager._queued_depth_async(parent_session_key)
 
+    def _has_live_parent_run_task(self, parent_session_key: str) -> bool:
+        """Whether a parent-owned run can still register its terminal report.
+
+        ``_run_inner`` publishes ``info.done`` before ``_run_impl`` resumes its
+        ``finally`` and registers the report task. During that scheduling gap the
+        ordinary ``running`` view is empty, but the outer task is still live.
+        Keep the parent pending until that task is removed; by then the report is
+        registered in ``_report_owners`` and the delivery barrier owns the wait.
+        """
+        for info in self._manager._agents.values():
+            if info.parent_session_key != parent_session_key:
+                continue
+            task = self._manager._tasks.get(info.id)
+            if task is not None and not task.done():
+                return True
+        return False
+
+    def _has_live_parent_followup_watcher(self, parent_session_key: str) -> bool:
+        """Whether a live follow-up watcher still owns work for this parent."""
+        parents = getattr(self._manager, "_followup_watcher_parents", {})
+        watchers = getattr(self._manager, "_followup_watchers", {})
+        return any(
+            not task.done() and parents.get(run_id) == parent_session_key
+            for run_id, task in watchers.items()
+        )
+
     def has_pending_work_for_impl(self, parent_session_key: str) -> bool:
-        """True while *parent_session_key* has sub-agents RUNNING or QUEUED.
+        """True while a parent has queued, running, or finalizing sub-agents.
 
         The reset-deferral guards must consult this, not ``running`` alone —
         see :meth:`queued_count_for` for why. A parent session reset while a
         spawn is still queued strands that agent's completion on a
-        cold-started, context-free replacement session.
+        cold-started, context-free replacement session. A completed inner run
+        remains pending until its live outer task registers the terminal report,
+        and a follow-up watcher remains pending until it dispatches or settles.
         """
         if self._manager._queued_depth(parent_session_key) > 0:
             return True
-        return any(a.parent_session_key == parent_session_key for a in self._manager.running)
+        return (
+            self._has_live_parent_run_task(parent_session_key)
+            or self._has_live_parent_followup_watcher(parent_session_key)
+            or any(a.parent_session_key == parent_session_key for a in self._manager.running)
+        )
 
     async def has_pending_work_for_async_impl(self, parent_session_key: str) -> bool:
         """:meth:`has_pending_work_for_impl` for an event-loop caller.
@@ -672,7 +754,11 @@ class RunEventCoordinator(ManagerComponent):
         """
         if await self._manager._queued_depth_async(parent_session_key) > 0:
             return True
-        return any(a.parent_session_key == parent_session_key for a in self._manager.running)
+        return (
+            self._has_live_parent_run_task(parent_session_key)
+            or self._has_live_parent_followup_watcher(parent_session_key)
+            or any(a.parent_session_key == parent_session_key for a in self._manager.running)
+        )
 
     def _emit_queue_depth_impl(self, parent_session_key: str, batch_id: str = "") -> None:
         """Emit the current queued depth for *parent_session_key* as a
@@ -1068,6 +1154,20 @@ class RunEventCoordinator(ManagerComponent):
             extra_kwargs["allowed_tools"] = info.allowed_tools
         if info.cwd:
             extra_kwargs["cwd"] = info.cwd
+        # A dedicated process joins its parent's session tree: the parent's
+        # ``$KIROCREW_SCRATCH`` is mounted beside the child's own scratch and is
+        # what the child's ``$KIROCREW_SCRATCH`` names, so a brief the parent
+        # staged there is readable (agent_scratch). Inert on the shared-runtime
+        # arm, where the child already runs in the parent's process; None when
+        # the parent has no live provider or spawned without scratch. Also the
+        # signal that skips the warm pool, whose mounts were fixed at pre-spawn.
+        if info.parent_session_key:
+            resolve_scratch = getattr(self._manager._sessions, "parent_work_scratch_dir", None)
+            shared_scratch = (
+                resolve_scratch(info.parent_session_key) if resolve_scratch is not None else None
+            )
+            if shared_scratch is not None:
+                extra_kwargs["shared_scratch"] = shared_scratch
 
         # ── Session sharing: reuse parent's shared AcpRuntime ──
         # When enabled and eligible, subagents get a session on the parent's
@@ -2198,6 +2298,26 @@ class RunEventCoordinator(ManagerComponent):
         # Cap disk file and trim memory — gateway decides how much to show based on mode.
         if info.result_path:
             cap_result_file(Path(info.result_path))
+        # The stream reached a successful EVENT_COMPLETE, so result.txt now holds
+        # the whole answer. Nothing else on disk says so: write_result_chunk
+        # appends per streamed chunk, so the file is non-empty from the first
+        # token and a reader after a restart cannot tell a finished answer from an
+        # opening sentence. A non-success completion leaves the flag unset, and
+        # so does a stream that never delivered a complete event at all — the
+        # generator can simply stop between chunks when the transport dies, and
+        # the absent stop reason alone classifies as a normal end of turn, which
+        # would mark the fragment complete. The explicit ``_complete_event``
+        # check is what tells those two apart. Recorded here because this is the
+        # only point that knows. Written after cap_result_file so the flag
+        # describes the file as it will be read. A restart landing between the
+        # complete event and this write leaves a finished result unflagged — it
+        # under-claims, which is the safe direction for a signal whose whole
+        # purpose is not to overstate.
+        await self._manager._write_state_off_loop(
+            info,
+            "result complete",
+            result_complete=_complete_event is not None and _stop.is_success,
+        )
         # Flag whether the completion-event copy will drop content, so the gateway
         # emits a summary + result_path pointer (read on demand) instead of a lossy
         # blob. The full transcript stays in result.txt for the TTL grace window.

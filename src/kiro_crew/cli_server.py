@@ -1004,8 +1004,12 @@ def _spawn_detached_gateway(port: int | None = None) -> subprocess.Popen[bytes]:
     else:
         # Source-tree/editable-install fallback: run the module directly.
         # This also covers the case where the wrapper script is not on PATH
-        # (e.g. running from an unactivated checkout).
-        argv = platform_compat.isolated_python_argv("-m", "kiro_crew", "gateway")
+        # (e.g. running from an unactivated checkout). ``-P`` because this
+        # child is spawned with ``cwd=Path.home()`` below and ``-m`` would put
+        # that directory first on sys.path, ahead of the standard library --
+        # the launch shape under which a stray ``~/concurrent/`` replaced the
+        # stdlib package in the field.
+        argv = platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", "gateway")
     if port is not None:
         argv += ["--port", str(int(port))]
 
@@ -1922,7 +1926,7 @@ def _refresh_agent_config(proj: str) -> None:
     print("  🔒 Refreshing agent config…")
     try:
         r = subprocess.run(
-            platform_compat.isolated_python_argv("-m", "kiro_crew", "setup", "--agent-only"),
+            platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", "setup", "--agent-only"),
             cwd=proj,
             stdin=subprocess.DEVNULL,
             capture_output=True,

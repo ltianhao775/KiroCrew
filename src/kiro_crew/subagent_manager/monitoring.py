@@ -7,6 +7,12 @@ import logging as _logging
 import time as _time
 from typing import TYPE_CHECKING, Any
 
+from ..session_map import session_files_resumable
+from ..subagent_persistence import (
+    _agent_dir,
+    _check_result_available,
+    subagent_id_from_conversation_key,
+)
 from ._component import ManagerComponent
 
 _glue_logger = _logging.getLogger(__name__)
@@ -18,6 +24,7 @@ if TYPE_CHECKING:
     from ..subagent import (
         _CLK_TCK,
         _REAPER_INTERVAL,
+        _SAMPLE_MAX_AGE_SECS,
         _SUPPRESS_CEILING,
         OUTCOME_FAILED,
         OUTCOME_INTERRUPTED,
@@ -28,27 +35,104 @@ if TYPE_CHECKING:
         VERDICT_WORKING,
         LivenessOracle,
         SubagentInfo,
-        _agent_dir,
         _attributed_count,
+        _cost_bucket,
         _proc_subtree_sample,
         _redact,
         _redact_and_truncate,
         agent_dir_for_display,
         append_cost_sample,
         asyncio,
+        cap_buckets,
         compact_cost_log,
         consult_offloaded,
+        cost_log_identity,
         has_dashboard_surface,
         list_orphans,
         logger,
         maintenance_executor,
         prune_stale_tombstones,
+        read_learned_costs_checked,
         sel,
         single_completion_meta,
         subprocess_executor,
         time,
         write_tombstone,
     )
+
+
+def orphan_resume_hint(agent_id: str, state: dict) -> str:
+    """The resume line for a lost orphan's notice, or ``""`` when nothing survives.
+
+    A run the restart caught before its first token leaves no ``result.txt``,
+    but its CONVERSATION -- every turn and tool call kiro-cli persisted -- is a
+    file the reconciliation deliberately keeps (retain-by-default), and
+    ``spawn_continue`` re-seeds the session map from the run's ``state.json`` to
+    resume it after a restart. "No result was captured" therefore under-tells:
+    the parent re-spawns from scratch and pays for the same tool calls twice.
+
+    The hint is offered only when the conversation is actually resumable by the
+    one rule ``SessionMap.get`` applies before it hands a sid out
+    (``session_map.session_files_resumable``: for kiro-cli the ``{sid}.json``
+    present and the ``{sid}.jsonl`` holding a turn; for any other backend the
+    resume itself decides, so the handle is offered and ``spawn_continue``
+    refuses typed if the session is gone). A pruned, released or never-started
+    kiro-cli conversation is therefore never advertised. Progress rides along so
+    the parent can weigh resuming against re-spawning. Never raises: a notice
+    that cannot be decorated is still a notice.
+    """
+    try:
+        sid = str(state.get("session_id") or "")
+        if not sid or not session_files_resumable(sid, str(state.get("provider") or "")):
+            return ""
+        turns = int(state.get("turns") or 0)
+        # ``last_tool`` is backend/agent-authored: for a shell tool it is the raw
+        # command, which can be multi-line and unbounded. Flatten it so the notice
+        # stays one line (a blank line inside it would split the completion card's
+        # head/body in the middle of a command), and let ``redact_and_truncate``
+        # cap it -- redaction must run over the WHOLE value first, or a credential
+        # straddling the cut would survive the later whole-message redaction. The
+        # import is local: this is a module-level helper, not an ``_impl`` method
+        # ``bind_component_globals`` rebinds onto ``subagent``'s namespace.
+        from ..security import redact_and_truncate
+
+        last_tool = redact_and_truncate(" ".join(str(state.get("last_tool") or "").split()), 80)
+        progress = f"It had completed {turns} turn(s)"
+        if last_tool:
+            progress += f"; its last tool call was `{last_tool}`"
+        # The handle names the CONVERSATION's owner, not this run: a run minted
+        # by ``spawn_continue`` records ``conversation_key="subagent:<original>"``
+        # and shares that run's sid, and continuing under its own id would seed a
+        # second session-map key onto the same sid.
+        owner = (
+            subagent_id_from_conversation_key(str(state.get("conversation_key") or "")) or agent_id
+        )
+        return (
+            f"{progress}. Its conversation survived the restart: "
+            f'`spawn_continue(conversation="{owner}", task=...)` resumes it with '
+            f"everything it had already read and done, instead of re-spawning from scratch."
+        )
+    except Exception:
+        _glue_logger.debug("orphan resume hint failed for %s", agent_id, exc_info=True)
+        return ""
+
+
+def tombstone_recovery_action(agent_id: str, state: dict) -> str:
+    """The terminal ``recovery_action`` for a tombstone: read it, or still notify.
+
+    ONE rule for every writer, so the two call sites cannot disagree.
+
+    A non-empty ``result.txt`` only means the provider emitted a token:
+    ``write_result_chunk`` appends per streamed chunk. The run records
+    ``result_complete`` when its stream reaches the complete event, so
+    without that flag these bytes are an opening sentence, not an answer.
+    """
+    has_result = _check_result_available(_agent_dir(agent_id) / "result.txt")
+    if not has_result:
+        return "notification_pending"
+    if not state.get("result_complete"):
+        return "partial_result"
+    return "result_available"
 
 
 class OrphanStallMonitor(ManagerComponent):
@@ -329,6 +413,10 @@ class OrphanStallMonitor(ManagerComponent):
         - PID alive → SIGKILL, tombstone (gateway_restart)
         - PID dead + result → tombstone (gateway_restart, delivered)
         - PID dead + no result → tombstone (gateway_restart, notification_pending)
+
+        A surviving ``result.txt`` is classified further: only a run that
+        recorded ``result_complete`` has a whole answer on disk, and anything
+        else is a fragment the restart cut off mid-turn.
         """
         try:
 
@@ -349,15 +437,8 @@ class OrphanStallMonitor(ManagerComponent):
                     continue  # tracked in current run, skip
                 try:
                     pid = state.get("pid")
-                    has_result = False
-                    try:
-
-                        rp = _agent_dir(agent_id) / "result.txt"
-                        has_result = rp.exists() and rp.stat().st_size > 0
-                    except OSError:
-                        pass
-
-                    recovery = "undeliverable"
+                    recovery = tombstone_recovery_action(agent_id, state)
+                    has_result = recovery != "notification_pending"
                     if pid and self._manager._is_pid_alive(pid):
                         # Use pid_recorded_at (when PID was actually written) instead of
                         # started (folder creation time) to avoid false negatives under load
@@ -374,11 +455,6 @@ class OrphanStallMonitor(ManagerComponent):
                                 )
                             except Exception:
                                 logger.debug("SEL audit failed for orphan %s", agent_id)
-                        recovery = "result_available" if has_result else "notification_pending"
-                    elif has_result:
-                        recovery = "result_available"
-                    else:
-                        recovery = "notification_pending"
 
                     try:
                         write_tombstone(
@@ -454,7 +530,27 @@ class OrphanStallMonitor(ManagerComponent):
         parent_session = state.get("parent_session", "")
         result_path = str(agent_dir_for_display(agent_id) / "result.txt")
 
-        if has_result:
+        if has_result and recovery == "partial_result":
+            msg = (
+                f"{SUBAGENT_COMPLETION_PREFIX}\n"
+                f"Agent `{agent_id}` ⚠️ cut off mid-turn by gateway restart\n"
+                f"Task: {task_preview}\n"
+                f"Partial output saved at: `{result_path}`\n"
+                f"It stops wherever the restart landed — read it as an unfinished "
+                f"fragment, not as the agent's answer."
+            )
+            # Same interrupted outcome as a whole result, but the note has to
+            # carry the difference: the wording above is all that stops a parent
+            # from acting on an opening sentence as though it were a finding.
+            row_meta = single_completion_meta(
+                agent_id=agent_id,
+                outcome=OUTCOME_INTERRUPTED,
+                task=task_preview,
+                note="cut off mid-turn by gateway restart",
+                requested_model=str(state.get("requested_model") or ""),
+                resolved_model=str(state.get("resolved_model") or ""),
+            )
+        elif has_result:
             msg = (
                 f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{agent_id}` ⚠️ orphaned by gateway restart\n"
@@ -479,6 +575,15 @@ class OrphanStallMonitor(ManagerComponent):
                 f"Task: {task_preview}\n"
                 f"No result was captured before the restart."
             )
+            # No result is not no work: when the run's conversation is still on
+            # disk the parent is told how far it got and how to resume it. The
+            # probe stats session files under KIRO_HOME, which can be network-
+            # backed, so it runs off the loop like this module's other file reads.
+            resume = await asyncio.get_running_loop().run_in_executor(
+                maintenance_executor(), orphan_resume_hint, agent_id, state
+            )
+            if resume:
+                msg += f"\n{resume}"
             row_meta = single_completion_meta(
                 agent_id=agent_id,
                 outcome=OUTCOME_FAILED,
@@ -624,10 +729,17 @@ class OrphanStallMonitor(ManagerComponent):
             shared_n = (
                 self._manager._live_shared_count(info._pid, agents) if info._session_sharing else 1
             )
+            generation = info._rss_generation
             sample = _proc_subtree_sample(info._pid)
+            if info._rss_generation != generation:
+                # The run was respawned while this off-loop read was in flight:
+                # the reading describes the dead process and must not settle
+                # the one that replaced it.
+                continue
             if sample.rss_kb > 0 and shared_n > 0:
                 gb = (sample.rss_kb / (1024 * 1024)) / shared_n
                 info.last_rss_gb = gb
+                info._rss_samples += 1
                 if gb > info.peak_rss_gb:
                     info.peak_rss_gb = gb
             info.last_procs = _attributed_count(sample.procs, shared_n, info.last_procs)
@@ -642,13 +754,98 @@ class OrphanStallMonitor(ManagerComponent):
                         info.peak_cpu_cores = cores
             info._cpu_jiffies_prev = jiffies
             info._cpu_sample_ts = now
+        # Same off-loop sweep, same store the samples above feed: publish the
+        # learned p90 the spawn guard prices an unmeasured start at. A plain
+        # attribute write of one float, read by the gate on the loop; the file
+        # itself is never opened there.
+        self._refresh_learned_cost_impl()
+
+    def _refresh_learned_cost_impl(self) -> None:
+        """Re-read the learned per-run memory p90 onto the manager. BLOCKING, off-loop.
+
+        The cost log is agent-writable and tiny (FIFO-trimmed to 50 records per
+        agent), but it is still a whole-file parse, so it runs on the maintenance
+        executor -- here and once at reaper start -- and the gate reads
+        ``_learned_costs_gb`` as arithmetic.
+
+        Three outcomes. An ABSENT log (first boot, or the operator's documented
+        reset: delete ``subagents/cost_samples.jsonl``) clears the map. A
+        COMPLETE read of a present, inspectable log REPLACES it -- the whole log
+        was parsed, so a bucket it does not yield has expired past the age
+        horizon or fallen below ``min_samples`` and its price retires on this
+        running process; a log that was replaced (new inode, or shrunk) is read
+        the same way. An INCOMPLETE read -- a refused record ended the parse
+        early, the present log could not be opened, or its identity could not be
+        inspected -- is MERGED, so a bucket the read could not reach keeps its
+        figure rather than being lowered silently. Only dedicated runs' samples
+        are read: a shared run's figure is a per-session share of one runtime,
+        not what a start that may run as its own process will cost.
+        """
+        try:
+            # Identity on both sides of the read: a log replaced DURING the read
+            # would otherwise pair pre-reset figures with the new file's identity
+            # and carry them into every later merge. A mismatch keeps the prior
+            # state; the next sweep reads a settled file.
+            before = cost_log_identity()
+            # Dedicated runs only: a start priced here may run as its own
+            # process, and a shared run's sample is a per-session share.
+            costs, complete = read_learned_costs_checked(
+                "mem_gb", dedicated_only=True, max_age_secs=_SAMPLE_MAX_AGE_SECS
+            )
+            identity = cost_log_identity()
+        except Exception:
+            logger.debug(
+                "learned subagent cost unreadable; keeping the previous value", exc_info=True
+            )
+            return
+        if identity != before:
+            logger.debug("cost log changed during the read; keeping the previous value")
+            return
+        manager = self._manager
+        if identity is None:
+            # Absent log: first boot, or the operator's reset. Nothing learned.
+            manager._learned_costs_gb = {}
+            manager._learned_costs_source = None
+            return
+        if len(identity) != 3:
+            # Present but not inspectable: nothing this read says is proven, so
+            # it is additive at most.
+            complete = False
+        previous = manager._learned_costs_source
+        replaced = (
+            previous is not None
+            and len(previous) == 3
+            and len(identity) == 3
+            and (identity[:2] != previous[:2] or identity[2] < previous[2])  # type: ignore[operator]
+        )
+        if replaced or previous is None or complete:
+            # Authoritative read: the whole log was parsed, so a bucket it does
+            # not yield has genuinely expired past the age horizon or fallen
+            # below min_samples, and its held price retires with it. Also the
+            # path for a log that was deleted and re-created within one sweep
+            # (the operator's reset), a compaction rewrite, and the first
+            # publication.
+            manager._learned_costs_gb = dict(costs)
+        else:
+            # Incomplete read -- an over-cap record ended the parse before the
+            # buckets after it: MERGE, so a bucket the read could not reach
+            # keeps its held figure while one it did reach takes the new value,
+            # up or down. Merge is reserved for exactly this degraded case.
+            manager._learned_costs_gb = cap_buckets({**manager._learned_costs_gb, **costs})
+        if len(identity) == 3:
+            manager._learned_costs_source = identity
 
     def _record_cost_impl(self, info: SubagentInfo) -> None:
         """Persist this run's high-water RSS/CPU to the learned-cost store."""
         if info.peak_rss_gb <= 0 and info.peak_cpu_cores <= 0:
             return  # never sampled (e.g. finished before the first reaper sweep)
         try:
-            append_cost_sample(info.agent, info.peak_rss_gb, info.peak_cpu_cores)
+            append_cost_sample(
+                _cost_bucket(info.agent, info.execution_context),
+                info.peak_rss_gb,
+                info.peak_cpu_cores,
+                shared=bool(info._session_sharing),
+            )
         except Exception:
             logger.debug("Failed to record subagent cost for %s", info.id, exc_info=True)
 
@@ -663,6 +860,15 @@ class OrphanStallMonitor(ManagerComponent):
             compact_cost_log()  # startup FIFO trim (§4.2)
         except Exception:
             logger.debug("Reaper: startup cost-log compaction failed", exc_info=True)
+        # Publish the learned cost BEFORE the first sleep: a fan-out in the
+        # first minute after boot must already be priced at it, not at the
+        # first-boot fallback. Off-loop for the same reason the sweep is.
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                maintenance_executor(), self._manager._refresh_learned_cost
+            )
+        except Exception:
+            logger.debug("Reaper: startup learned-cost refresh failed", exc_info=True)
         while True:
             await asyncio.sleep(_REAPER_INTERVAL)
             now = time.time()
@@ -1038,7 +1244,10 @@ class OrphanStallMonitor(ManagerComponent):
                 "started_at": a.started,
                 "shared": a._session_sharing,
                 "pid": a._pid,
-                "sampled": a.last_rss_gb > 0.0 or a.peak_rss_gb > 0.0,
+                # "Has this PROCESS been measured": a counted sweep or a live
+                # reading -- not the peak, which a respawned run keeps from the
+                # dead process while its own readings start over.
+                "sampled": a._rss_samples > 0 or a.last_rss_gb > 0.0,
             }
             for a in self._manager._agents.values()
             if not a.done and not a.queued

@@ -10,6 +10,7 @@ reach a wake brief.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1119,3 +1120,49 @@ def test_a_coalesced_probe_wake_pays_for_the_tail_once(monkeypatch, module):
     assert "A" in body and "B" in body
     assert body.count(gh_pr._WAKE_TAIL) == 1
     assert body.count("Context: two reds") == 1
+
+
+def test_pr_watch_wake_sources_match_the_observations_the_probe_builds():
+    """The two source maps must together be the set the probe really emits.
+
+    The gated loop's user-facing texts render their wake set from
+    ``WAKE_SOURCES`` and their watch-ending set from ``TERMINAL_SOURCES``, so
+    those maps ARE the promise those texts make. Nothing else in the suite can
+    catch a map going stale: the ack tests take their expectations from the
+    same maps, so they agree with a wrong one. This reads the probe's own
+    ``Observation`` keys instead, which makes adding or gating a source red
+    here until one of the maps names it.
+    """
+    source = (ROOT / "src" / "kiro_crew" / "probes" / "gh_pr.py").read_text(encoding="utf-8")
+    built = {raw.split(":")[0] for raw in re.findall(r'Observation\(\s*f?"([^"]+)"', source)}
+    assert built, "the key scan found no Observation call at all"
+    named = {key for key, _name in gh_pr.WAKE_SOURCES} | {
+        key for key, _name in gh_pr.TERMINAL_SOURCES
+    }
+    assert built == named
+
+
+def test_a_terminal_source_is_never_offered_as_a_wake():
+    """A TERMINAL key among the wake sources promises a delivery that cannot
+    arrive: the watch is removed in the same tick."""
+    wake_keys = {key for key, _name in gh_pr.WAKE_SOURCES}
+    terminal_keys = {key for key, _name in gh_pr.TERMINAL_SOURCES}
+    assert not wake_keys & terminal_keys
+
+
+def test_no_source_name_carries_a_comma():
+    """A member with an internal comma renders as two list items.
+
+    ``_joined`` comma-separates, so "every check settled green, unless that
+    one is turned off" reads as a sixth source whose "that one" resolves to
+    nothing -- in the very texts this exists to make readable.
+    """
+    for _key, name in gh_pr.WAKE_SOURCES + gh_pr.TERMINAL_SOURCES:
+        assert "," not in name, f"{name!r} would render as two list items"
+
+
+def test_the_wake_set_phrase_names_every_source_once():
+    """The rendered clause must carry every member, so no text can drop one."""
+    phrase = gh_pr.wake_set_phrase()
+    for _key, name in gh_pr.WAKE_SOURCES:
+        assert phrase.count(name) == 1, f"{name!r} must appear exactly once"

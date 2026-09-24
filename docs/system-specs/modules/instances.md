@@ -6,19 +6,19 @@ SSM Session Manager** tunnels, embedding each remote dashboard as an iframe pane
 below a switcher strip. Opt-in: off by default (`instances.enabled`). The transport is
 per-instance (`connection_method`) — see §13.
 
-> **Naming — "Remote Instances".** The user-facing surfaces label this feature
-> **Remote Instances**: the Settings section (*Settings → Remote Instances*), the
-> top-header switcher group ("Remote Instances" / "Switch instance"), and the
+> **Naming — "Remote Crew".** The user-facing surfaces label this feature
+> **Remote Crew**: the Settings section (*Settings → Remote Crew*), the
+> top-header switcher group ("Remote Crews" / "Switch crew"), and the
 > keyboard shortcuts. This is deliberately distinct from the product name
 > **Kiro Crew** and from an agent **crew** (an assistant with its own
-> workspace/memory — `kiroCrewAgentsPage`, the Crew Members page). Earlier UI copy called
-> this feature "Remote Crew"; that wording was retired in favour of "instance" to
-> match the code and config it already sits on (`/api/instances`,
-> `instances.json`, `InstancesPanel`, EC2 `instance_id` / `ssm_target`). Only the
-> **displayed strings** changed — i18n key names and internal identifiers
-> (including the `remoteCrewPanel` component/key namespace) are unchanged, so
-> "crew" as a shorthand for an instance still appears in code and in this spec's
-> prose below.
+> workspace/memory — `kiroCrewAgentsPage`, the Crew Members page). The **code and
+> config** underneath use "instance" throughout (`/api/instances`,
+> `instances.json`, `InstancesPanel`, EC2 `instance_id` / `ssm_target`), so a
+> displayed "crew" and a stored "instance" are the same thing seen from two
+> sides. i18n key names and internal identifiers (including the
+> `remoteCrewPanel` component/key namespace) track the code, not the label, and
+> this spec's prose below uses "instance" wherever it is describing the
+> registry, the tunnel or the EC2 box rather than the surface.
 
 > **Section numbers in this document are an API.** `src/kiro_crew/cloud/connect.py`
 > cites "instances.md §9" from two docstrings (the module docstring and
@@ -28,7 +28,7 @@ per-instance (`connection_method`) — see §13.
 Code: `src/kiro_crew/instances/` (registry, tunnel manager, port allocator, token
 mint, diagnostics, injection validation, run-marker) plus
 `src/kiro_crew/dashboard/handlers_instances.py` (control plane) and the frontend
-`InstanceTabBar` / `InstancesViewport` / `Settings → Remote Instances` surfaces.
+`InstanceTabBar` / `InstancesViewport` / `Settings → Remote Crew` surfaces.
 
 ---
 
@@ -90,7 +90,7 @@ kirocrew config set instances.enabled true
 kirocrew restart
 ```
 
-Settings → Remote Instances offers the same toggle (it PATCHes
+Settings → Remote Crew offers the same toggle (it PATCHes
 `instances.enabled` through `/api/config/kirocrew`) and then shows a
 "restart required" hint, because the flag is only consulted in the gateway's
 `on_startup` hook.
@@ -121,7 +121,7 @@ after startup and a restart is still pending.
  |  Dashboard SPA                                                        |
  |   |- InstanceTabBar    switcher dropdown: Local + crews with intent   |
  |   |- InstancesViewport  warm <iframe>s: http://<host>:<port>/?token=  |
- |   +- Settings > Remote Instances  add/edit/connect/diagnose/remove    |
+ |   +- Settings > Remote Crew  add / edit / connect / diagnose / remove |
  |            | owner-only JSON API (SEL-audited)                        |
  |  dashboard/handlers_instances.py                                      |
  |            |                                                          |
@@ -146,13 +146,13 @@ Module responsibilities:
 
 | Module | Responsibility |
 |--------|----------------|
-| `registry.py` | Persistent list of configured instances (`~/.kiro/crew/instances.json`) + `last_active_id`. Light charset check on `ssh_host`/`remote_bin` (SSH) or `ssm_target`/`aws_profile`/`aws_region`/`ssm_run_as` (SSM) at add/update, per `connection_method`; the `fargate` arm requires an ECS task target and the `ssm` arm refuses one (§16); every mutation re-reads the file and writes atomically, so a live gateway and a CLI edit cannot clobber each other. |
+| `registry.py` | Persistent list of configured instances (`~/.kiro/crew/instances.json`) + `last_active_id`. Light charset check on `ssh_host`/`remote_bin` (SSH) or `ssm_target`/`aws_profile`/`aws_region`/`ssm_run_as` (SSM) at add/update, per `connection_method`; the `fargate` arm requires an ECS task target and the `ssm` arm refuses one (§16); every mutation re-reads the file and writes atomically while holding a lock keyed by the registry's path and shared by every registry object over it, so two objects in one gateway cannot clobber each other; a separate CLI process is outside that lock and always reads a whole file, but a mutation it interleaves can still be lost. |
 | `port_allocator.py` | Probes for a free loopback port at or above `tunnel_base_port` (7778). A port counts as free only when it is free on **every** loopback address (`127.0.0.1` and `::1`), since the forward binds one family and a foreign listener on the other leaves `localhost:<port>` ambiguous; an address the host cannot assign at all (`EADDRNOTAVAIL`/`EAFNOSUPPORT`/`EPROTONOSUPPORT`, e.g. IPv6 disabled) reads as free rather than occupied, while a probe that could not be *run* (`EMFILE` and friends) propagates rather than being coerced to either answer. A single-address primitive (`_is_addr_free(port, host)`) answers the narrower "did *this* forward's own address come free" question that orphan reclaim asks. The probe sets `SO_REUSEADDR` so a `TIME_WAIT` remnant from a just-closed forward is not a false "in use". |
 | `token_mint.py` | Runs `kirocrew token --ttl --port --embed-parent-port` on the remote over SSH (run-marker first, then a bin-candidate ladder) and parses the JWT out of the printed URL. Token is returned in memory only, **never logged**. |
 | `ssm_token_mint.py` | The SSM sibling of `token_mint.py`: runs the same subcommand via `aws ssm send-command` through the launcher's `cloud.ssm` chokepoint, reusing the shared remote-command builders. Token in memory only, **never logged**. See §13. |
 | `validation.py` | The authoritative injection-safe guard on `ssh_host` / `remote_bin`, and on `ssm_target` / `aws_profile` / `aws_region` / `ssm_run_as`, applied immediately before any command line is built. See §11. |
 | `run_marker.py` | Records the running gateway's own `kirocrew` launcher (and pid) keyed by port, so a remote mint execs the same venv the live gateway runs from. Also backs zero-config client port discovery. See §12. |
-| `ssh_tunnel_manager.py` | Supervises one tunnel child per instance — `ssh -N -L` or `aws ssm start-session` — with readiness wait, health probe, 2-tier self-heal, proactive token refresh, stored-token liveness probe, remote restart. One state machine, two forwarder shapes; the `fargate` method shares the SSM forwarder and mints nothing (§16). |
+| `ssh_tunnel_manager.py` | Supervises one tunnel child per instance — `ssh -N -L` or `aws ssm start-session` — with readiness wait, health probe, 2-tier self-heal, proactive token refresh, stored-token liveness probe, remote restart. One state machine, two forwarder shapes; the `fargate` method shares the SSM forwarder and mints nothing (§16). An SSM child's stdout is captured and drained alongside stderr, because the close notice that names why a forward ended is printed there. |
 | `diagnostics.py` | Dependency-ordered failure probes; reports the first broken link. `diagnose_instance` (SSH ladder), `diagnose_instance_ssm` (SSM ladder) and `diagnose_instance_fargate` (ECS task ladder, §16). |
 | `handlers_instances.py` | Owner-only, enabled-gated, SEL-audited HTTP control plane. |
 
@@ -187,6 +187,16 @@ origin and mints its own port-scoped cookie.
 **Platform note.** The hub side of this feature assumes a POSIX host with an
 OpenSSH `ssh` client on `PATH`, and run-marker port discovery refuses outright on
 non-POSIX (§12). Treat a Windows hub as unverified.
+
+**Frameless-window drag.** Under the desktop app's frameless macOS shell the
+window is dragged solely by `-webkit-app-region: drag` `.host-drag-strip`
+regions, and the per-pane strips are gated off once a remote-instance overlay is
+up — so `InstancesViewport`'s connecting/loading overlay and its
+connection-error/disconnected overlay each render a `.host-drag-strip` across the
+top (clipped clear of the Windows/Linux caption controls) to keep the window
+draggable while a pane is connecting or has failed. The injected no-drag rule
+leaves the `InstanceTabBar` switcher, Retry and ErrorNotice clickable under the
+strip.
 
 ---
 
@@ -584,6 +594,18 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
   benign stderr written earlier (e.g. arbitrary `LocalCommand` output) cannot
   consume the budget and truncate the classified reason out of the surfaced
   detail.
+- **Untrusted SSM close notice.** The session-manager plugin prints every close
+  notice to its *stdout*, so an SSM forward pipes that stream too and drains it
+  in the background for the tunnel's life. The buffer is bounded the same way
+  stderr is, and is ANSI-stripped, control-stripped and credential-redacted at
+  read, before any matching. Matching is line-anchored on the fixed literals the
+  plugin prints, so the session banner and per-connection lines cannot be
+  mistaken for a close notice. The service-supplied reason text inside a notice
+  is a **classification signal only**: it never leaves the classifier, so it
+  reaches neither the operator nor the log, and every surfaced message is
+  composed from this repo's own wording. A notice whose reason is unrecognised,
+  or absent, is reported as a plain AWS-ended close rather than given a cause
+  the stream does not establish.
 - **Trust root.** `<data-home>/run/` (the run-marker dir) is on the
   `is_sensitive_path` floor, so agent file tools can neither read nor write it.
   See §12 and [security.md](security.md).
@@ -609,8 +631,8 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
 ## 8. Using it (step by step)
 
 1. **Enable** on the hub: `kirocrew config set instances.enabled true && kirocrew restart`
-   (or the Settings → Remote Instances toggle, then a restart).
-2. Open the dashboard and go to **Settings → Remote Instances**. This panel is the
+   (or the Settings → Remote Crew toggle, then a restart).
+2. Open the dashboard and go to **Settings → Remote Crew**. This panel is the
    control plane only; it does not embed remote dashboards.
 3. **Add** an instance:
    - *Name*: any label.
@@ -637,7 +659,12 @@ Every configured row carries separate source and transport badges from the
 instance record. `connection_method="ssm"` shows **SSM**; every other transport
 shows **SSH**. A record whose persisted `provisioner_id` is `aws_ec2` also shows
 **EC2**, independently of launch-job history. `provisioner_id` is stamped by
-`register_instance` on each EC2 registration and relaunch; a record created
+`register_instance` on each launch registration and relaunch, and carries the
+lane that created the box: `aws_ec2` for the EC2 lane, which is the parameter's
+default, and `aws_fargate` for a Fargate task. The two are separate from
+`connection_method` because a Fargate task is reached over the SSM transport
+without being an EC2 instance, so the pair `connection_method="fargate"` with
+`provisioner_id="aws_fargate"` is the ordinary Fargate row. A record created
 before the field existed carries `""` until its next relaunch, and until then
 the launch-job correlation supplies the EC2 badge and posture. A hand-added
 record with no known provisioner shows only its transport rather than being
@@ -881,7 +908,7 @@ used by the managed path.
 
 ### Provisioning from the dashboard (`/api/cloud/*`)
 
-The Remote Instances settings page can create an EC2 instance in the user's own AWS
+The Remote Crew settings page can create an EC2 instance in the user's own AWS
 account without dropping to the CLI. `dashboard/handlers_cloud.py` exposes the
 launcher behind the same owner-only guard as `/api/instances/*`: an
 authenticated owner (`request["user"]`), non-Slack, POSIX only, `403` otherwise.
@@ -976,7 +1003,7 @@ whose current variable parts are all charset-bound literals.
 
 | Symptom | Likely cause / fix |
 |---------|--------------------|
-| Settings → Remote Instances shows the opt-in card | `instances.enabled` is false. Set it and restart. |
+| Settings → Remote Crew shows the opt-in card | `instances.enabled` is false. Set it and restart. |
 | Enabled but the panel says "not active" | The flag was set after the gateway started; the SSH manager is created at startup only. Restart. |
 | Iframe is blank or black | The pane's embedded SPA never announced readiness within 15s, so the error panel with **Retry** appears (Retry force-reloads even an identical src). An iframe reports no load error to its parent, so this watchdog is the only signal. |
 | Connect fails with an SSH auth error | Refresh your SSH credentials (re-add the key to `ssh-agent`); `BatchMode` never prompts, so a missing credential is an immediate failure. Tunnels self-heal once auth is restored. |
@@ -1310,6 +1337,18 @@ credentials, `ssm:StartSession` denial, missing plugin, target not a connected
 managed node, local bind conflict) rather than running SSM stderr through the ssh
 auth/transport matchers, which would mislabel an `AccessDenied` as an ssh auth
 failure.
+
+Stderr is not the only input. The plugin exits `0` with an empty stderr whether
+the session went idle, the transport was lost, or the session never started, so
+those three would otherwise collapse into one bare exit-code message. The close
+notice that tells them apart is on stdout, which the forward therefore captures
+under the rules in §Security. `_ssm_close_reason` reads that buffer and returns
+one shape -- idle, closed, resume-timeout, start-failed, or nothing matched --
+and `_ssm_exit_error` composes its own message and remedy from the shape. A real
+stderr signal still outranks the close notice, and a stop this code initiated is
+never classified at all. The remedy points at Connect on the crew's card, the
+surface a Fargate crew actually has, and states no timeout duration: the idle
+window is a Session Manager preference, not a value this code knows.
 
 ### Diagnosis ladder
 
@@ -2177,7 +2216,85 @@ be the defect the field replaces.
 
 ### 16.6 Seam
 
-`FargateEngine.register()` (`src/kiro_crew/cloud/fargate_engine.py`) is a
-deliberate no-op: a launched task is not added to this registry, so a `fargate`
-record is created by hand (Settings, the API or the CLI) with the task's ECS
-target. Tracked in #12511.
+`FargateLaunchEngine.register()` (`src/kiro_crew/cloud/fargate_engine.py`) adds a
+launched task to this registry, so a `fargate` record is normally created by the
+launch rather than by hand; Settings, the API and the CLI remain the way to add one
+for a task launched some other way, or to repair a launch whose registration did
+not complete.
+
+The launcher holds a task ARN, which this registry does not address, so `register`
+resolves a target before it writes one: it polls `ecs:DescribeTasks` for the crew
+container's `runtimeId` (`REGISTER_TARGET_POLL_SECONDS`, up to
+`REGISTER_TARGET_TIMEOUT_SECONDS` of ELAPSED time on a monotonic clock, with the
+last sleep cut to the remaining budget so the ceiling is the documented number and
+not that number plus one round trip per poll, returning on the first read that
+carries one), composes `ecs:<cluster>_<task-id>_<runtime-id>` from the task's own
+coordinates, and reads it back through `split_ecs_target` before handing it to
+`connect.register_instance(connection_method="fargate", remote_port=FRONT_PORT,
+provisioner_id="aws_fargate")`. The port is passed explicitly because
+`register_instance` defaults to the stock dashboard port, which nothing in the task
+listens on (§16's field notes). The provisioner id is passed explicitly for a
+different reason: it is persisted source metadata, not a dispatch key. The engine
+driving a launch is resolved from the launch job's own provisioner id and never from
+a registry record, so this stamp selects nothing; what reads it is the dashboard's
+crew list, which captions a row by it and picks the lifecycle guidance and Remove
+warning it shows. A Fargate task left with the EC2 default is therefore presented as
+an EC2 instance and its owner pointed at the wrong console.
+
+An absence is not a death until the task has been seen. `RunTask` and
+`ecs:DescribeTasks` are eventually consistent, so a task accepted moments ago is
+legitimately missing from the first read; the poll waits through an absence that
+precedes any sighting and treats only a DISAPPEARANCE -- an absence after a sighting
+-- as terminal. Calling the first case gone would fail the launch of a task that
+goes on to start and bill, and because the failed step is CONNECT rather than
+PROVISION the provision rollback does not run, so nothing would stop it.
+
+`FargateLaunchEngine.teardown()` removes each stopped task's record, after ECS
+accepts the stop. `register` is this lane's last launch step, so a cancel observed
+just after it unwinds through teardown with the row already present, and a stopped
+task that keeps its row leaves a crew list entry whose target resolves to nothing.
+The removal is `connect.unregister_ecs_task(cluster, task_id)`, which finds the row
+by reading each ECS target back through `split_ecs_target` and comparing cluster and
+task id: a teardown holds the task ARN and never the runtime id, so it cannot match a
+whole target, and a `ecs:<cluster>_<task-id>_` prefix test would let cluster `crews`
+remove a row belonging to cluster `crews_eu`. This is the Fargate counterpart of the
+EC2 lane's `cloud destroy` unregistration, which matches on the whole `ssm_target`
+because for that lane the target IS the instance id.
+
+A target is composed only from a task that is actually serving, and every state
+after `RUNNING` is refused before that point. ECS runs a task through
+`PROVISIONING`, `PENDING`, `ACTIVATING`, `RUNNING`, `DEACTIVATING`, `STOPPING`,
+`DEPROVISIONING`, `STOPPED`; the three after `RUNNING` are billable while nothing is
+listening, because the ENI is being torn down, and the container keeps its
+`runtimeId` through all of them. So neither the presence of a runtime id nor
+`TaskSighting.is_running` can decide this: that property answers a BILLING question
+and admits every state but `STOPPED`, which is right for the teardown warning it
+serves and wrong here. `TaskSighting.is_serving` answers the reachability one, and
+`is_past_running` separates "not serving yet" from "never serving again" so a
+`PENDING` task is polled while a `STOPPING` one is refused. `desiredStatus` counts
+too: a task ECS has been told to stop is on that path even while `lastStatus` still
+says `RUNNING`.
+
+Idempotency is `register_instance`'s own: it matches an existing record by
+`ssm_target`, so registering the same task twice updates that record in place and
+preserves its id, allocated local port, TTL and `was_connected`.
+
+Which failures are fatal follows the task, not the lane. A task that is gone or past
+running -- any of the four states from `DEACTIVATING` on, or one ECS no longer lists
+-- raises `RuntimeError` and fails the launch: there is no running crew behind it to
+add by hand and none to tear down, so reporting the launch as done would leave the job
+green for something unreachable. Every other failure raises
+`launch_job.RegistrationUnavailable`, which the launcher records on the connect step
+while still reporting the task as launched -- a denied `ecs:DescribeTasks`, a
+container still starting at the budget, coordinates that form no target, and a
+registry write that declined. The task may be running and billing in those, so the
+remedy is to add it here by hand or tear it down, and a launch reported as failed
+would describe the one thing that did work as the thing that broke. A failed read
+counts as may-be-running, so a missing permission never reports a live crew as dead.
+
+That non-fatal path writes the failed connect step and the terminal status in ONE
+save. A failed connect step beside a non-terminal status is the combination
+`reap_orphans` reads as an interrupted launch, and it rewrites the status to `FAILED`
+-- so persisting the step on its own would leave a window where a restart turns the
+intended `DONE` into a red card over a running crew, which is the outcome this whole
+path exists to avoid.

@@ -20,12 +20,20 @@ import sys
 
 from kiro_crew import __version__, platform_compat
 from kiro_crew._ssl_compat import _ensure_ssl_certs
+from kiro_crew.stdlib_shadow import refuse_if_stdlib_shadowed
 
 # Windows: force UTF-8 stdout/stderr before any non-ASCII output (no-op on POSIX).
 platform_compat.ensure_utf8_console()
 _ensure_ssl_certs()
 
 if __name__ == "__main__":
+    # BEFORE the `--version` fast-path, not after: a stdlib shadowed from the
+    # launch directory has already been imported by `kiro_crew.__init__`
+    # (asyncio -> concurrent.futures), so the earliest this process can say so
+    # is here, and a refusal that names `~/concurrent` beats a version string
+    # followed by a TypeError on the next command.
+    refuse_if_stdlib_shadowed()
+
     # Fast-path for bare `--version` (`python -m kiro_crew --version`, which
     # also covers the desktop launchers): skip importing `kiro_crew.cli`
     # (~250ms). Mirrored by the `_bootstrap.main` guard for the console

@@ -269,14 +269,30 @@ export default function SessionTitleControl({
   )
 
   if (editing) {
+    // While editing, the title is UNMISTAKABLY a text input (#13050, #12772,
+    // #13325): three nightly GUI testers read the previous editor -- the Input
+    // with every piece of its chrome stripped, sitting inside the same hover
+    // pill the read-only title shows, the whole name selected -- as
+    // "highlighted, not editable". So the editor now keeps the Input's own
+    // border, background and focus ring (its tokens, no colours of its own)
+    // and IS the box: no pill is painted behind it.
+    //
+    // The box is the read-only pill's box, so the header does not move when
+    // editing starts or ends: the pill's `py-0.5 px-1.5` (2px / 6px) becomes
+    // the editor's 1px border plus `py-px px-[5px]`, the editing wrapper adds
+    // no padding of its own, and the type classes (size, weight, colour) are
+    // the read-only title's. `rounded-l-[2px] rounded-r-md` mirrors the pill
+    // too: its flat left corners meet the header menu's pill across the row
+    // gap. Both hosts share this render, so the split-view pane header gets
+    // the same editing look (#10140).
     return (
-      <div className="flex min-w-0 flex-1 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md bg-bg-hover">
+      <div className="flex min-w-0 flex-1 items-center gap-1">
         {glyphs}
         <TitleEditor
           initial={title}
           className={compact
-            ? 'text-[13px] font-semibold text-text-strong font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-hidden focus:!shadow-none focus-visible:border-b focus-visible:border-accent'
-            : 'session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-hidden md:max-w-[50vw] focus:!shadow-none focus-visible:border-b focus-visible:border-accent'}
+            ? 'text-[13px] font-semibold text-text-strong font-body rounded-l-[2px] rounded-r-md border-accent px-[5px] py-px m-0 min-w-0 flex-1'
+            : 'session-header-title text-sm font-semibold text-muted font-body rounded-l-[2px] rounded-r-md border-accent px-[5px] py-px m-0 min-w-0 flex-1 md:max-w-[50vw]'}
           onCommit={commit}
           onClose={() => setEditing(false)}
         />
@@ -386,17 +402,27 @@ function TitleEditor({ initial, className, onCommit, onClose }: {
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       {...ime.bindComposition<HTMLInputElement>({
-        // Select the whole title on open, anchored BACKWARD. Caret-at-end
-        // autofocus scrolls a long title so only its tail shows, which reads
-        // as "part of the name is already gone" in a narrow pane. A plain
-        // select() keeps the selection focus at the end, so the browser still
-        // scrolls to the tail; with the focus at the start the input scrolls
-        // to 0 and the beginning of the name is what shows. Retype and
-        // append-after-End stay one keystroke each. Routed through the IME
-        // guard, whose spread owns the input's focus handler.
+        // A caret at the END on open, nothing selected, field scrolled to its
+        // START. The editor used to select the whole title, anchored backward
+        // so a long name showed its start: typing replaced the name in one
+        // keystroke, but a range selection paints no caret in any engine --
+        // Chromium, Gecko and WebKit draw it only for a collapsed selection --
+        // so with the Input chrome stripped as well, the highlight was the
+        // only cue, and three nightly testers read it as "highlighted, not
+        // editable" (#13050, #12772, #13325). The caret is the one cue that
+        // says "type here", and it sits at the end, where a focused text
+        // field puts it; replacing the whole name is Ctrl/Cmd+A. `scrollLeft
+        // = 0` keeps the old rule that a name wider than its box opens
+        // showing its beginning, not its tail (which read as "part of the
+        // name is already gone" in a narrow pane): for such a name the caret
+        // sits past the right edge until the first keystroke or End scrolls
+        // to it, and the box's border and ring carry the affordance
+        // meanwhile. Set explicitly: engines disagree on where a programmatic
+        // focus leaves the caret. Routed through the IME guard, whose spread
+        // owns the input's focus handler.
         onFocus: (e) => {
           const el = e.currentTarget
-          el.setSelectionRange(0, el.value.length, 'backward')
+          el.setSelectionRange(el.value.length, el.value.length)
           el.scrollLeft = 0
         },
         onBlur: () => {

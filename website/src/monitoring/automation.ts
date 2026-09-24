@@ -104,6 +104,15 @@ export interface LegacyGoalLoop {
    *  `undefined` means "not known here", while '' is a real "no sentinel".
    *  Kept only so the goal editor can say which of the two it is (#10458). */
   stopSentinelPath?: string
+  /** The wake judge's brief and its last reading, in the wire's own spelling.
+   *  This record is what the session popover renders a loop from, so a judge the
+   *  REST read publishes reaches the owner only by being carried here: the
+   *  popover's own loop shape is rebuilt from this one field by field, and a
+   *  value absent here is indistinguishable to it from a plain timer. Both keep
+   *  snake_case names because the same normalizer parses both the REST row
+   *  and the popover's own edited loop back into this shape. */
+  judge?: { wake_when?: string; quiet_when?: string; targets?: string[] }
+  judge_last_verdict?: { outcome?: string; evidence_items?: number; at?: number }
 }
 
 export interface StructuredMonitor {
@@ -220,6 +229,39 @@ function owns(value: JsonObject, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key)
 }
 
+/** The judge half of a loop row, coerced field by field like every other one.
+ *
+ * The popover renders the criterion as text and the verdict count as a number, so
+ * a wire value of the wrong type reaches a `.trim()` or a plural rule that has no
+ * answer for it. Coercing here keeps a malformed judge inert -- it reads as no
+ * judge -- instead of throwing inside the render of a loop that is otherwise fine.
+ * An absent key stays absent, because the reader's own rule is that a brief with
+ * neither sentence is not a judge, and a synthesized empty one would say the
+ * record carried something it did not. */
+function judgeFields(loop: JsonObject): Partial<LegacyGoalLoop> {
+  const fields: Partial<LegacyGoalLoop> = {}
+  const brief = object(loop.judge)
+  if (brief) {
+    const targets = Array.isArray(brief.targets)
+      ? brief.targets.filter((entry): entry is string => typeof entry === 'string')
+      : []
+    fields.judge = {
+      wake_when: text(brief.wake_when),
+      quiet_when: text(brief.quiet_when),
+      targets,
+    }
+  }
+  const verdict = object(loop.judge_last_verdict)
+  if (verdict) {
+    fields.judge_last_verdict = {
+      outcome: text(verdict.outcome),
+      evidence_items: count(verdict.evidence_items),
+      at: finite(verdict.at),
+    }
+  }
+  return fields
+}
+
 /** The legacy compatibility feed also projects structured monitors, but
  * deliberately withholds both the prompt and structured payload. Only rows
  * carrying their own message are complete legacy records. */
@@ -316,6 +358,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
       ...(typeof loop.stop_sentinel_path === 'string'
         ? { stopSentinelPath: loop.stop_sentinel_path }
         : {}),
+      ...judgeFields(loop),
     }
   }
 

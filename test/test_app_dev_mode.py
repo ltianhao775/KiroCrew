@@ -572,16 +572,35 @@ async def test_watch_loop_picks_up_out_of_process_toggle(tmp_path, monkeypatch):
     monkeypatch.setattr(dev_mode, "POLL_INTERVAL_SECS", 0.02)
 
     events: list[tuple[str, dict]] = []
+    scans: list[object] = []
+    _real_scan = dev_mode._scan_ui_mtimes
+
+    def _spy(ui_dir):
+        sig = _real_scan(ui_dir)  # record only AFTER the walk completed
+        scans.append(ui_dir)
+        return sig
+
+    monkeypatch.setattr(dev_mode, "_scan_ui_mtimes", _spy)
     task = asyncio.get_running_loop().create_task(
         dev_mode._watch_loop(lambda e, p: events.append((e, p)))
     )
     try:
         await asyncio.sleep(0.1)  # running with no dev apps
         assert events == []
+        assert scans == [], "walked a ui/ tree before any app was in dev mode"
 
         # Out-of-process toggle: write the sentinel + installed.json.
         set_dev_mode("dev-mode-app", True)
-        await asyncio.sleep(0.1)  # watcher re-reads sentinel, seeds state
+        # Wait for two completed walks. A fixed sleep assumes three to_thread
+        # hops plus an rglob fit inside it; on a loaded Windows runner they do
+        # not, the seed then contains the edit below, prev is None, and the loop
+        # seeds instead of broadcasting. Two walks mean the seeding tick ran to
+        # its broadcast decision, so the assertion below is not vacuous.
+        for _ in range(500):
+            await asyncio.sleep(0.02)
+            if len(scans) >= 2:
+                break
+        assert len(scans) >= 2, "watcher never seeded state for the newly-dev app"
         assert events == [], "seeding a newly-dev app must not broadcast"
 
         ui_file = dev_mode.app_dir("dev-mode-app") / "ui" / "index.mjs"

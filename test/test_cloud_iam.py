@@ -94,13 +94,15 @@ class TestPolicyDocument:
         # addition to the role-ARN prefix) so a leaked launcher credential can't
         # inline a policy onto a PRE-EXISTING, out-of-band, unbounded
         # kirocrew-ec2-* role. The role is tagged atomically at CreateRole, so the
-        # legitimate CFN deploy still satisfies it.
+        # legitimate CFN deploy still satisfies it. PutRolePolicy + TagRole are
+        # MERGED into one statement (same Effect + role ARN + managed-tag
+        # Condition), so the action list holds exactly those two.
         st = next(
             s
             for s in iam.policy_document()["Statement"]
-            if s["Sid"] == "IamPutRolePolicyForInstance"
+            if s["Sid"] == "IamPutRolePolicyAndTagRoleOnManaged"
         )
-        assert st["Action"] == ["iam:PutRolePolicy"]
+        assert set(st["Action"]) == {"iam:PutRolePolicy", "iam:TagRole"}
         assert iam.ROLE_NAME_PREFIX in st["Resource"]
         assert st["Condition"]["StringEquals"][f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         # No dead iam:PermissionsBoundary condition (that key isn't in
@@ -110,8 +112,9 @@ class TestPolicyDocument:
     def test_put_role_policy_and_passrole_not_tag_scoped_regression(self):
         # Guard: both PutRolePolicy and PassRole on a kirocrew-ec2-* role ARN must
         # carry the managed-tag condition — a regression that drops it re-opens
-        # the pre-existing-unbounded-role escalation.
-        for sid in ("IamPutRolePolicyForInstance", "IamPassRoleToEc2"):
+        # the pre-existing-unbounded-role escalation. PutRolePolicy now lives in
+        # the merged IamPutRolePolicyAndTagRoleOnManaged statement.
+        for sid in ("IamPutRolePolicyAndTagRoleOnManaged", "IamPassRoleToEc2"):
             st = next(s for s in iam.policy_document()["Statement"] if s["Sid"] == sid)
             se = st.get("Condition", {}).get("StringEquals", {})
             assert (
@@ -119,20 +122,24 @@ class TestPolicyDocument:
             ), f"{sid} lost its aws:ResourceTag/kirocrew:managed gate"
 
     def test_tag_role_gated_on_existing_managed_tag(self):
-        # iam:TagRole must be a SEPARATE statement gated on aws:ResourceTag/
-        # kirocrew:managed=true — NOT unconditioned, and NOT in IamRoleForInstance.
-        # If it were unconditioned, a leaked launcher credential could tag a
-        # pre-existing UNBOUNDED kirocrew-ec2-* role kirocrew:managed=true and
-        # thereby satisfy the PutRolePolicy/PassRole tag gate, defeating it. The
-        # aws:ResourceTag gate means the launcher can only tag a role that is
-        # ALREADY managed — which, at CreateRole, AWS evaluates against the tags
-        # being applied (so the boundary-gated create still works), but a standalone
-        # re-tag of an unmanaged role is denied. (Both validated live with a
-        # least-privilege assumed-role principal.)
+        # iam:TagRole must be gated on aws:ResourceTag/kirocrew:managed=true —
+        # NOT unconditioned, and NOT in IamRoleForInstance. If it were
+        # unconditioned, a leaked launcher credential could tag a pre-existing
+        # UNBOUNDED kirocrew-ec2-* role kirocrew:managed=true and thereby satisfy
+        # the PutRolePolicy/PassRole tag gate, defeating it. The aws:ResourceTag
+        # gate means the launcher can only tag a role that is ALREADY managed —
+        # which, at CreateRole, AWS evaluates against the tags being applied (so
+        # the boundary-gated create still works), but a standalone re-tag of an
+        # unmanaged role is denied. (Both validated live with a least-privilege
+        # assumed-role principal.) TagRole now shares the merged
+        # IamPutRolePolicyAndTagRoleOnManaged statement with PutRolePolicy — same
+        # Effect + role ARN + Condition, so the merge is permission-neutral.
         st = next(
-            s for s in iam.policy_document()["Statement"] if s["Sid"] == "IamTagRoleOnManaged"
+            s
+            for s in iam.policy_document()["Statement"]
+            if s["Sid"] == "IamPutRolePolicyAndTagRoleOnManaged"
         )
-        assert st["Action"] == ["iam:TagRole"]
+        assert set(st["Action"]) == {"iam:PutRolePolicy", "iam:TagRole"}
         assert iam.ROLE_NAME_PREFIX in st["Resource"]
         assert st["Condition"]["StringEquals"][f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         # It must NOT use iam:PermissionsBoundary — validated live that AWS does
@@ -164,9 +171,12 @@ class TestPolicyDocument:
         assert "cloudformation:DeleteStack" in st["Action"]
         # scoped to kirocrew-* stacks, not "*"
         assert st["Resource"] == f"arn:aws:cloudformation:*:*:stack/{iam.STACK_PREFIX}*/*"
-        # read-only enumerate/validate stays account-wide (can't be stack-scoped)
+        # read-only enumerate/validate stays account-wide (can't be stack-scoped);
+        # it now lives in the merged CloudFormationAndResourceDiscovery statement.
         read = next(
-            s for s in iam.policy_document()["Statement"] if s["Sid"] == "CloudFormationRead"
+            s
+            for s in iam.policy_document()["Statement"]
+            if s["Sid"] == "CloudFormationAndResourceDiscovery"
         )
         assert "cloudformation:ListStacks" in read["Action"]
 
@@ -223,9 +233,9 @@ class TestPolicyDocument:
         st = next(
             s
             for s in iam.policy_document()["Statement"]
-            if s["Sid"] == "IamPutRolePolicyForInstance"
+            if s["Sid"] == "IamPutRolePolicyAndTagRoleOnManaged"
         )
-        assert st["Action"] == ["iam:PutRolePolicy"]
+        assert set(st["Action"]) == {"iam:PutRolePolicy", "iam:TagRole"}
         assert iam.ROLE_NAME_PREFIX in st["Resource"]
         assert "iam:PermissionsBoundary" not in str(st.get("Condition", {}))  # no dead key
         # CreateRole/PutRolePolicy must not appear in the plain role statement.
@@ -325,15 +335,29 @@ class TestPolicyDocument:
 
     def test_authorize_security_group_is_tag_gated(self):
         # SG rule mutation must be gated to kirocrew:managed=true SGs so a leaked
-        # credential can't open ingress on unrelated security groups.
+        # credential can't open ingress on unrelated security groups. It lives in
+        # the merged Ec2ManagedResourceMutateTagged statement (same Effect +
+        # Resource "*" + managed-tag Condition as the destructive/lifecycle verbs).
         st = next(
             s
             for s in iam.policy_document()["Statement"]
-            if s["Sid"] == "Ec2SecurityGroupRulesTagged"
+            if s["Sid"] == "Ec2ManagedResourceMutateTagged"
         )
+        # EXACT set-equality pin on the whole merged action list — the only
+        # statement here with Resource "*" and a mutating verb set, so a later
+        # change that appends a new mutating verb (e.g. ec2:ModifyInstanceAttribute)
+        # to this "*"-scoped statement must land red here, not green. A subset
+        # check would let action creep onto the wildcard resource unreviewed.
         assert set(st["Action"]) == {
             "ec2:AuthorizeSecurityGroupEgress",
             "ec2:AuthorizeSecurityGroupIngress",
+            "ec2:RevokeSecurityGroupIngress",
+            "ec2:DeleteSecurityGroup",
+            "ec2:DeleteTags",
+            "ec2:StopInstances",
+            "ec2:StartInstances",
+            "ec2:TerminateInstances",
+            "ec2:RebootInstances",
         }
         assert st["Condition"]["StringEquals"][f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         # ...and they're not in any of the provision (create) statements.
@@ -414,7 +438,11 @@ class TestPolicyDocument:
                 assert cond_tag == "true", f"{st['Sid']} creates SG on security-group/* untagged"
 
     def test_lifecycle_is_tag_scoped(self):
-        st = next(s for s in iam.policy_document()["Statement"] if s["Sid"] == "Ec2LifecycleTagged")
+        st = next(
+            s
+            for s in iam.policy_document()["Statement"]
+            if s["Sid"] == "Ec2ManagedResourceMutateTagged"
+        )
         cond = st["Condition"]["StringEquals"]
         assert cond[f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         assert "ec2:TerminateInstances" in st["Action"]
@@ -448,7 +476,7 @@ class TestPolicyDocument:
                     "without a tag condition"
 
     def test_destructive_ec2_verbs_tag_scoped(self):
-        st = self._stmt("Ec2DestructiveTagged")
+        st = self._stmt("Ec2ManagedResourceMutateTagged")
         cond = st["Condition"]["StringEquals"]
         assert cond[f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         for verb in ("ec2:DeleteSecurityGroup", "ec2:RevokeSecurityGroupIngress", "ec2:DeleteTags"):
@@ -528,6 +556,81 @@ class TestPolicyDocument:
         actions = {a for st in iam.policy_document()["Statement"] for a in st["Action"]}
         assert "s3:HeadBucket" not in actions
         assert "s3:ListBucket" in actions
+
+    def test_policy_fits_iam_managed_policy_limit(self):
+        # A customer managed policy is capped at 6,144 characters with WHITESPACE
+        # NOT COUNTED (AWS IAM quota "Managed policy size", non-adjustable — see
+        # docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html).
+        # Over that, `aws iam create-policy` fails with LimitExceeded and the
+        # printed policy is unusable for every operator who isn't already an admin.
+        # The headroom target sits BELOW the hard cap so the next feature (EC2
+        # Spot, ~+152 chars) still fits without another shrink; merge equivalent
+        # statements (see Ec2ManagedResourceMutateTagged /
+        # IamPutRolePolicyAndTagRoleOnManaged / CloudFormationAndResourceDiscovery)
+        # rather than letting the policy creep back over.
+        compact = json.dumps(iam.policy_document(), separators=(",", ":"))
+        assert len(compact) <= 6144, (
+            f"launcher policy is {len(compact)} chars — over IAM's 6,144 managed-policy "
+            "limit; merge equivalent statements or split the policy"
+        )
+        # Headroom gate BELOW the hard cap so growth is caught well before it hits
+        # the platform limit. Sized to sit above where the next feature (EC2 Spot,
+        # ~+152 chars -> ~5,970) lands so that feature is not tripped by the very
+        # reserve meant to admit it, while still leaving ~100 chars of margin under
+        # the 6,144 cap. If a feature legitimately needs more, raise this in the
+        # same change and say why — do not let the policy drift up to the cap.
+        assert len(compact) <= 6044, (
+            f"launcher policy is {len(compact)} chars — over the 6,044 headroom gate "
+            "(100 chars under IAM's 6,144 cap). Merge equivalent statements or, if a "
+            "feature genuinely needs the room, raise this gate deliberately."
+        )
+
+    def test_shrink_preserved_the_permission_set_byte_for_byte(self):
+        # Merging statements that share Effect + Resource + Condition to stay under
+        # the cap MUST NOT change the effective permission set. Flatten the
+        # pre-merge fixture and the current policy into canonical (Effect, Action,
+        # Resource-form, Resource, Condition) tuple sets and assert equality — this
+        # is the guarantee that the merges are permission-neutral.
+        import pathlib
+
+        fixture = (
+            pathlib.Path(__file__).resolve().parent
+            / "fixtures"
+            / "cloud_iam_policy_pre_shrink.json"
+        )
+        old = json.loads(fixture.read_text(encoding="utf-8"))
+        new = iam.policy_document()
+
+        def flatten(doc):
+            tuples = set()
+            for st in doc["Statement"]:
+                effect = st["Effect"]
+                actions = st.get("Action", [])
+                if isinstance(actions, str):
+                    actions = [actions]
+                if "Resource" in st:
+                    form = "Resource"
+                    resources = st["Resource"]
+                else:
+                    form = "NotResource"
+                    resources = st["NotResource"]
+                if isinstance(resources, str):
+                    resources = [resources]
+                cond = json.dumps(st.get("Condition"), sort_keys=True)
+                for action in actions:
+                    for resource in resources:
+                        tuples.add((effect, action, form, resource, cond))
+            return tuples
+
+        old_tuples = flatten(old)
+        new_tuples = flatten(new)
+        assert new_tuples == old_tuples, {
+            "only_in_old": sorted(old_tuples - new_tuples),
+            "only_in_new": sorted(new_tuples - old_tuples),
+        }
+        # The old policy really was over the hard cap (the reason for this PR),
+        # so the fixture is the genuine pre-shrink state, not a copy of the new one.
+        assert len(json.dumps(old, separators=(",", ":"))) > 6144
 
     def test_policy_json_roundtrips(self):
         assert json.loads(iam.policy_json()) == iam.policy_document()

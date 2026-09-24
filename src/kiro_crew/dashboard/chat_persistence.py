@@ -134,6 +134,16 @@ def _rehydrate_title_refresh_mark(stored: object) -> int:
     return 0
 
 
+def _rehydrate_title_low_signal(stored: object) -> bool:
+    """Resolve the persisted low-signal flag; absent/invalid means False.
+
+    A legacy session written before the field existed rehydrates as False —
+    the conservative default, since re-arming the early refresh on old
+    sessions would spend one-liner calls their budget never accounted for.
+    """
+    return stored is True
+
+
 def _rehydrate_slot_title(
     slot: _ChatSlot,
     raw_title: str,
@@ -154,6 +164,7 @@ def _rehydrate_slot_title(
     slot._titled = titled
     slot._title_origin = _rehydrate_title_origin(titled, metadata.get("title_origin"))
     slot._title_refresh_mark = _rehydrate_title_refresh_mark(metadata.get("title_refresh_mark"))
+    slot._title_low_signal = _rehydrate_title_low_signal(metadata.get("title_low_signal"))
 
 
 _MAX_HISTORY_CHARS = 8000
@@ -3696,6 +3707,14 @@ def _save_slot_to_history(
                     _mark = getattr(slot, "_title_refresh_mark", 0)
                     if _mark:
                         fields["title_refresh_mark"] = _mark
+                    # Title-coupled like the two fields above, and written
+                    # UNCONDITIONALLY: _persist_title is the primary writer but
+                    # returns False without retry on a transient failure, so a
+                    # full save must land the CURRENT boolean either direction
+                    # -- a skipped True loses the turn-one refresh after
+                    # restart, and a skipped False (flag just cleared by
+                    # consumption or manual regenerate) re-arms it.
+                    fields["title_low_signal"] = bool(getattr(slot, "_title_low_signal", False))
                 else:
                     fields["title"] = ""
                 if slot.agent:
@@ -3713,8 +3732,10 @@ def _save_slot_to_history(
                 # Clearable like memory_store: a name-only pick after a template
                 # pick must not keep advertising the template namespace.
                 fields["agent_kind"] = slot.agent_kind
-                if slot.project:
-                    fields["project"] = slot.project
+                # Written even when EMPTY: the merge is an upsert that cannot delete a key, so
+                # omitting a cleared project leaves the previous directory on disk to be read
+                # back as though the clear never happened.
+                fields["project"] = slot.project
                 if slot._app:
                     fields["app"] = slot._app
                 if slot._origin:
@@ -4072,6 +4093,14 @@ def _save_slot_to_history(
                 _mark = getattr(slot, "_title_refresh_mark", 0)
                 if _mark:
                     meta_line["title_refresh_mark"] = _mark
+                # Title-coupled like the two fields above, and written
+                # UNCONDITIONALLY: _persist_title is the primary writer but
+                # returns False without retry on a transient failure, so the
+                # full save must land the CURRENT boolean either direction -- a
+                # skipped True loses the turn-one refresh after restart, and a
+                # skipped False (flag just cleared by consumption or manual
+                # regenerate) re-arms it.
+                meta_line["title_low_signal"] = bool(getattr(slot, "_title_low_signal", False))
             if slot.agent:
                 meta_line["agent"] = slot.agent
             meta_line["model"] = slot.model

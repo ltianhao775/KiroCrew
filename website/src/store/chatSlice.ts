@@ -10,11 +10,11 @@ import { isChatPageSurface } from '../utils/channelOrigin'
 import { isSystemNoticeKind } from '../lib/systemNotice'
 import { isStopEvent } from '../lib/stopEvent'
 import { isNoteRow } from '../lib/noteContract'
-import type { ToolAction } from '../utils/toolAction'
+import type { PhaseDetail, ToolPhaseDetail } from '../utils/toolStatusLabel'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { gcSessionStorage } from '../utils/storageGc'
 import type { RootState } from './index'
-import type { ChatMessage, ChatSlot, SessionInfo, SubagentActivity, ToolActivity, WorkflowRunSummary } from '../types'
+import type { ChatMessage, ChatSlot, SessionInfo, SubagentActivity, ToolActivity, ToolPayloadCut, WorkflowRunSummary } from '../types'
 import { SOFT_STOP_DEBOUNCE_MS, SPAWN_LAUNCH_MARKER } from '../pages/chat/types'
 import { mergePreservedPastes } from '../utils/pasteTokens'
 import { safeSetItem } from '../utils/safeStorage'
@@ -344,12 +344,18 @@ const TOOL_OUTPUT_SNAP_WINDOW = 2_000
 /** Clamp a tool result to `TOOL_OUTPUT_MAX_CHARS`, keeping head + tail.
  *
  *  Each cut snaps to a line break within `TOOL_OUTPUT_SNAP_WINDOW` of its raw
- *  offset so neither side of the marker starts with a short mid-line fragment.
+ *  offset so neither side of the seam starts with a short mid-line fragment.
  *  A cut without a nearby usable line break keeps its raw offset, preserving
- *  the intended head and tail budgets. The marker carries the exact number of
- *  characters elided between the two slices. */
-export function clampToolOutput(output: string): string {
-  if (output.length <= TOOL_OUTPUT_MAX_CHARS) return output
+ *  the intended head and tail budgets.
+ *
+ *  Returns the clamped `text` plus a structural `cut` — the seam offset and the
+ *  exact number of characters elided — or `cut: null` when nothing was
+ *  removed. The marker the user reads is NOT part of `text`: it is a locale
+ *  string, and a reducer that baked it in would freeze it in the language
+ *  active when the result arrived. `ToolDetails` renders it at the seam at
+ *  view time instead. */
+export function clampToolOutput(output: string): { text: string; cut: ToolPayloadCut | null } {
+  if (output.length <= TOOL_OUTPUT_MAX_CHARS) return { text: output, cut: null }
   const headCut = output.lastIndexOf('\n', TOOL_OUTPUT_HEAD_CHARS)
   const headEnd = headCut >= TOOL_OUTPUT_HEAD_CHARS - TOOL_OUTPUT_SNAP_WINDOW
     ? headCut
@@ -367,13 +373,23 @@ export function clampToolOutput(output: string): string {
   const parts = [
     output.slice(0, headEnd),
     '\n',
-    i18nT('store.chatSlice.truncated_chars', { count: tailStart - headEnd }),
-    '\n',
     output.slice(tailStart),
   ]
   // V8's multi-part Array#join path copies the characters into a fresh
   // sequential string instead of retaining the sliced parents through a cons.
-  return parts.join('')
+  return { text: parts.join(''), cut: { at: headEnd + 1, count: tailStart - headEnd } }
+}
+
+/** Write a clamped payload onto a tool-log entry as its `input`/`input_cut` or
+ *  `output`/`output_cut` pair. An unclamped payload CLEARS a stale `*_cut`: an
+ *  `is_update` frame can replace an oversize `input_preview` with a short one,
+ *  and a leftover offset would make the renderer split the new text. */
+function setClampedField(entry: ToolActivity, field: 'input' | 'output', payload: string): void {
+  const { text, cut } = clampToolOutput(payload)
+  const cutField = field === 'input' ? 'input_cut' : 'output_cut'
+  entry[field] = text
+  if (cut) entry[cutField] = cut
+  else delete entry[cutField]
 }
 
 /** Drop every MCP App render payload belonging to `sessionKey` (slot deleted
@@ -576,9 +592,30 @@ export const shouldResolveAskOnSend = (
   askAtSend: string | null,
 ): boolean => !!askAtSend && !!(accepted?.ok || accepted?.queued)
 
+/** The attachment lists a queue entry carries, as the server echoes them on
+ *  the slot-detail `queue[]` item and the `queue_push` frame (the same `meta`
+ *  the `queue_pop` frame already uses). `files` is the
+ *  ORDERED non-image list an `[attached_file N]` marker indexes (`files[N-1]`),
+ *  `dirs` the folder list `[attached_dir N]` indexes. */
+export type QueueEntryAttachments = { files?: string[]; dirs?: string[] }
+
+/** Reduce a wire `meta` to its attachment lists. Only a non-empty list of
+ *  strings is kept: the lists are indexed by marker number, so a malformed
+ *  entry would shift every later marker onto the wrong path. Returns `{}` for
+ *  anything else, which is what an entry without attachments carries. */
+export function queueEntryAttachments(meta: unknown): QueueEntryAttachments {
+  const out: QueueEntryAttachments = {}
+  if (!meta || typeof meta !== 'object') return out
+  for (const key of ['files', 'dirs'] as const) {
+    const raw = (meta as Record<string, unknown>)[key]
+    if (Array.isArray(raw) && raw.length && raw.every((p) => typeof p === 'string' && p)) out[key] = [...raw] as string[]
+  }
+  return out
+}
+
 /** One queued-message entry as normalized by `fetchSlotDetail` from the backend
  *  slot-detail `queue` field. */
-type SlotQueueItem = { content: string; queueId: string; ts: string }
+type SlotQueueItem = { content: string; queueId: string; ts: string } & QueueEntryAttachments
 
 /** Field-for-field equality over every `ChatMessage` field a consumer can render. */
 function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
@@ -616,8 +653,11 @@ function hydrateQueuedBubbles(
   queue: SlotQueueItem[] | undefined,
 ): ChatMessage[] {
   const base = list.filter((m) => m.role !== 'queued')
-  for (const { content, queueId, ts } of queue ?? []) {
-    base.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId } })
+  for (const { content, queueId, ts, ...attachments } of queue ?? []) {
+    // The lists ride the row's meta under the same keys a user row carries
+    // them, so a cancel on THIS tab restores a spaced path exactly even
+    // though the send happened on another tab or before a reload.
+    base.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...attachments } })
   }
   return base
 }
@@ -859,13 +899,29 @@ export interface FollowupItem {
   branch?: string
 }
 
+/** A slot's live status line, keyed by `kind`: a `tool` phase carries the
+ *  agent-written `purpose` (plus the `toolCallId` it describes, so a refinement
+ *  of the SAME call merges into it); a fixed phase carries no copy, and a
+ *  server-supplied status carries its `label`. Purpose and label are separate
+ *  fields so a reader cannot paint one for the other; `toolStatusLabel`
+ *  resolves any of them into the string a row shows. */
+export type SlotStatusDetail = ((ToolPhaseDetail & { toolCallId?: string }) | PhaseDetail) & { ts: number }
+
 interface ChatState {
   activeSlot: string | null
   messages: ChatMessage[]
   slotRunning: boolean
   slotStopping: boolean
   slotState: SlotState
-  slotStatusDetail: Record<string, { kind: string; text: string; ts: number; toolName?: string; derivedTitle?: string; derivedAction?: ToolAction; derivedMore?: number; toolCallId?: string }>
+  slotStatusDetail: Record<string, SlotStatusDetail>
+  /** Slots the header's "Request a Feature" action created, this tab only. The
+   *  transcript reads it to offer the non-inference route (the repo's
+   *  feature-request form) on a `usage_limit` error row in one of them
+   *  (#13342): the row's kind says the plan is spent, but only the flow that
+   *  created the slot knows the turn was a feature request, and the backend is
+   *  not told. Keys are never removed -- slot keys are unique, so a stale entry
+   *  can match nothing -- and the list grows by one per press. */
+  featureRequestSlots: string[]
   slotHasMore: boolean
   slotOldestIndex: number
   /** Slot the cursor above describes. A switch moves activeSlot first, so
@@ -1196,6 +1252,7 @@ const initialState: ChatState = {
   slotStopping: false,
   slotState: 'idle',
   slotStatusDetail: {},
+  featureRequestSlots: [],
   slotHasMore: false,
   slotOldestIndex: 0,
   slotCursorKey: null,
@@ -1533,10 +1590,13 @@ export const fetchHistory = createAsyncThunk(
     const state = (getState() as { chat: ChatState }).chat
     const offset = append ? state.historyOffset : 0
     // Older sessions is the complement of the open tabs listed above it, so the
-    // server drops anything a live slot already holds. Excluded server-side
+    // server drops anything a live slot already holds. `user_only` drops the
+    // machine namespaces on top of that: a subagent or workflow transcript is
+    // not a conversation the reader ever addressed, and having no title it would
+    // render its own storage key as the row label. Both excluded server-side
     // because `historyOffset` advances by the row count received: dropping rows
     // here would desynchronise the offset and skip or repeat rows on the next page.
-    const d = await api.sessions(30, offset, false, true)
+    const d = await api.sessions(30, offset, false, true, true)
     return { sessions: (d.sessions || d) as SessionInfo[], hasMore: d.has_more || false, offset, append }
   },
 )
@@ -2035,6 +2095,66 @@ function hasUnidentifiedDurableRow(rows: ChatMessage[]): boolean {
   return rows.some(m => isDurableRow(m) && !(typeof m.meta?.mid === 'string' && m.meta.mid.length > 0))
 }
 
+/** The count-matched limit for a refetch that REPLACES rows it did not page, or
+ *  `undefined` when no bound can be proven safe for the rows the caller holds.
+ *
+ *  ONE owner for two paths that ask the identical question: `refreshSlot` about the
+ *  open transcript, `warmSlotCache` about a background pane's cache. Both hand the
+ *  response to a reducer that reconciles it by `meta.mid`, so a bound is safe for
+ *  both under exactly one condition and unsafe for both under exactly one other --
+ *  and a rule proved for one must not be able to go missing from the other.
+ *
+ *  `rows` is what the caller already holds. Only DURABLE rows are counted: the limit
+ *  reaches a handler that slices DISK, disk holds no client-only row (a `thinking`
+ *  block, a `permission` card, a `queued` bubble), and counting one inflates the
+ *  request past the caller's own span. `floor` keeps a near-empty view from asking
+ *  for a single row; `ceiling` is the widest window worth a round trip.
+ *
+ *  `span` picks WHICH durable rows are counted, and it must match the check the
+ *  caller runs on the page it gets back:
+ *
+ *  - `identified` (default, `refreshSlot`): rows carrying a `mid`. Its post-fetch
+ *    checks are `mid`-keyed, and the floor guard below is argued over that count.
+ *  - `placeable` (`warmSlotCache`): rows carrying a `mid` OR a readable `ts` -- the
+ *    exact rows `slotCoverageShortfall` measures the page against. Counting only
+ *    `mid` rows there sized the page SMALLER than the span coverage checks: 50+
+ *    identified rows plus one mid-less legacy row asked for one row too few, so the
+ *    shortfall was always > 0 and every warm paid the bounded read AND the unbounded
+ *    retry this limit exists to cap. The floor guard still holds: at `want === held`
+ *    a page of `held` rows is the whole placeable span, and above it the decline for
+ *    unidentified history is unchanged.
+ *
+ *  Declines in the two shapes where a window can strand a row the caller holds:
+ *
+ *  - NOTHING IDENTIFIED. With no `mid` to count there is no span to match, so any
+ *    number would be a FIXED bound -- a window that can sit entirely newer than the
+ *    cache, which the reducer must then replace rather than merge.
+ *  - THE FLOOR OVER-REQUESTS INTO UNIDENTIFIED HISTORY. At `want === held` a page of
+ *    `held` rows leaves no room for an unidentified row to be its oldest, so the cut
+ *    anchors. Above `held` the floor pulls older unidentified rows in, the page's
+ *    oldest anchors nothing, and the reducer keeps no head while the caller still
+ *    holds rows above it -- in no page and no head. Legacy history written before the
+ *    backend stamped `mid` is the real case. */
+export function countMatchedFetchLimit(input: {
+  rows: readonly ChatMessage[]
+  floor: number
+  ceiling: number
+  span?: 'identified' | 'placeable'
+}): number | undefined {
+  const { rows, floor, ceiling, span = 'identified' } = input
+  const hasMid = (m: ChatMessage) => typeof m.meta?.mid === 'string' && m.meta.mid.length > 0
+  // Nothing identified: no span to match, so any number would be a fixed bound.
+  if (!rows.some(m => isDurableRow(m) && hasMid(m))) return undefined
+  const counted = span === 'placeable'
+    ? (m: ChatMessage) => hasMid(m) || transcriptTsMs(m.ts) !== null
+    : hasMid
+  const held = rows.filter(m => isDurableRow(m) && counted(m)).length
+  const want = Math.max(held, floor)
+  if (want > ceiling) return undefined
+  if (want > held && hasUnidentifiedDurableRow(rows as ChatMessage[])) return undefined
+  return want
+}
+
 /** The `(hasMore, cursor)` pair to install after keeping an older head above a
  *  bounded page. Lives here so a second head-keeping reducer cannot re-derive it.
  *  The cursor is a row OFFSET, so a kept head shifts it down by the head's own
@@ -2110,8 +2230,8 @@ async function fetchSlotDetail(key: string, limit?: number) {
   // COUNT-MATCHED one instead, see REFRESH_LIMIT_CEILING. Omit the arg when
   // unbounded to keep the one-arg shape.
   const d = await (limit === undefined ? api.chatSlotDetail(key) : api.chatSlotDetail(key, limit))
-  type QueueItem = string | { content: string; id: string }
-  return { key, boundedRead: limit !== undefined, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString() }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
+  type QueueItem = string | { content: string; id: string; meta?: unknown }
+  return { key, boundedRead: limit !== undefined, nextBefore: d.next_before || 0, messages: filterMessages(d.messages || []), running: d.running || false, stopping: d.stopping || false, hasMore: d.has_more || false, total: d.total || 0, queue: ((d.queue || []) as QueueItem[]).map((q: QueueItem) => typeof q === 'string' ? { content: q, queueId: crypto.randomUUID(), ts: new Date().toISOString() } : { content: q.content, queueId: q.id, ts: new Date().toISOString(), ...queueEntryAttachments(q.meta) }), context: d.context_pct != null ? { pct: d.context_pct, used: d.context_used_tokens ?? undefined, window: d.context_window_tokens ?? undefined } : undefined }
 }
 
 /** SINGLE hydration path for the slot-detail context-meter fields — the one
@@ -3147,43 +3267,16 @@ export const refreshSlot = createAsyncThunk(
     // the same server-row notion `serverRowCount` and the reducer's
     // `priorServerRows` are built on.
     const view = state.messages
-    /* `isDurableRow` is load-bearing here, not decoration. A client-only row can
-     * carry a `mid` too, and counting one inflates `held` -- which does not merely
-     * over-request, it makes `want === held` hold when the DURABLE span is smaller,
-     * silently bypassing the floor guard below whose whole argument is that at
-     * `want === held` a page of `held` rows cannot hide an unidentified row. The
-     * limit reaches a handler that slices DISK, and disk has no client-only rows, so
-     * only durable ones may be counted against it. */
-    const serverRows = view.filter(
-      m => isDurableRow(m) && typeof m.meta?.mid === 'string' && m.meta.mid.length > 0,
-    )
-    const held = serverRows.length
-    const want = Math.max(held, PANE_HYDRATE_LIMIT)
-    /* The FLOOR is the one over-request, and mixed history is where it bites.
-     *
-     * At `want === held` the page cannot strand a durable row: `spansView` only
-     * passes when all `held` identified rows are INSIDE a page of exactly `held`
-     * rows, which leaves no room for an unidentified row to be the page's oldest --
-     * and `overlapsView` already requires the page's oldest row to anchor. So the
-     * count-matched request is safe whatever the identities are.
-     *
-     * `want > held` breaks that arithmetic. With few identified rows the floor pulls
-     * a page of 50 that holds all of them (so `spansView` passes) plus older
-     * UNIDENTIFIED rows -- and the page's oldest row is then one the `mid`-keyed cut
-     * cannot anchor, so the reducer keeps no head while the view holds rows above it.
-     * They would be in no page and no head, which is the scrollback loss this bound
-     * exists to avoid. Legacy rows written before the backend stamped `mid` are the
-     * real case.
-     *
-     * So the floor declines on a window it cannot fully identify. Modern transcripts
-     * -- every live session, which is the recurring cost #4690 is about -- keep the
-     * bound, because their rows all carry a `mid`. */
-    const floorOverRequests = want > held
-    const bounded =
-      held > 0 &&
-      want <= REFRESH_LIMIT_CEILING &&
-      !(floorOverRequests && hasUnidentifiedDurableRow(view))
-    if (!bounded) return fetchSlotDetail(key)
+    /* The bound itself lives in `countMatchedFetchLimit`, shared with the background
+     * warm: which rows may be counted, why the floor declines on history it cannot
+     * identify, and why an unidentified view takes the unbounded shape are all one
+     * rule, stated once there. */
+    const want = countMatchedFetchLimit({
+      rows: view,
+      floor: PANE_HYDRATE_LIMIT,
+      ceiling: REFRESH_LIMIT_CEILING,
+    })
+    if (want === undefined) return fetchSlotDetail(key)
     const page = await fetchSlotDetail(key, want)
     /* Is this page safe to hand a reducer that REPLACES the transcript with it?
      * It is, on any one of three counts -- and each is a different relationship
@@ -3261,16 +3354,85 @@ export const warmSlotCache = createAsyncThunk(
   async (key: string, { getState }) => {
     const state = (getState() as { chat: ChatState }).chat
     if (state.activeSlot === key) return null
-    // Unbounded while streaming is deliberate, not a raw-row guard: the handler
-    // collapses chunk runs BEFORE computing total and slicing, even mid-stream.
-    const streaming = (state.slotRun[key]?.state ?? 'idle') !== 'idle'
     // Captured BEFORE the fetch: two warms for one slot resolve in any order,
     // and the later-dispatched response is the newer view of the transcript.
     const warmSeq = nextWarmSeq()
-    // `switchSlot.pending` paints the active view from this cache, and a window can miss
-    // a small cache entirely once the server has grown, so refetch any of it whole.
-    const cached = state.slotMessages?.[safeKey(key)]?.length ?? 0
-    return { ...(await fetchSlotDetail(key, streaming || cached > 0 ? undefined : PANE_HYDRATE_LIMIT)), warmSeq }
+    /* A populated cache is COUNT-MATCHED, by the same rule and the same owner
+     * `refreshSlot` uses: ask for the span this pane already holds, never for the
+     * whole chained transcript.
+     *
+     * Why this path must not ask unbounded whenever it holds anything: every
+     * WebSocket reconnect warms each mounted pane, so one reconnect requests the
+     * ENTIRE history of every session on screen at once. The handler answers each by
+     * reading that session's whole corpus off disk, running its regex redaction
+     * battery across it and serializing the result -- Python work holding the GIL on
+     * one worker thread, so a handful of multi-MB sessions stalls every other request
+     * and every WS frame queued behind them. This limit is the only cap on that work,
+     * and the pane's own span is the honest size for it.
+     *
+     * A bounded page is safe for this reducer: `warmSlotCache.fulfilled` keeps any
+     * older head sitting above the page's first row (`olderHeadAbovePage`), so a
+     * window narrower than the pane's scrollback merges with it instead of replacing
+     * it. A cache the bound cannot prove safe still takes the unbounded shape --
+     * `countMatchedFetchLimit` answers `undefined` there.
+     *
+     * A STREAMING slot is no exception. The handler collapses chunk runs BEFORE it
+     * slices. Its one folded streaming row carries no durable identity, so a
+     * populated running cache asks for one extra row: the page still covers the same
+     * number of durable rows instead of reporting a deterministic one-row shortfall.
+     * The bounded read also leaves a comparable `total` behind for the next switch's
+     * coverage check. Exempting streaming would apply the unbounded shape to the
+     * panes most likely to be mid-turn when a socket drops. */
+    const cache = state.slotMessages?.[safeKey(key)] ?? []
+    const running = (state.slotRun[safeKey(key)]?.state ?? 'idle') !== 'idle'
+    /* One guard this path needs beyond the shared rule, because it is the only one of
+     * the three with no post-fetch validation in front of its reducer: a durable row
+     * with no readable instant is invisible to BOTH safety nets. It can carry a `mid`,
+     * so the count-matched bound admits it, and `slotCoverageShortfall` cannot place it
+     * in time, so the coverage check below reports it as nothing to cover -- a window
+     * that misses it then replaces the cache with no shortfall ever raised. Legacy
+     * history written before the backend stamped a timestamp is the real case, and it
+     * takes the unbounded shape. `refreshSlot` does not need this: it validates the
+     * page it got against the view and retries, so an unplaceable row costs it a round
+     * trip rather than a row. */
+    const unplaceable = cache.some(m => isDurableRow(m) && transcriptTsMs(m.ts) === null)
+    const matchedLimit = cache.length === 0
+      ? PANE_HYDRATE_LIMIT
+      : unplaceable
+        ? undefined
+        : countMatchedFetchLimit({
+          rows: cache,
+          floor: PANE_HYDRATE_LIMIT,
+          ceiling: SLOT_DETAIL_MAX_LIMIT,
+          span: 'placeable',
+        })
+    const limit = running && cache.length > 0 && matchedLimit !== undefined
+      ? Math.min(SLOT_DETAIL_MAX_LIMIT, matchedLimit + 1)
+      : matchedLimit
+    const first = await fetchSlotDetail(key, limit)
+    /* Coverage, MEASURED against the rows this pane holds -- the same check
+     * `switchSlot` runs after its bounded read, for the same reason: the window
+     * extends BACKWARD from the newest row, so a pane parked on a head it paged into
+     * holds rows a newest-N window never reaches however exactly that window is sized
+     * to the cache's count, and this reducer replaces rather than merges when nothing
+     * anchors. A bare count cannot distinguish a true truncation from a bounded
+     * snapshot that predates a concurrent sibling, and bounded and unbounded totals
+     * do not even count the same corpus while streaming. Always close an observed
+     * coverage hole, then let the reducer's ordered comparable-total check decide
+     * whether rows were actually removed. */
+    if (limit !== undefined && slotCoverageShortfall({ cached: cache, window: first.messages }) > 0) {
+      const wide = await fetchSlotDetail(key)
+      /* Carry the bounded read's total unconditionally, exactly as `switchSlot` does
+       * after its own coverage retry. The unbounded handler counts the RAW window --
+       * every per-turn `done` row included, rows the bounded path collapses away --
+       * whether or not the slot is running, so `wide.total` is never in the same
+       * units as the bounded counts the reducer compares it against. Storing it as
+       * the baseline makes the next bounded warm's smaller collapsed count read as a
+       * server shrink, which discards the mid-turn streaming row the page cannot
+       * vouch for and restarts the in-flight reply mid-sentence. */
+      return { ...wide, comparableTotal: first.total, warmSeq }
+    }
+    return { ...first, warmSeq }
   },
 )
 
@@ -4833,10 +4995,23 @@ const chatSlice = createSlice({
      *  merged into it (see the `tool_call` case in useWebSocket) without a
      *  refinement of one call inheriting a sibling's purpose when tools run in
      *  parallel. */
-    setSlotStatusDetail(state, action: PayloadAction<{ slot: string; kind: string; text: string; ts: number; toolName?: string; derivedTitle?: string; derivedAction?: ToolAction; derivedMore?: number; toolCallId?: string }>) {
+    setSlotStatusDetail(state, action: PayloadAction<SlotStatusDetail & { slot: string }>) {
       const { slot, ...detail } = action.payload
       if (isUnsafeKey(slot)) return
       state.slotStatusDetail[safeKey(slot)] = detail
+    },
+    /** Remember that the "Request a Feature" action created `slot`, so a later
+     *  `usage_limit` error row in it can offer the feature-request form (#13342).
+     *  Written right after the slot exists and BEFORE the send settles: the
+     *  refusal arrives over the WebSocket once the turn has started, so a marker
+     *  written only on a happy receipt would miss the one case it exists for.
+     *  Tolerates a preloaded state without the field (older persisted shapes,
+     *  partial test stores). */
+    markFeatureRequestSlot(state, action: PayloadAction<string>) {
+      const slot = action.payload
+      if (!slot) return
+      if (!Array.isArray(state.featureRequestSlots)) state.featureRequestSlots = []
+      if (!state.featureRequestSlots.includes(slot)) state.featureRequestSlots.push(slot)
     },
     clearMessages(state) { state.messages = []; setPagingCursor(state, false, 0); state.voiceAudio = null; state.voicePlaying = false; if (state.activeSlot) delete state.thinkingOrphans?.[safeKey(state.activeSlot)]; if (state.activeSlot) evictMcpApps(state, state.activeSlot); if (state.activeSlot) writeSlotPage(state, state.activeSlot, [], false) },
     /** A server-confirmed clear for a slot that is NOT the active view. The
@@ -5676,7 +5851,7 @@ const chatSlice = createSlice({
         if (existing) {
           if (action.payload.tool) existing.text = action.payload.tool
           if (action.payload.purpose) existing.purpose = action.payload.purpose
-          if (action.payload.input_preview) existing.input = clampToolOutput(action.payload.input_preview)
+          if (action.payload.input_preview) setClampedField(existing, 'input', action.payload.input_preview)
           if (action.payload.kind) existing.kind = action.payload.kind
           if (action.payload.is_shell !== undefined) existing.is_shell = action.payload.is_shell
           if (action.payload.tool_name) existing.tool_name = action.payload.tool_name
@@ -5689,7 +5864,9 @@ const chatSlice = createSlice({
       }
       // `input` is fed by the server's `input_preview`, which `_redact_tool_field`
       // caps at the same 1 MB as a result, so it takes the same clamp.
-      log.push({ type: 'tool', text: action.payload.tool, purpose: action.payload.purpose, input: clampToolOutput(action.payload.input_preview), kind: action.payload.kind, ts: Date.now(), auto: action.payload.auto, tool_call_id: action.payload.tool_call_id, is_shell: action.payload.is_shell, tool_name: action.payload.tool_name, mcp_server: action.payload.mcp_server })
+      const entry: ToolActivity = { type: 'tool', text: action.payload.tool, purpose: action.payload.purpose, kind: action.payload.kind, ts: Date.now(), auto: action.payload.auto, tool_call_id: action.payload.tool_call_id, is_shell: action.payload.is_shell, tool_name: action.payload.tool_name, mcp_server: action.payload.mcp_server }
+      setClampedField(entry, 'input', action.payload.input_preview)
+      log.push(entry)
       if (log.length > 100) log.splice(0, log.length - 100)
     },
     sseActivityEvent(state, action: PayloadAction<{ slot: string; kind: string; text: string; approval_id?: string; approval_type?: string }>) {
@@ -5775,7 +5952,7 @@ const chatSlice = createSlice({
           if (log[i].type === 'tool' && (!tid || !log[i].tool_call_id)) { target = i; break }
         }
       }
-      if (target >= 0) log[target].output = clampToolOutput(action.payload.output)
+      if (target >= 0) setClampedField(log[target], 'output', action.payload.output)
     },
     /** Store an MCP App (SEP-1865) render payload, keyed by BOTH its session
      *  and tool_call_id (see mcpAppKey): the session scope means an ACP
@@ -6117,13 +6294,26 @@ const chatSlice = createSlice({
       if (idx >= 0) msgs.splice(idx, 1)
     },
     /** Edit a queued message in place (from backend queue_edit WS event or optimistic local update). */
-    editQueuedMessage(state, action: PayloadAction<{ slot: string; queue_id: string; content: string }>) {
-      const { slot, queue_id, content } = action.payload
+    /** Rewrite a queued row's text. `attachments` is the server's post-edit
+     *  attachment lists (from the `queue_edit` frame's `meta`): when present it
+     *  REPLACES the row's lists -- an edit that removes a marker prunes and
+     *  renumbers the entry's lists on the server, so the pre-edit lists no
+     *  longer index the renumbered markers and a later cancel would restore
+     *  nothing from them. An empty object clears the lists (the frame carries
+     *  no `meta` once every marker is gone). Omitted by the optimistic local
+     *  edit, which cannot know how the server pruned them. */
+    editQueuedMessage(state, action: PayloadAction<{ slot: string; queue_id: string; content: string; attachments?: QueueEntryAttachments }>) {
+      const { slot, queue_id, content, attachments } = action.payload
       if (isUnsafeKey(slot)) return
       const msgs = slot === state.activeSlot ? state.messages : state.slotMessages[slot]
       if (!msgs) return
       const idx = msgs.findIndex(m => m.role === 'queued' && (m.meta?.queueId as string) === queue_id)
-      if (idx >= 0) msgs[idx].content = content
+      if (idx < 0) return
+      msgs[idx].content = content
+      if (attachments) {
+        const { files: _f, dirs: _d, ...rest } = msgs[idx].meta ?? {}
+        msgs[idx].meta = { ...rest, ...attachments }
+      }
     },
     /** Reorder queued messages to match the given queue-id sequence (from the
      *  backend queue_reorder WS event or an optimistic local update). Queued
@@ -6148,16 +6338,18 @@ const chatSlice = createSlice({
     },
     /** Add a queued message (from backend queue_push WS event). */
     appendQueuedMessage: {
-      reducer(state, action: PayloadAction<{ slot: string; content: string; ts: string; queueId: string }>) {
-        const { slot, content, ts, queueId } = action.payload
+      reducer(state, action: PayloadAction<{ slot: string; content: string; ts: string; queueId: string; meta?: unknown }>) {
+        const { slot, content, ts, queueId, meta } = action.payload
         const msgs = slot === state.activeSlot ? state.messages : (state.slotMessages[safeKey(slot)] ??= [])
         // A row with this queueId may ALREADY exist: slot-detail hydration
         // can land before a delayed `queue_push` for the same entry. Appending
         // blindly would duplicate the row; keep the existing one.
         if (msgs.some(m => m.role === 'queued' && (m.meta?.queueId as string) === queueId)) return
-        msgs.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId } })
+        // Same row shape as `hydrateQueuedBubbles`: the frame's attachment
+        // lists ride the row so a cancel restores from them.
+        msgs.push({ role: 'queued', content, cls: 'msg msg-queued', ts, meta: { queueId, ...queueEntryAttachments(meta) } })
       },
-      prepare(payload: { slot: string; content: string; ts: string; queue_id?: string }) {
+      prepare(payload: { slot: string; content: string; ts: string; queue_id?: string; meta?: unknown }) {
         return { payload: { ...payload, queueId: payload.queue_id || crypto.randomUUID() } }
       },
     },
@@ -6761,8 +6953,18 @@ const chatSlice = createSlice({
         const priorSeq = state.slotServerTotalSeq?.[safeKey(key)]
         const staleTotal = typeof warmSeq === 'number' && typeof priorSeq === 'number'
           && warmSeq < priorSeq
-        const serverShrank = typeof priorTotal === 'number' && typeof total === 'number'
-          && total < priorTotal && !staleTotal
+        // The payload's own `total` counts the RAW window: a coverage retry answers
+        // with the unbounded read, whose count includes every per-turn `done` row
+        // and every unfolded chunk run, running or idle. The retained baseline is
+        // the settled collapsed count, so a comparison against it must use the
+        // collapsed count the retry carries (`comparableTotal`). ONE value, read
+        // at every comparison site below and at the retain call: a raw count at
+        // any one of them reads a rewind as growth and a same-count rewrite as a
+        // newer row, restoring discarded rows and rendering a reply twice.
+        const comparable = (action.payload as { comparableTotal?: number }).comparableTotal
+        const cmpTotal = comparable ?? total
+        const serverShrank = typeof priorTotal === 'number' && typeof cmpTotal === 'number'
+          && cmpTotal < priorTotal && !staleTotal
         const anchorIds = anchorIdx >= 0 ? rowIdentities(prior[anchorIdx]) : []
         const warmAnchorIdx = warmed.findIndex(m => rowIdentities(m).some(id => anchorIds.includes(id)))
         // A `streaming` row is minted client-side by the first chunk and carries
@@ -6809,7 +7011,7 @@ const chatSlice = createSlice({
         // A rewrite REPLACES a reply, so the count holds while the post-anchor rows
         // differ. Equal tail LENGTH is what separates that from a real newer row.
         const sameCountRewrite = rescuable.length > 0 && warmAnchorIdx >= 0 && !staleTotal
-          && typeof priorTotal === 'number' && typeof total === 'number' && total === priorTotal
+          && typeof priorTotal === 'number' && typeof cmpTotal === 'number' && cmpTotal === priorTotal
           && prior.length - anchorIdx === warmed.length - warmAnchorIdx
         const newerTail = sameCountRewrite ? [] : rescuable
         // A confirmed shrink means those rows were REMOVED, so the disjoint branches
@@ -6854,7 +7056,13 @@ const chatSlice = createSlice({
         const boundedLen = boundaryIdx >= 0 ? boundaryIdx + 1 : pageRows.length
         writeSlotPage(state, key, revived, warmIsPrefix ? hasMore : undefined,
           warmIsPrefix && hasMore ? boundedLen : undefined)
-        retainServerTotal(state, key, total, running, warmSeq, action.payload.boundedRead)
+        // The baseline retained for the next warm is the same collapsed count the
+        // comparisons above read (`cmpTotal`), never the raw wide count: the raw
+        // one is not comparable with the collapsed counts later pages report.
+        retainServerTotal(
+          state, key, cmpTotal, running, warmSeq,
+          comparable !== undefined || action.payload.boundedRead,
+        )
         // Idle the per-slot run indicator only when the server says the turn is
         // NOT running. This is a pure non-regression gate for the reconnect
         // caller (which warms slots MID-TURN): idling is idempotent with the
@@ -7113,7 +7321,7 @@ const chatSlice = createSlice({
 
 export const {
   setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, clearSwitchSlotGone, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  removeThinking, confirmOptimisticSend, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, markFeatureRequestSlot, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
@@ -7130,6 +7338,17 @@ export function selectAutomationForSlot(
 ): AutomationRecord | null {
   if (isUnsafeKey(slotKey)) return null
   return automationForSlot(state.chat.automations, safeKey(slotKey))
+}
+
+/** True when the header's "Request a Feature" action created `slotKey` in this
+ *  tab (see `markFeatureRequestSlot`). Tolerates a state without the field. */
+export function selectIsFeatureRequestSlot(
+  state: { chat: Pick<ChatState, 'featureRequestSlots'> },
+  slotKey: string | null | undefined,
+): boolean {
+  if (!slotKey) return false
+  const marked = state.chat.featureRequestSlots
+  return Array.isArray(marked) && marked.includes(slotKey)
 }
 
 export default chatSlice.reducer

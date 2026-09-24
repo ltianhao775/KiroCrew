@@ -88,6 +88,8 @@ with no row here.
      - pre-session registry query (whether enrolled members can load a full saved spec)
    * - ``ACP_BACKENDS_MEMBER_DISPATCH``
      - driver-internal (whether a per-session tool set can be mounted)
+   * - ``ACP_BACKENDS_MEMBER_PANEL``
+     - driver-internal (whether a member's own webview can be mounted)
    * - ``ACP_BACKENDS_STEER``
      - pre-session registry query (whether ``_session/steer`` exists)
    * - ``ACP_BACKENDS_COMPACT``
@@ -134,6 +136,11 @@ with no row here.
        as two config-option writes)
    * - ``effort_config_option_id``
      - driver-internal (which ``configId`` carries the reasoning effort)
+   * - ``effort_config_option_value``
+     - driver-internal (which VALUE that option spells a Crew effort level with)
+   * - ``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION``
+     - driver-internal (whether the ADVERTISED option, rather than Crew's model
+       registry, answers that this session takes an effort level and which ones)
    * - ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``
      - semantic question (``SessionCapabilities.resolves_model_from_advertised_list``)
    * - ``ACP_BACKENDS_SEED_LOCAL_SETTINGS``
@@ -148,6 +155,11 @@ with no row here.
      - pre-session registry query (whether the dashboard may skip a session reset)
    * - ``ACP_BACKENDS_STRUCTURED_REFUSAL``
      - driver-internal (whether the metadata refusal parser is consulted)
+   * - ``ACP_BACKENDS_HOOKS_LIST``
+     - driver-internal (whether this harness's agent asks its client for the hooks
+       matching a trigger, read by the session dispatch loop that answers the two
+       read-only hook methods; no consumer above the boundary asks it, and the
+       capability that would make an agent use the channel is not announced)
    * - ``ACP_BACKENDS_HOST_AUTH_CALLBACK``
      - driver-internal (whether the reader loop may answer the engine's
        ``_kiro/auth/getAccessToken`` from Crew's own vault)
@@ -180,6 +192,7 @@ seam). Both already existed; neither gained a member here.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, FrozenSet, Mapping, Set
@@ -465,16 +478,20 @@ ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset(
 #:   creates or restores the session. The read-back is on the SAME connection as the
 #:   session -- no second child, and no window in which the session is live and the
 #:   mode is unconfirmed. See :data:`Routing.VERIFIED_SEEDED_SETTINGS`.
-#: ``ACP_BACKEND_DEEPSEEK`` is NOT included, and it fails the SECOND condition
-#: rather than the first: it has an install probe, and its tool calls are not routed.
-#: Its sandbox decides them itself -- an in-policy action runs silently, an
-#: out-of-policy one is denied with the denial in the tool result -- and
-#: ``session/request_permission`` carries only a model-initiated request to escalate
-#: past that sandbox. So Crew's PreToolUse gate, and with it the bundled
-#: denied-command rules, the sensitive-path block and the governance ceiling, would
-#: run for almost nothing a session actually does. Offering the switch would be
-#: offering a harness Crew cannot gate; ``test_agent_backend_editable`` names it in
-#: ``NOT_SHIPPED_SELECTABLE`` with that reason.
+#: * ``backend_install`` probes for the ``dsh`` binary, one component, because the
+#:   harness's own release ships the executable that serves ACP from its ``acp``
+#:   profile.
+#: * its tool calls are ROUTED and the routing is VERIFIED. Its sandbox decides an
+#:   action itself and its own ``session/request_permission`` carries only a
+#:   model-initiated escalation -- so
+#:   the gate is not a setting Crew can seed but a PLUGIN Crew composes, through the
+#:   per-launch patch its own launcher documents. The plugin answers the harness's
+#:   ``tools/pre-execute`` waterfall with ``ask``, which its tools core resolves
+#:   through ``ctx.approval`` and its ACP bridge answers by emitting
+#:   ``session/request_permission`` per call. The read-back is the gate's own load
+#:   marker, keyed to this session's nonce and to Crew's sealed file, read before the
+#:   first prompt. See :data:`Routing.VERIFIED_GATE_EXTENSION` and
+#:   :data:`Readback.LOAD_MARKER`.
 BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset(
     {
         ACP_BACKEND_KIRO,
@@ -484,6 +501,7 @@ BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset(
         ACP_BACKEND_OPENCODE,
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
+        ACP_BACKEND_DEEPSEEK,
     }
 )
 
@@ -796,39 +814,213 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO})
 # session on it stays a plain chat: the dispatch tools are simply not
 # mounted, never mounted-and-refused.
 #
-# codex-acp is NOT a member, and the reason is scope rather than capability.
-# ``providers/mirrors/codex.py`` gives it the per-session mount its earlier
-# exclusion was waiting on, and its precondition needs no new gate: codex's
-# routing is ``SESSION_CONFIG``, the one mechanism in
-# ``tool_gate.ENFORCED_ROUTINGS``, so a session that cannot arm ``mode=read-only``
-# is refused before its first prompt — structurally stronger than claude's
-# ``settings.local.json`` ownership check, which covers a routing this core
-# declares and does not enforce. What is missing is a DECISION, not a
-# mechanism: mounting session control into a codex DM thread is a new capability,
-# separate from giving a codex session the tools its own agent spec declares, and
-# it belongs to whoever decides member threads should run on codex at all. Until
-# then a codex member session stays plain chat — the dispatch tools are simply not
-# mounted, never mounted-and-refused.
+# codex-acp is a member, and both things membership requires hold:
 #
-# opencode is excluded, but NOT any longer for want of a mount: it is a member of
-# ``ACP_BACKENDS_SESSION_MCP_ARRAY`` and its sessions now carry Crew's control
-# plane, so the transport a member dispatch would ride on exists. What is missing is
-# the same DECISION codex is waiting on -- mounting session control into a member DM
-# thread is a new capability, separate from giving a session the tools its own agent
-# spec declares. Until that is taken, an opencode member session stays plain chat:
-# the dispatch tools are simply not mounted, never mounted-and-refused.
+#   * the per-session mount exists -- ``providers/mirrors/codex.py`` projects the
+#     whole array onto ``session/new`` (codex is in
+#     ``ACP_BACKENDS_SESSION_MCP_ARRAY``), so the dispatch element rides the same
+#     channel the session's own servers do;
+#   * the session is GATED -- codex's routing is ``SESSION_CONFIG``, one of the
+#     three mechanisms in ``tool_gate.ENFORCED_ROUTINGS``, so a session that cannot
+#     arm ``mode=read-only`` is REFUSED before its first prompt. That is
+#     structurally stronger than claude's ``settings.local.json`` ownership check,
+#     which covers a routing this core declares and does not enforce.
+#
+# Membership is a DECISION on top of those two rather than a consequence of them:
+# mounting session control into a codex DM thread is a capability separate from
+# giving a codex session the tools its own agent spec declares. The decision is
+# that a member DM thread on codex holds the session-control tools.
+#
+# Membership un-withholds nothing, because the entry is Crew's OWN.
+# ``mirrors.identity.identity_bound_crew_servers`` keeps the dashboard server out of
+# the projection, and that withhold judges SPEC-DESCRIBED elements: one the agent
+# file names carries no session identity and answers ``identity_unattested`` to
+# every call. The dispatch entry comes from
+# ``members.member_dispatch_session_server`` carrying this session's key and its
+# signed stub token, the same way the projection rebuilds the control plane.
+#
+# opencode is a member, and it holds the same two things:
+#
+#   * the per-session mount exists -- opencode is in
+#     ``ACP_BACKENDS_SESSION_MCP_ARRAY`` and ``providers/mirrors/opencode.py``
+#     projects the array onto ``session/new``, so the dispatch element rides the
+#     channel the session's own servers ride. The harness reads no agent file of
+#     Crew's, so that array is the ONLY channel any tool set reaches it on;
+#   * the session is GATED -- its routing is ``VERIFIED_SEEDED_SETTINGS``, one of
+#     the three mechanisms in ``tool_gate.ENFORCED_ROUTINGS``. The value is seeded
+#     on ``OPENCODE_CONFIG_CONTENT`` and READ BACK from the harness's own config
+#     resolution before the first prompt, so a session that cannot establish the
+#     asking posture is REFUSED rather than run. The read-back is what makes this
+#     routing VERIFIED rather than merely seeded, and it is the whole of the
+#     difference from claude's.
+#
+# H6 is explicit that supporting one harness establishes nothing about another, so
+# the decision above is codex's alone and this membership carries its own: a member
+# DM thread on opencode holds the session-control tools.
+#
+# The mount asks for no owned permission file here, and must not: the client's
+# fallback answers for an UNENFORCED routing alone (``tool_gate.is_enforced`` is true
+# for this one), and ``providers/mirrors/opencode.py`` documents
+# ``permission_surface_owned`` as accepted-and-ignored for that same reason -- the
+# flag stands in for a read-back this harness performs, and no opencode session owns
+# a ``settings.local.json`` to satisfy it with.
+#
+# Membership un-withholds nothing, for the reason it un-withholds nothing on codex:
+# ``mirrors.identity.identity_bound_crew_servers`` keeps the dashboard server out of
+# the SPEC projection, because an element the agent file names carries no session
+# identity, while the entry mounted here is Crew's own and carries this session's key
+# and its signed stub token.
+#
+# One restriction the mount must NOT step over, and this harness is the only member it
+# binds: switching off a tool of the dashboard server is honoured here by withholding
+# the whole server (``registry.PerToolDeny.WHOLE_SERVER`` -- no deny slot on the
+# element, no file of Crew's, and no structured identity on a tool call to refuse by).
+# So ``AcpClient._append_member_dispatch_server`` withholds the mount for a member
+# whose dashboard server is narrowed, and that thread runs as plain chat rather than
+# reaching a tool the operator switched off. codex and claude keep their mounts there:
+# both hold a second channel that still refuses the call.
+#
+# Switching that server off WHOLE (``disabled``) is a stronger rule and carries no
+# backend condition, because the form has no per-call spelling for any harness to
+# refuse by (``acp.session_mcp.session_mcp_disabled_servers``). It binds on BOTH paths
+# that compose a session's array -- ``AcpClient``'s, which opencode and claude take,
+# and ``AcpRuntime``'s create and resume paths, which codex and KAS take -- so the
+# operator's switch-off reaches a member session whichever one runs.
+#
+# goose is a member, and it holds the same two things opencode does:
+#
+#   * the per-session mount exists, on a RECORDED ROUND TRIP rather than on an
+#     advertisement -- ``test/fixtures/acp_frames/goose/mcp-stdio-mount-live.jsonl``
+#     (goose 1.50.1) carries one ``session/new`` element shaped as
+#     ``acp.session_mcp`` emits, and the named child is asked ``initialize``,
+#     ``notifications/initialized``, ``tools/list`` and ``tools/call`` with the tool's
+#     own result coming back. So the element is MOUNTED and its tools are REACHABLE,
+#     not merely accepted. The harness reads no agent file of Crew's, so that array is
+#     the ONLY channel any tool set reaches it on;
+#   * the session is GATED -- its routing is ``VERIFIED_SEEDED_SETTINGS``, one of the
+#     three mechanisms in ``tool_gate.ENFORCED_ROUTINGS``. The asking mode is seeded on
+#     the environment and READ BACK off the ``session/new`` response before the first
+#     prompt, so a session that cannot establish the asking posture is REFUSED rather
+#     than run.
+#
+# H6 again: opencode's membership establishes nothing here, so both facts are held for
+# THIS harness. The mount asks for no owned permission file, and must not: the client's
+# fallback answers for an UNENFORCED routing alone (``tool_gate.is_enforced`` is true for
+# this one), and ``providers/mirrors/goose.py`` documents ``permission_surface_owned`` as
+# accepted-and-ignored for that same reason -- the flag stands in for a read-back this
+# harness performs, and no goose session owns a ``settings.local.json`` to satisfy it
+# with.
+#
+# One thing is goose's ALONE, and it is why this membership carries a test of its own:
+# goose is the only member of ``ACP_BACKENDS_META_IDENTITY``, so it is the only member
+# whose every tool approval runs ``AcpClient._refuse_identity_drift``. That refusal
+# judges a call's trusted server name against the names Crew PLACED on this session's
+# array plus the harness's own builtin extension -- and the dashboard server is neither
+# a builtin nor named by the agent template. It passes because both halves read the
+# SAME array: the mount is appended inside ``_resolve_session_mcp_servers``, whose
+# result is the cache ``_foreign_mcp_identity`` enumerates, so a server this session
+# mounted is a placed server by construction. The identity goose reports for it is the
+# element's own name (``_meta.goose.toolCall.extensionName``, the field the mount
+# fixture pins for ``crew-probe``), so a dispatch call arrives as a placed server
+# rather than as a drifted one.
+#
+# The per-tool rule binds here for opencode's reason: this harness's declared
+# ``registry.PerToolDeny`` is ``WHOLE_SERVER``, so narrowing a dashboard tool withholds
+# the whole mount and the thread runs as plain chat.
 #
 # pi is excluded on the evidence in ``ACP_BACKENDS_SESSION_MCP_ARRAY``: the array is
 # accepted and never forwarded to the agent, so a member dispatch mounted through it
 # would be inert.
-# deepseek is excluded, and it fails a HARDER test than either of the two above. It
-# does have the mount -- it is a member of ``ACP_BACKENDS_SESSION_MCP_ARRAY`` -- so
-# codex's first precondition holds. Codex's second does not: its routing is
-# ``Routing.UNVERIFIED``, outside ``tool_gate.ENFORCED_ROUTINGS``, so a session that
-# cannot be gated is never refused because nothing gates it. Mounting session control
-# into such a session would hand Crew's own control plane to a harness whose tool
-# calls Crew does not decide. A member session on it stays plain chat.
-ACP_BACKENDS_MEMBER_DISPATCH = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
+# deepseek is excluded, and since Crew's gate plugin was composed into it the ground
+# is H6 alone. It has the mount -- it is a member of ``ACP_BACKENDS_SESSION_MCP_ARRAY``
+# -- and its routing (``Routing.VERIFIED_GATE_EXTENSION``, read back from the
+# plugin's load marker before the first prompt) sits inside
+# ``tool_gate.ENFORCED_ROUTINGS``, so both of codex's preconditions now hold where
+# the second once failed. What it lacks is the DECISION for THIS harness: H6 is
+# explicit that supporting one harness establishes nothing about another, and no
+# member-dispatch round trip has been driven on it. A member session on it stays
+# plain chat -- the dispatch tools are not mounted, never mounted-and-refused.
+#
+# WHERE the mount happens differs by backend, and opencode's is the client's.
+# ``AcpClient._append_member_dispatch_server`` serves the backends whose array the
+# CLIENT composes -- claude's and opencode's -- while codex and KAS are served by
+# ``AcpRuntime``: their arrays come from ``AcpRuntime._mirrored_session_mcp`` and
+# ``create_session`` / ``load_session`` append the entry themselves, on a non-empty
+# ``member_session_key``. That key is where membership is read
+# (``providers/acp.py`` ``_member_session_key``), which is why adding a backend here
+# is the whole of the change for a runtime-served harness. Both establishment paths
+# carry it, because ``session/load`` re-initializes a session's MCP servers and a
+# resume that skipped the append would strip a member thread of its tools
+# mid-conversation.
+#
+# The client path's own PRECONDITION is read from the routing rather than from one
+# harness's flag: ``tool_gate.is_enforced``. A harness whose routing this core
+# enforces needs nothing further -- an ungated session never reaches a prompt. A
+# harness whose routing is declared-but-unenforced (claude) additionally needs Crew
+# to OWN the session's native permission file, because a tool pre-approved in a file
+# Crew does not own never sends ``session/request_permission`` and Crew's gate never
+# fires. Reading the flag for a harness whose mirror documents it as
+# accepted-and-ignored would withhold every member's tools on a condition that
+# cannot describe that backend.
+ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
+    {
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_GOOSE,
+    }
+)
+
+# Backends a crew member's OWN WEBVIEW may be mounted into (``kirocrew-panel``:
+# ``panel_publish``, ``panel_templates``).
+#
+# Its own set, and its own argument, because H6 requires membership to be opted
+# into PER CAPABILITY: supporting session control establishes nothing about the
+# panel, so reusing ``ACP_BACKENDS_MEMBER_DISPATCH`` would grant a distinct
+# capability on evidence gathered for a different one. The two memberships happen
+# to coincide today; what must not coincide is the DECISION, and a backend added
+# to one set does not join the other.
+#
+# The panel asks a SMALLER question than session control does, which is why every
+# dispatch-capable harness also clears this one. Session control needs a
+# server-side ownership fence (``created_by``) to bound which OTHER sessions a
+# member may drive; the panel reaches no other session at all. ``panel_publish``
+# takes no crew or session argument, resolves the publishing crew strictly from
+# the calling session, and refuses a subagent, so the worst an auto-approved call
+# can do is rewrite the caller's own drawer. What the panel still needs is exactly
+# what makes an approval-free grant safe to project at all, and it is the same
+# two preconditions the dispatch set is argued on:
+#
+# * a session-level ``mcpServers`` array this core composes, so the element can
+#   carry the session identity the panel server's tool-policy read demands --
+#   ``ACP_BACKENDS_SESSION_MCP_ARRAY`` for the client-composed harnesses, and
+#   ``AcpRuntime``'s own array for codex and KAS; and
+# * a permission surface Crew either gates (``tool_gate.is_enforced``) or owns
+#   (claude's ``settings.local.json``), so a verb Crew did not grant is not
+#   silently pre-approved in a file Crew does not write.
+#
+# pi and deepseek are excluded for the reasons the dispatch set states and neither
+# reason is about session control specifically: pi accepts the array and never
+# forwards it, so a mounted panel server would be inert, and deepseek's routing is
+# ``Routing.UNVERIFIED``, so a session that cannot be gated is never refused --
+# projecting an approval-free grant onto a harness whose tool calls Crew does not
+# decide is the thing both exclusions protect against.
+#
+# kiro is excluded and cannot be added by this set alone: a member session's key is
+# what every mount reads, and ``providers/acp.py`` ``_member_session_key`` gates
+# that key on ``ACP_BACKENDS_MEMBER_DISPATCH``. So this set decides whether a
+# member session that EXISTS gets a panel; whether one exists at all is that
+# gate's decision, and a backend must clear both.
+ACP_BACKENDS_MEMBER_PANEL = frozenset(
+    {
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_GOOSE,
+    }
+)
 
 # Backends implementing the ``_session/steer`` extension (mid-turn steer).
 # claude-agent-acp does not implement it, so a steer sent there is answered with
@@ -1382,16 +1574,24 @@ ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
 # for: the same ``session/new`` result that advertises its ``model`` select
 # advertises a ``mode`` select beside it and no ``effort`` option at all.
 #
-# pi is NOT a member for the same kind of reason: the option beside its ``model``
-# select is ``thought_level`` (off ... xhigh), a different id with a different
-# vocabulary, and this set names the harnesses whose option is ``effort``.
+# pi IS a member, and joins under its OWN spelling rather than the default one: the
+# option beside its ``model`` select is ``thought_level``, offering off, minimal,
+# low, medium, high and xhigh, and describing itself as "Set the reasoning effort
+# for this session". ``test/fixtures/acp_frames/pi/session-live.jsonl`` carries that
+# select off a live ``session/new`` result, which is the evidence this membership
+# rests on. A DIFFERENT id is not an absent channel -- resolving the id per harness
+# is what ``EFFORT_CONFIG_OPTION_IDS`` below already exists for, and reading the
+# difference as absence is what left this harness reporting no effort control at
+# all. Its vocabulary differs too, and that half is answered by
+# ``EFFORT_CONFIG_OPTION_VALUES``: membership says the channel exists, one table
+# says what to call the OPTION and the other what to call the LEVEL.
 #
 # deepseek IS a member: the same ``session/new`` result carries both selects, the
 # effort one offering off, low, high and max. It advertises that option under its own
 # id, ``reasoning_effort``, which ``EFFORT_CONFIG_OPTION_IDS`` below records --
 # membership says the channel exists, the table says what to call it.
 ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION = frozenset(
-    {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_DEEPSEEK}
+    {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_DEEPSEEK, ACP_BACKEND_PI}
 )
 
 # Backends whose ADVERTISED model ids are ``<model>[<effort>]`` pairs that the
@@ -1408,9 +1608,10 @@ ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS = frozenset({ACP_BACKEND_CODEX})
 
 # The ``configId`` each backend spells its reasoning-effort option with. One home
 # for a fact that is per-harness vocabulary, not a constant: claude-agent-acp
-# advertises ``effort`` and codex-acp advertises ``reasoning_effort``, and a
-# session that writes the other one's spelling is answered with "unknown config
-# option" and silently keeps whatever effort it already had.
+# advertises ``effort``, codex-acp advertises ``reasoning_effort`` and pi-acp
+# advertises ``thought_level``, and a session that writes another one's spelling is
+# answered with "unknown config option" and silently keeps whatever effort it
+# already had.
 #
 # Opt-in by exception (harness-parity H13): the default is the ``effort`` spelling
 # every existing member of ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` runs through,
@@ -1423,11 +1624,50 @@ ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS = frozenset({ACP_BACKEND_CODEX})
 EFFORT_CONFIG_OPTION_IDS: Mapping[str, str] = {
     ACP_BACKEND_CODEX: "reasoning_effort",
     ACP_BACKEND_DEEPSEEK: "reasoning_effort",
+    ACP_BACKEND_PI: "thought_level",
 }
 
 #: The spelling used by every backend without a row in
 #: ``EFFORT_CONFIG_OPTION_IDS``.
 DEFAULT_EFFORT_CONFIG_OPTION_ID = "effort"
+
+# Backends whose ADVERTISED effort option answers two questions Crew's model
+# registry answers everywhere else: whether this session takes an effort level at
+# all, and which levels may be written. A member advertises the option per
+# SESSION rather than per model, so the option served on ``session/new`` is the
+# authority and the registry cannot speak for it.
+#
+# Membership is what makes the channel above REACHABLE, and the two are separate
+# claims rather than one: ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` says a change
+# travels as ``session/set_config_option``, and this set says who decides there is
+# a level to send. A harness in the first and not the second is asked
+# ``model_supports_effort``, which is a NAME test -- it answers True for the
+# Claude and GPT families and False for everything it does not recognise, so on a
+# harness serving the operator's own model ids it answers False for every ordinary
+# session and the effort control never appears.
+#
+# pi is a member: its ids are ``provider/model`` pairs out of the operator's own
+# ``models.json`` (``ollama/llama3.2:3b`` in
+# ``test/fixtures/acp_frames/pi/session-live.jsonl``), which no registry entry and
+# no name heuristic carries, while the ``thought_level`` select sits on the same
+# ``session/new`` result for all of them.
+#
+# deepseek is NOT a member, though its model ids are equally foreign to the
+# registry and it advertises its own ``reasoning_effort`` select. Membership here
+# would light a write path whose vocabulary gap is unmeasured: deepseek advertises
+# off, low, high and max, so Crew's ``medium`` and ``xhigh`` land on nothing it
+# offers, and ``EFFORT_CONFIG_OPTION_VALUES`` carries no deepseek row to fold them
+# onto. A member whose stored level is silently dropped at its own cold start is
+# the defect this set exists to remove, so deepseek waits for its own fold rows
+# and its own round-trip coverage rather than riding in on pi's.
+#
+# The kiro family and claude are NOT members, and that is the split this set
+# exists for: there the level rides the MODEL. kiro-cli refuses effort with
+# "Effort configuration is currently not available on <model>", and
+# claude-agent-acp rebuilds its effort options per model from
+# ``supportedEffortLevels`` -- so the registry, which knows which model families
+# take a level, is the right authority for them.
+ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION = frozenset({ACP_BACKEND_PI})
 
 
 def effort_config_option_id(backend: str) -> str:
@@ -1442,6 +1682,56 @@ def effort_config_option_id(backend: str) -> str:
     skips, so the session runs an effort the UI does not report.
     """
     return EFFORT_CONFIG_OPTION_IDS.get(backend, DEFAULT_EFFORT_CONFIG_OPTION_ID)
+
+
+# What each backend calls a LEVEL, where its own vocabulary omits one of Crew's.
+# The sibling of ``EFFORT_CONFIG_OPTION_IDS`` and kept beside it: that table answers
+# what to call the OPTION, this one what to call the value written into it, and both
+# are per-harness vocabulary rather than a constant.
+#
+# Asked only where the two vocabularies genuinely differ, so most harnesses have no
+# row. Crew's ladder (``kiro_crew.effort.EFFORT_LEVELS``) is low, medium, high,
+# xhigh, max; pi's ``thought_level`` is off, minimal, low, medium, high, xhigh. Every
+# Crew level but ``max`` is spelled identically, so pi's row is exactly that one
+# fold, onto the ceiling its own capture advertises
+# (``test/fixtures/acp_frames/pi/session-live.jsonl``). pi's two EXTRA values are not
+# folds in the other direction and are absent here deliberately: the dropdown is
+# filled from what the harness advertised, so a member picking ``minimal`` sends
+# ``minimal``, and nothing maps a Crew level onto ``off`` -- clearing the level is
+# ``clear_effort``, not a level of its own.
+#
+# A DECLARED fold and not the reactive step-down in
+# ``AcpProvider._set_effort_config_option``, which is why this table exists rather
+# than the ladder being left to cover it. That step-down descends only when the
+# refusal is RECOGNISED, and ``_is_config_value_rejection`` recognises a bare
+# ``-32602`` on per-adapter grounds its own docstring states -- along with the
+# requirement that a harness joining ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` have
+# its ``-32602`` semantics checked before it joins. The pi corpus carries no
+# config-value refusal at all, so pushing ``max`` to pi would rest on an unchecked
+# guess: read as a value refusal it descends correctly, read as anything else it
+# propagates -- and on the live-change path that resets the session. Folding before
+# the write means pi is never asked for a value it never advertised, and the ladder
+# stays the backstop for the per-model ceilings it was built for.
+EFFORT_CONFIG_OPTION_VALUES: Mapping[str, Mapping[str, str]] = {
+    ACP_BACKEND_PI: {"max": "xhigh"},
+}
+
+
+def effort_config_option_value(backend: str, level: str) -> str:
+    """The value *backend*'s effort option spells Crew's *level* with.
+
+    The value-side twin of :func:`effort_config_option_id`, read by the same sites
+    for the same reason: the dashboard's live change, the startup application of a
+    persisted slot level, the knowledge pool's apply, and the effort half of a
+    ``<model>[<effort>]`` pick. One site resolving the level while another writes it
+    raw is the same silent divergence two spellings of the option id produce -- the
+    session runs a level the UI does not report, or the write is refused and read as
+    "this adapter has no effort selector".
+
+    A backend without a row, and a level a backend already spells the same way, come
+    back unchanged, so a harness whose vocabulary matches Crew's is untouched.
+    """
+    return EFFORT_CONFIG_OPTION_VALUES.get(backend, {}).get(level, level)
 
 
 # Backends that resolve the WIRE model id from the provider's OWN advertised list
@@ -1513,6 +1803,53 @@ ACP_BACKENDS_ADVERTISED_MODEL_SELECTION = frozenset(
 # one pinned environment variable, and its model travels as a config option, so a
 # warm-pool claim that switches model leaves nothing anywhere to re-seed.
 ACP_BACKENDS_SEED_LOCAL_SETTINGS = frozenset({ACP_BACKEND_CLAUDE})
+
+#: Operator lever for the permission mode a seeded session runs under, read by
+#: :func:`resolve_cc_permission_mode`. One name and one resolver, so a per-session
+#: lever and an operator-wide one cannot disagree about the same session.
+CC_PERMISSION_MODE_ENV = "KIROCREW_CC_PERMISSION_MODE"
+
+
+def resolve_cc_permission_mode(explicit: str | None, backend: str) -> str | None:
+    """The ``permissions.defaultMode`` a session seeds, or ``None`` to seed nothing.
+
+    Two opt-ins, one answer: the caller's own per-session request (the dashboard
+    slot's Auto intent) first, then :data:`CC_PERMISSION_MODE_ENV` for an operator
+    who wants every session on the backend's classifier. ``None`` leaves the
+    seeded ``settings.local.json`` without a ``defaultMode`` key at all, which is
+    the backend's own per-tool default -- so with nothing asking, nothing widens.
+
+    Fail-closed in both axes. A backend that seeds no per-session settings file
+    gets ``None``, asked of :data:`ACP_BACKENDS_SEED_LOCAL_SETTINGS` rather than of
+    the backend id, so a future seeding adapter joins the set instead of editing
+    this. And ``auto`` EXACTLY is the only value that resolves: a typo, a stray
+    space, a stale value or an inherited ``bypassPermissions`` resolves to ``None``
+    rather than to a wider surface than the one it names.
+
+    An unrecognised value is not silently dropped, because that is the failure this
+    whole path was reported for: a lever an operator believes is set, doing nothing,
+    with every other signal reading healthy. It warns and names what it read.
+    """
+    # Function-scope import, not module-scope: this module is on the load path of
+    # ``KiroCrewConfig.load()`` and stays free of ``kiro_crew.acp`` there (see the
+    # import-light note in ``kiro_crew.acp_backends``; ``test_acp_capability_sets_leaf``
+    # pins it in a subprocess).
+    from kiro_crew.acp.types import CC_PERMISSION_MODE_AUTO
+
+    if backend not in ACP_BACKENDS_SEED_LOCAL_SETTINGS:
+        return None
+    requested = explicit or os.environ.get(CC_PERMISSION_MODE_ENV) or ""
+    if requested == CC_PERMISSION_MODE_AUTO:
+        return CC_PERMISSION_MODE_AUTO
+    if requested:
+        logger.warning(
+            "permission mode %r is not recognised (only %r is); this session runs on "
+            "the backend's own per-tool default",
+            requested,
+            CC_PERMISSION_MODE_AUTO,
+        )
+    return None
+
 
 # Which model-registry NAMESPACE a backend's ids live in. This is a registry index
 # key, NOT a provider-identity check (see agent_sdk.provider_identity, note 3): a
@@ -1707,6 +2044,19 @@ ACP_BACKENDS_STRUCTURED_REFUSAL = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # provider key it needs is resolved inside the harness from its own credential store.
 ACP_BACKENDS_HOST_AUTH_CALLBACK = frozenset({ACP_BACKEND_KAS})
 
+#: Backends whose agent asks its CLIENT for the hooks matching a trigger, over
+#: ``_kiro/hooks/list`` and ``_kiro/hooks/sessionStart``. Only KAS defines that
+#: channel, and the answers carry operator-authored hook commands, so the route
+#: that serves them is gated on membership rather than on the method name alone:
+#: the dispatch loop it lives in is shared by every backend served by the shared
+#: runtime, and a non-member sending either method is answered ``-32601`` like any
+#: other method it does not serve.
+#:
+#: Membership does NOT mean the channel is live for that backend. Crew serves the
+#: two read-only methods and does not announce the capability that makes the agent
+#: use them, so a member asks nothing until that flag is set.
+ACP_BACKENDS_HOOKS_LIST = frozenset({ACP_BACKEND_KAS})
+
 # Backends that keep their OWN session records and resolve a resume from the
 # ``sessionId`` alone. For a member there is no Crew-side transcript to check
 # before ``session/load`` and no ``_kiro.dev/session_file`` to send with it; a
@@ -1884,20 +2234,20 @@ ACP_BACKEND_ROUTING: dict = {
     ACP_BACKEND_OPENCODE: Routing.VERIFIED_SEEDED_SETTINGS,
     ACP_BACKEND_PI: Routing.VERIFIED_GATE_EXTENSION,
     ACP_BACKEND_GOOSE: Routing.VERIFIED_SEEDED_SETTINGS,
-    # deepseek is ``UNVERIFIED`` on OBSERVATION, not for want of looking, and the
-    # distinction matters because its approval setting looks like a seed-and-verify
-    # case and is not one. Its ACP surface does advertise
-    # ``session/request_permission``, and its composition does carry an approval
-    # service whose policy Crew can pin and read back. What the wire shows is that
-    # neither decides a tool call: the sandbox permits an in-policy action silently
-    # and DENIES an out-of-policy one with the denial in the tool result, and the
-    # permission request carries only a MODEL-INITIATED ask to escalate past that
-    # sandbox -- refused outright when the model omits its justification. Four live
-    # captures across the confined and read-only postures raised no permission
-    # request at all. So a ``VERIFIED_SEEDED_SETTINGS`` entry here would read back a
-    # setting that governs escalations and assert a routing guarantee nothing
-    # performs, which is the one thing this table exists to prevent.
-    ACP_BACKEND_DEEPSEEK: Routing.UNVERIFIED,
+    # deepseek reaches the same member as pi, and by the same reasoning: the harness
+    # has no gate of its own that decides a TOOL CALL, so Crew loads one into it.
+    # Its sandbox permits an in-policy
+    # action silently, DENIES an out-of-policy one with the denial in the tool
+    # result, and its own ``session/request_permission`` carries only a
+    # MODEL-INITIATED ask to escalate past that sandbox, so its approval POLICY is
+    # real, readable, and routes nothing. That is why it is not
+    # ``VERIFIED_SEEDED_SETTINGS``. What it does answer is its own
+    # ``tools/pre-execute`` waterfall: a plugin returning ``{kind: 'ask'}`` makes its
+    # tools core resolve the call through ``ctx.approval``, which its ACP bridge
+    # answers by emitting ``session/request_permission`` per call. So the gate is an
+    # extension Crew composes, which is this member, and the frame corpus carries the
+    # live capture (``test/fixtures/acp_frames/deepseek/permission-request-live``).
+    ACP_BACKEND_DEEPSEEK: Routing.VERIFIED_GATE_EXTENSION,
 }
 
 
@@ -1954,6 +2304,55 @@ ACP_BACKEND_PERMISSION_SETTING: dict = {
 #: is package data resolved by the driver, not by this leaf.
 ACP_BACKEND_GATE_PROBE_COMMAND: dict = {
     ACP_BACKEND_PI: "kiro-crew-gate",
+    # deepseek's token is a PLUGIN name rather than a command name, because its
+    # composition has no command registry to register into -- see
+    # ``ACP_BACKEND_GATE_READBACK`` below for which read-back looks for it.
+    ACP_BACKEND_DEEPSEEK: "kiro-crew-tool-gate",
+}
+
+
+class Readback(str, Enum):
+    """HOW a ``VERIFIED_GATE_EXTENSION`` harness is asked whether the gate loaded.
+
+    The mechanism is one member of :class:`Routing` because the GUARANTEE is one
+    thing -- Kiro Crew's own gate, loaded into a harness that has none, confirmed
+    present before the first prompt -- but the QUESTION has to be asked in the
+    harness's own terms, and two harnesses do not answer the same way. This enum
+    is that difference, kept as data beside the routing table so a third harness
+    is a row rather than a branch in the verdict.
+
+    ``COMMAND_REGISTRY`` -- ask the harness. The extension registers a command and
+    the harness's own registry reports it with the file it was loaded from, so the
+    WITNESS is the harness: Crew reads back an answer it did not author. This is
+    the stronger of the two and is preferred wherever a harness offers it.
+
+    ``LOAD_MARKER`` -- ask Crew's own code, because the harness offers nothing to
+    ask. The plugin writes one file at a path Crew names in the child's
+    environment, carrying the probe name, the per-session nonce Crew issued, and
+    its own resolved module URL. Present-with-this-nonce-and-this-module proves
+    the plugin Crew shipped was composed, from Crew's file, in THIS session --
+    which is the precondition. It is weaker than the member above in one specific
+    way, stated rather than glossed: the witness is the gate itself, so it
+    attests that Crew's code ran and not that the harness reports it running. A
+    harness whose ACP surface adds no method, capability or ``_meta`` field -- which
+    is the dsh ACP profile's own declared invariant -- leaves no third option, and
+    a marker that is merely ABSENT refuses the session, so the failure direction
+    is closed either way.
+    """
+
+    COMMAND_REGISTRY = "command_registry"
+    LOAD_MARKER = "load_marker"
+
+
+#: Harness id -> how its ``VERIFIED_GATE_EXTENSION`` read-back is performed.
+#:
+#: A ``.get(backend, Readback.COMMAND_REGISTRY)`` read would be wrong here: a
+#: harness added to the routing table without a row would silently inherit a
+#: read-back its driver never implements and report ROUTED for it. So the lookup
+#: fails closed instead -- see :func:`gate_readback_for`.
+ACP_BACKEND_GATE_READBACK: dict = {
+    ACP_BACKEND_PI: Readback.COMMAND_REGISTRY,
+    ACP_BACKEND_DEEPSEEK: Readback.LOAD_MARKER,
 }
 
 
@@ -2169,3 +2568,14 @@ def permission_setting_for(backend: str) -> tuple:
 def gate_probe_command_for(backend: str) -> str:
     """The probe command *backend*'s gate extension registers, or ``""`` when none."""
     return ACP_BACKEND_GATE_PROBE_COMMAND.get(backend, "")
+
+
+def gate_readback_for(backend: str) -> Readback | None:
+    """How *backend*'s gate-extension read-back is performed, or ``None``.
+
+    ``None`` means this harness declares no read-back style, and every caller
+    treats that as a refusal rather than picking one: a harness routed through
+    :data:`Routing.VERIFIED_GATE_EXTENSION` whose style is unknown would otherwise
+    report ROUTED for a check its driver never runs.
+    """
+    return ACP_BACKEND_GATE_READBACK.get(backend)

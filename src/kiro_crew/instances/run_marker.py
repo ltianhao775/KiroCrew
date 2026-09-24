@@ -87,6 +87,17 @@ def pid_file_name(port: int) -> str:
     return f"{_MARKER_PREFIX}{int(port)}{_PID_SUFFIX}"
 
 
+def secret_file_name(port: int) -> str:
+    """File name of the credential sidecar written for a gateway serving *port*.
+
+    Public for the same reason as :data:`RUN_DIR_NAME`: a control plane reads a
+    pod's credential out of the pod's own isolated home, which :func:`secret_path`
+    cannot name because it resolves against the CALLING process's data home. The
+    name is produced here so the reader and the writer share one spelling.
+    """
+    return f"{_MARKER_PREFIX}{int(port)}{_SECRET_SUFFIX}"
+
+
 def _start_path_for(path: Path) -> Path:
     """Start-identity sidecar sitting beside the pid sidecar at *path*.
 
@@ -241,7 +252,7 @@ def secret_path(port: int) -> Path:
     Lives beside the marker and the pid sidecar, inside the ``0700`` ``run/``
     dir on the ``is_sensitive_path`` floor, and is written ``0600``.
     """
-    return _run_dir() / f"{_MARKER_PREFIX}{int(port)}{_SECRET_SUFFIX}"
+    return _run_dir() / secret_file_name(port)
 
 
 def read_secret(port: int) -> str:

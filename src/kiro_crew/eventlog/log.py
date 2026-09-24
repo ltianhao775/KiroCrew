@@ -31,8 +31,14 @@ import time
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from kiro_crew.crew_log.checkpoint import (
+    PrefixWitness,
+    prefix_admit,
+    prefix_unchanged,
+    prefix_witness,
+)
 from kiro_crew.crew_log.errors import (
     CODE_ALREADY_EXISTS,
     CODE_ALREADY_OWNED,
@@ -41,12 +47,15 @@ from kiro_crew.crew_log.errors import (
     CrewLogError,
 )
 from kiro_crew.crew_log.schema import APP_SOURCE_PREFIX, KIND_MEMBER
-from kiro_crew.crew_log.store import CrewLog, crew_log_path
+from kiro_crew.crew_log.store import CrewLog, crew_log_path, segment_first_seqs
 from kiro_crew.eventlog.types import (
     Event,
     is_contributed_event_type,
     is_known_event_type,
 )
+
+if TYPE_CHECKING:
+    from kiro_crew.projection import Admit
 
 #: The fixed emitter for every built-in event. These facts are observed BY the
 #: gateway about the member, never written by the member itself, which is why the
@@ -428,3 +437,110 @@ class MemberLog:
 
     def exists(self) -> bool:
         return CrewLog.exists(KIND_MEMBER, self.slug)
+
+    def checkpoint_identity(self) -> dict[str, Any] | None:
+        """The facts that say WHICH log a savepoint belongs to, or None when absent.
+
+        Two facts, and they are the same two the crew log's own savepoints compare,
+        read through that module's own public helpers so two spellings of "is this
+        the same log" cannot drift apart -- the one that said yes too often would
+        fold a retired file's state onto a live one's bytes:
+
+        * ``origin`` -- the file's creation identity. A member removed and recreated
+          under the same slug restarts its seqs, so once the new log has grown past a
+          stored watermark a seq check ALONE would pass, and the fold would resume
+          state derived from an unrelated log.
+        * ``first_seq`` -- the oldest surviving segment's first seq. Retention deletes
+          whole segments off the front, so a cold fold folds a window while a
+          savepoint still counts entries the file does not hold. The two answers
+          differ, and the savepoint's is the one no reader can reproduce.
+
+        Returned as a plain mapping because the projection kernel stores it VERBATIM
+        and never interprets a key: adding a third fact here retires this log's
+        existing savepoints and needs no change in the kernel.
+
+        ``None`` means "do not take the shortcut" -- no log, or an identity the store
+        could not answer for. A caller folds from the start, which costs more and is
+        never wrong.
+        """
+        self._ensure_loaded()
+        handle = self._crew_log
+        if handle is None:
+            return None
+        # Function-local: crew_log.projection imports the store and the session
+        # ledger, so a module-level import here would widen this module's import
+        # graph for one accessor -- the same reason that module keeps its own
+        # checkpoint import local.
+        from kiro_crew.crew_log.projection import log_origin
+
+        origin = log_origin(handle)
+        if origin is None:
+            return None
+        firsts = segment_first_seqs(KIND_MEMBER, self.slug)
+        if not firsts:
+            return None
+        return {"origin": origin, "first_seq": firsts[0]}
+
+    def checkpoint_admit(self, first_seq: int) -> Admit | None:
+        """The live-log condition a savepoint of this log must satisfy, or None.
+
+        :meth:`checkpoint_identity` covers what is fixed once the fold is done, and
+        equality is all it can do. This covers the one fact equality cannot hold: the
+        bytes a savepoint's state was folded from are still the bytes in the file.
+        :meth:`last_seq` records why this log needs it -- a damaged committed line is
+        skipped on load, so a reader loses that line and not the file. A cold fold
+        then omits what that line contributed while a savepoint written before the
+        damage keeps it, and because a resumed fold never revisits the region below
+        its watermark, the two reads disagree for the life of the member rather than
+        for one load. A savepoint may LAG; it may not hold a value no later read
+        reproduces.
+
+        The predicate is the crew log's own, not a second copy: it reads the digest
+        helpers that live on ``CrewLog`` precisely so one mechanism serves both
+        clients, and two spellings of this question would drift.
+
+        *first_seq* is the value :meth:`checkpoint_identity` reported, which bounds how
+        few raw records a prefix can hold.
+
+        ``None`` means "do not take the shortcut", the same answer and for the same
+        reason as an absent identity.
+        """
+        self._ensure_loaded()
+        handle = self._crew_log
+        if handle is None:
+            return None
+        return prefix_admit(handle, first_seq)
+
+    def checkpoint_witness(self, seq: int) -> PrefixWitness | None:
+        """The digest of this log's raw records through *seq*, or None.
+
+        Read this BEFORE the fold that consumes the file, and confirm it with
+        :meth:`checkpoint_prefix_unchanged` after the pass. A digest read only
+        afterwards can certify bytes the pass never saw: a consumed record that
+        changed in between is hashed together with state folded from its earlier
+        value, and every later resume recomputes the digest from those same changed
+        bytes, so the comparison passes and the state is served for the life of the
+        member while disagreeing with a cold fold.
+
+        ``None`` when *seq* is not a boundary this file resolves, which costs a
+        savepoint rather than recording one nothing can check.
+        """
+        self._ensure_loaded()
+        handle = self._crew_log
+        if handle is None:
+            return None
+        return prefix_witness(handle, seq)
+
+    def checkpoint_prefix_unchanged(self, witness: PrefixWitness) -> bool:
+        """Whether the records *witness* covers still hash to what it recorded.
+
+        Decode-free, and growth above the boundary is not a change: the walk stops at
+        the record count the witness names. This is what a stat cannot answer -- a
+        size and an mtime say the file moved, never whether the bytes already
+        consumed are the same bytes.
+        """
+        self._ensure_loaded()
+        handle = self._crew_log
+        if handle is None:
+            return False
+        return prefix_unchanged(handle, witness)

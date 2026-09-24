@@ -226,8 +226,8 @@ describe('TelemetryPanel — group by', () => {
     expect(screen.queryByText('A named conversation')).not.toBeInTheDocument()
     expect(document.querySelectorAll('table')).toHaveLength(1)
 
-    await userEvent.click(screen.getByRole('button', { name: 'Category' }))
-    await waitFor(() => expect(screen.getByText('background')).toBeInTheDocument())
+    await userEvent.click(screen.getByRole('button', { name: 'Origin' }))
+    await waitFor(() => expect(screen.getByText('all background')).toBeInTheDocument())
     expect(screen.queryByText('opus-5')).not.toBeInTheDocument()
   })
 })
@@ -335,22 +335,23 @@ describe('TelemetryPanel — latency distribution order', () => {
   })
 
   it('labels bg the same way in the session column and in the category grouping', async () => {
-    // `category_bg` was applied in the Session table's column but not in the
-    // Group-by-Category table, which renders through the shared share-columns —
-    // so ONE field read "background" in one view and the raw "bg" in the other.
+    // `category_bg` is applied in the Session table's column AND in the
+    // Group-by-Origin table, which renders through the shared share-columns —
+    // mapping it in only one view makes ONE field read its label in one place
+    // and the raw "bg" in the other.
     await mount(only({
       cost: cost({
         conversations: [convo({ slot: 'cron:default:nightly', category: 'bg', channel: 'cron' })],
         by_category: [{ name: 'bg', credits: 900, turns: 90, per_turn: 10, share_pct: 100 }],
       }),
     }))
-    await waitFor(() => expect(screen.getAllByText('background').length).toBeGreaterThan(0))
+    await waitFor(() => expect(screen.getAllByText('all background').length).toBeGreaterThan(0))
     // The session view must not show the raw enum.
     expect(screen.queryByText('bg')).toBeNull()
 
     // The category grouping must agree rather than drift back to the enum.
-    await userEvent.click(screen.getAllByRole('button', { name: 'Category' })[0])
-    await waitFor(() => expect(screen.getAllByText('background').length).toBeGreaterThan(0))
+    await userEvent.click(screen.getAllByRole('button', { name: 'Origin' })[0])
+    await waitFor(() => expect(screen.getAllByText('all background').length).toBeGreaterThan(0))
     expect(screen.queryByText('bg')).toBeNull()
   })
 

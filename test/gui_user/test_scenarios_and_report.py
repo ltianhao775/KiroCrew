@@ -24,12 +24,19 @@ KNOWLEDGE_NOTES_DIR = (
 
 SHIPPED_SMOKE = {
     "apps-discover-enable-research-lab",
+    "artifacts-library-table-and-kind-filter",
     "auth-sign-in-card-signed-out",
+    "capabilities-agents-list-and-open-editor",
+    "capabilities-skills-filter-and-open-builtin",
     "chat-activity-side-panel-toggle",
+    "chat-files-side-panel-browse",
     "chat-session-title",
     "chat-sessions-page",
     "chat-switch-seeded-sessions",
     "chat-turn-stats-footer",
+    "connections-services-search-and-mcp-list",
+    "memory-open-browser-from-overview",
+    "notifications-bell-sheet-open-close",
     "notifications-center-empty-state",
     "schedule-list-calendar-executions-views",
     "search-everywhere-jump-to-setting",
@@ -37,14 +44,24 @@ SHIPPED_SMOKE = {
     "settings-chat-toggle-show-timestamps",
     "settings-developer-panel-dev-mode-toggle",
     "settings-search-jump-to-theme",
+    "settings-security-docs-section",
+    "settings-security-layers-section",
+    "settings-security-rail-navigation",
+    "settings-security-rules-custom-deny",
+    "settings-security-trusted-apps-toggle",
     "settings-shortcuts",
     "settings-tab-rail-navigation",
     "settings-theme-toggle",
     "sidebar-folders-and-older-sessions",
     "sidebar-rail-collapse-expand",
+    "taskrunner-projects-page-compose",
 }
 SHIPPED = SHIPPED_SMOKE | {
+    "crewmate-chat-clean",
+    "crewmate-panel-tabs",
+    "crewmate-reply-thread",
     "knowledge-add-folder-source-and-scan",
+    "meet-crewmates-flow",
     "members-dm-hello",
     "members-private-memory-keeps-thread",
 }
@@ -69,8 +86,8 @@ class TestShippedScenarios:
             assert s.max_steps <= 14, s.name
         smoke_steps = sum(s.max_steps for s in smoke)
         smoke_seconds = sum(s.max_seconds for s in smoke)
-        assert smoke_steps == 190, f"smoke max_steps total is {smoke_steps}; re-pin"
-        assert smoke_seconds == 5100, f"smoke max_seconds total is {smoke_seconds}; re-pin"
+        assert smoke_steps == 307, f"smoke max_steps total is {smoke_steps}; re-pin"
+        assert smoke_seconds == 8420, f"smoke max_seconds total is {smoke_seconds}; re-pin"
 
     def test_nightly_includes_smoke(self) -> None:
         nightly = scenarios.select(scenarios.load_all(SCENARIOS_DIR), tier="nightly")
@@ -93,6 +110,39 @@ class TestShippedScenarios:
         assert any("3 supported files found" in step for step in sc.steps)
         assert any('"3 items"' in exp for exp in sc.expectations)
         assert any("/tmp/kirocrew-gui-user-test/team-notes" in step for step in sc.steps)
+
+    def test_rich_seed_artifacts_are_the_ones_the_scenario_reads(self) -> None:
+        # The Artifacts scenario names the three artifacts the `rich` seed ships and
+        # narrows the table to the one markdown artifact by slug and kind. An
+        # artifact renamed, re-kinded or dropped from the fixture without the
+        # scenario moving fails here rather than as a paid nightly run. The set is
+        # a copy of the `artifacts-library` fixture's, and the two are held equal
+        # so the copies cannot drift apart silently.
+        from kiro_crew.artifacts import ArtifactStore
+        from kiro_crew.testing.fixtures import seeded_home
+
+        def fingerprint(fixture: str) -> dict[str, tuple[str, str, int]]:
+            with seeded_home(fixture):
+                return {a.slug: (a.name, a.kind, a.version) for a in ArtifactStore().list()}
+
+        rich = fingerprint("rich")
+        assert rich == fingerprint("artifacts-library")
+        assert {slug: kind for slug, (_, kind, _) in rich.items()} == {
+            "pagination-design": "markdown",
+            "queue-badge": "svg",
+            "release-checklist": "widget",
+        }
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "artifacts-library-table-and-kind-filter.yaml")
+        first_step = sc.steps[0]
+        for name, _, _ in rich.values():
+            assert name in first_step, name
+        markdown = [(slug, *rest) for slug, rest in rich.items() if rest[1] == "markdown"]
+        assert len(markdown) == 1
+        slug, name, _, version = markdown[0]
+        assert any(
+            name in exp and f'"{slug}"' in exp and '"markdown"' in exp for exp in sc.expectations
+        )
+        assert any(f'"v{version}"' in exp for exp in sc.expectations)
 
     def test_explicit_name_selection(self) -> None:
         picked = scenarios.select(scenarios.load_all(SCENARIOS_DIR), names=["members-dm-hello"])
@@ -136,11 +186,30 @@ class TestShippedScenarios:
                 "sidebar-rail-collapse-expand",
             ],
             "search": ["search-everywhere-jump-to-setting"],
-            "members": ["members-dm-hello", "members-private-memory-keeps-thread"],
+            "members": [
+                "crewmate-chat-clean",
+                "crewmate-panel-tabs",
+                "crewmate-reply-thread",
+                "meet-crewmates-flow",
+                "members-dm-hello",
+                "members-private-memory-keeps-thread",
+            ],
+            "capabilities": [
+                "capabilities-agents-list-and-open-editor",
+                "capabilities-skills-filter-and-open-builtin",
+            ],
+            "connections": ["connections-services-search-and-mcp-list"],
+            "memory": ["memory-open-browser-from-overview"],
             "knowledge": ["knowledge-add-folder-source-and-scan"],
+            "artifacts": ["artifacts-library-table-and-kind-filter"],
+            "files": ["chat-files-side-panel-browse"],
             "apps": ["apps-discover-enable-research-lab"],
+            "task-runner": ["taskrunner-projects-page-compose"],
             "schedule": ["schedule-list-calendar-executions-views"],
-            "notifications": ["notifications-center-empty-state"],
+            "notifications": [
+                "notifications-bell-sheet-open-close",
+                "notifications-center-empty-state",
+            ],
             "auth": ["auth-sign-in-card-signed-out"],
             "settings": [
                 "settings-chat-toggle-show-timestamps",
@@ -150,6 +219,13 @@ class TestShippedScenarios:
                 "settings-tab-rail-navigation",
                 "settings-theme-toggle",
             ],
+            "security": [
+                "settings-security-docs-section",
+                "settings-security-layers-section",
+                "settings-security-rail-navigation",
+                "settings-security-rules-custom-deny",
+                "settings-security-trusted-apps-toggle",
+            ],
         }
         # FEATURES order, not alphabetical: chat is the product's primary surface.
         assert list(groups) == [
@@ -158,12 +234,19 @@ class TestShippedScenarios:
             "sidebar",
             "search",
             "members",
+            "capabilities",
+            "connections",
+            "memory",
             "knowledge",
+            "artifacts",
+            "files",
             "apps",
+            "task-runner",
             "schedule",
             "notifications",
             "auth",
             "settings",
+            "security",
         ]
 
     def test_members_scenario_holds_across_the_crew_mode_retirement(self) -> None:
@@ -177,6 +260,20 @@ class TestShippedScenarios:
             "Crew Members and Crew Mode" in preview_step
         )  # the longer title is still a valid reading
         assert any('"Crew Members" item appears in the left rail' in s for s in sc.steps)
+
+    def test_members_scenarios_hedge_the_card_label(self) -> None:
+        """A seeded member has no display name, so its card shows the id; every members scenario says so."""
+        for name in (
+            "members-dm-hello",
+            "members-private-memory-keeps-thread",
+            "crewmate-reply-thread",
+        ):
+            sc = scenarios.load_scenario(SCENARIOS_DIR / f"{name}.yaml")
+            card_steps = [s for s in sc.steps if "Nova Sky" in s]
+            assert card_steps, name
+            for step in card_steps:
+                assert 'may read "nova-sky"' in step, (name, step)
+            assert not any('named "Nova Sky"' in s for s in sc.steps), name
 
 
 def _write(tmp_path: Path, name: str, doc: dict) -> Path:
@@ -510,7 +607,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_11 of {len(scenarios.FEATURES)} features covered · 22 scenarios (19 smoke / 3 nightly)._"
+            f"_18 of {len(scenarios.FEATURES)} features covered · 39 scenarios (32 smoke / 7 nightly)._"
             in md
         )
         assert (
@@ -532,8 +629,9 @@ class TestReport:
         )
         # Uncovered features are the backlog.
         assert "## Not yet covered" in md
-        assert "- `artifacts` Artifacts" in md
+        assert "- `terminal` Terminal panel" in md
         assert "- `chat` Chat sessions" not in md
+        assert "- `files` File viewer & project files" not in md
 
     def test_features_catalog_without_a_run(self) -> None:
         md = report.render_features(scenarios.load_all(SCENARIOS_DIR))

@@ -179,8 +179,8 @@ export default function SettingsPage() {
     navigate({ pathname: target, search: rest ? `?${rest}` : '' }, { replace: true })
   }, [search, pathname, navigate])
 
-  // An embedded instance pane can't manage remote instances (single-level by
-  // design) — hide the Instances tab so a pane can't connect onward.
+  // An embedded instance pane can't manage remote crews (single-level by
+  // design) — hide the Remote Crew tab so a pane can't connect onward.
   const embedded = isEmbeddedPane()
   // Update nudge: dot on the About entry while an update is available. Two
   // independent sources, because they cover different installs: the Electron
@@ -220,6 +220,11 @@ export default function SettingsPage() {
       // Keyed apart from the main window: an embedded pane has a different tab
       // roster (no Instances), so the two must not restore each other's tab.
       rememberKey={embedded ? 'settings-embedded' : 'settings'}
+      // Desktop: search lives at the top of the sidebar rail (navTop), pinned
+      // while the tab list scrolls. Mobile: the same field is the floating
+      // bottom capsule (headerRight + bottom-float). Only one mounts per
+      // viewport, so passing both is not a double render.
+      navTop={<SettingsSearch />}
       headerRight={<SettingsSearch />}
       footer={<span className="text-[12px] text-muted">{i18nT('pages.settingsPage.kirocrew_v')}{version}</span>}
     >

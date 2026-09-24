@@ -21,6 +21,7 @@ from kiro_crew.config.schema import (
     SCHEMA_REGISTRY,
     config_entry_to_dict,
 )
+from kiro_crew.validation import _AGENT_NAME_RE
 
 
 @pytest.fixture(autouse=True)
@@ -300,6 +301,16 @@ class TestAgentCrudProperties:
                         },
                     )
                     create_data = await resp.json()
+                    # The route refuses, before anything else about the body is
+                    # judged, a name the roster (``GET /api/members``) would
+                    # skip: a non-ASCII letter, a leading or trailing ``-``/``_``.
+                    # The strategy stays wide on purpose so this branch is
+                    # exercised, not sidestepped.
+                    if not _AGENT_NAME_RE.match(name):
+                        assert resp.status == 400
+                        assert create_data["code"] == "invalid_agent_name"
+                        assert json.loads(tmp.read_text()) == _seed_config()
+                        return
                     if memory_store not in ("", "default"):
                         assert resp.status == 400
                         assert create_data["code"] == "member_memory_required"
@@ -308,6 +319,8 @@ class TestAgentCrudProperties:
                     assert resp.status == 200
                     private_store = create_data["memory_store"]
                     assert private_store != "default"
+                    # The immutable identity a client binds to (never the name).
+                    assert create_data["member_id"]
 
                     # List and verify
                     resp = await client.get("/api/agents")

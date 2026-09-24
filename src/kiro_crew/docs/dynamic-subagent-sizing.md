@@ -2,7 +2,7 @@
 
 Kiro Crew sizes the concurrent sub-agent cap **automatically** by default
 (`agent.max_subagents = 0`): at gateway startup it computes a sensible cap from
-the host's actual memory and CPU, plus a per-agent cost Kiro Crew *learns* from
+the host's actual memory, plus a per-agent memory cost Kiro Crew *learns* from
 past runs. A fixed number is wrong in both directions — it wastes capacity on a
 large host and over-commits a tiny one — so auto is the default; set an
 integer >= 3 to pin an explicit cap.
@@ -34,16 +34,19 @@ change it is re-measured by the next subagent-setting edit or a restart.
 
 For long-running work, new provider/tool stream activity can earn one additional
 slot after a clear observation window, without waiting for the task to finish.
-This probe requires queued work, measured host headroom and no provider throttle.
-An unchanged activity timestamp, a queued/stalled/parked run or an unreadable
-host probe cannot earn it. Successful completions still earn faster startup
+This probe requires queued work, free memory above the pressure line and no
+provider throttle. An unchanged activity timestamp, a queued/stalled/parked run
+or an unreadable memory probe cannot earn it. Successful completions still earn faster startup
 doubling; after pressure, growth remains bounded to one slot per clean window.
 The configured ceiling is never a command to start unnecessary workers.
 
-The configured ceiling and live growth bound are separate. The controller
-refreshes host headroom while running: memory headroom buys additional slots,
-so existing resident workers are added back to that memory term; CPU capacity
-is already a total. An explicit ceiling such as 64 is not clamped by the
+The configured ceiling is the growth bound. The adaptive controller climbs
+toward it on live pressure signals (free memory against the pressure line, loop
+lag, timeouts) and never against a number predicted from past peaks: many
+sessions may ask for many workers, the controller admits them up to the ceiling
+you chose, and what the host cannot absorb yet queues -- at the per-spawn memory
+gate below and in the controller's own back-off -- rather than being refused
+for a guessed cap. An explicit ceiling such as 64 is not clamped by the
 auto-sizing-only `subagent_auto_max`.
 
 ## How the Cap Is Computed
@@ -51,8 +54,7 @@ auto-sizing-only `subagent_auto_max`.
 ```
 buf      = 1 - subagent_mem_buffer_pct / 100
 mem_term = floor( (avail_gb * buf - pool_size * mem_cost) / mem_cost )
-cpu_term = floor( (cpu_count * buf) / cpu_cost )
-cap      = clamp( min(mem_term, cpu_term), 3, hard_cap )
+cap      = clamp( mem_term, 3, hard_cap )
 ```
 
 - **Memory term** — how many agents fit in available RAM after reserving a
@@ -60,9 +62,14 @@ cap      = clamp( min(mem_term, cpu_term), 3, hard_cap )
   cost per warm-pool slot. `avail_gb` comes from `_available_memory_gb()`,
   which on Linux is `min(MemAvailable, cgroup headroom)` so a memory-capped
   container is respected.
-- **CPU term** — how many fit in the core budget, using a measured per-agent
-  CPU cost (agents are mostly I/O-bound, so this is generous).
-- **`min(...)`** — the tighter of memory/CPU wins.
+- **No CPU term** — deliberately. Over-committing memory ends in the OOM
+  killer, an unrecoverable hard failure, so it is sized up front. Over-committing
+  CPU only slows work down, and the adaptive controller already backs off on the
+  pressure that slowness produces. A static CPU term stacked on that loop did
+  the opposite of what it promised: agents are mostly I/O-bound, but the term
+  was priced from each agent's one-minute *peak*, so a single build-heavy run
+  (20 cores for a minute) priced every slot at that burst and pinned a 32-core
+  host with 96 GB free at 4.
 - **Floor of 3** — the auto-sized cap never drops below the legacy default
   (`_LEGACY_DEFAULT_MAX`), so enabling auto can't regress a small host. This is
   a hard floor: `compute_max_subagents` clamps to `[3, hard_cap]`, and the
@@ -79,16 +86,17 @@ Kiro Crew doesn't hard-code how much an agent costs — it measures it:
   RSS (memory) and CPU, keeping the **high-water** mark for that run (a single
   reading at exit would miss a mid-run peak that has already declined).
 - At exit, one sample `{agent, mem_gb, cpu_cores, ts}` is appended to
-  `~/.kiro/crew/subagents/cost_samples.jsonl`.
-- At the next startup, Kiro Crew takes the **p90 of the last N samples per
-  agent name** (robust to the occasional outlier run), then the worst case
+  `~/.kiro/crew/subagents/cost_samples.jsonl`. The CPU figure is telemetry
+  only; sizing reads `mem_gb`.
+- At the next startup, Kiro Crew takes the **p90 of the last N memory samples
+  per agent name** (robust to the occasional outlier run), then the worst case
   across agent types, as the divisor.
 
 The longer the gateway runs, the more accurate the learned cost becomes. The
 sample log is bounded to the last N records per agent (FIFO compaction at
 startup and periodically at runtime), so it never grows without limit. Before
 enough samples accumulate, a conservative fallback is used
-(`agent.subagent_cost_gb`, `agent.subagent_cpu_cost_cores`).
+(`agent.subagent_cost_gb`).
 
 ### Session-shared sub-agents (AcpRuntime)
 
@@ -126,8 +134,8 @@ limit is frequently the *real* bottleneck — a host that fits 48 agents in RAM
 may only get useful throughput from a handful before requests start queueing.
 
 `agent.subagent_auto_max` (default **32**) is an honest ceiling for that
-unmodeled limit. On a big host the hard cap binds; on a small host memory or
-CPU binds below it. If you've confirmed your provider serves more concurrency,
+unmodeled limit. On a big host the hard cap binds; on a small host memory
+binds below it. If you've confirmed your provider serves more concurrency,
 raise it. Kiro Crew does **not** yet measure provider saturation — that's a
 deliberate v1 simplification we may revisit.
 
@@ -136,9 +144,9 @@ deliberate v1 simplification we may revisit.
 | Key | Default | Effect |
 |-----|---------|--------|
 | `agent.max_subagents` | `0` | `0` = auto-size (default); `>0` = explicit cap |
-| `agent.subagent_mem_buffer_pct` | `20` | % of memory/CPU reserved for the OS and other processes |
+| `agent.subagent_mem_buffer_pct` | `20` | % of memory reserved for the OS and other processes |
 | `agent.subagent_cost_gb` | `0.5` | First-boot memory-cost fallback (GB/agent) until learned |
-| `agent.subagent_cpu_cost_cores` | `1.0` | First-boot CPU-cost fallback (cores/agent) until learned |
+| `agent.subagent_cpu_cost_cores` | `1.0` | **Deprecated, inert.** CPU no longer sizes the cap; kept so an existing config is not rewritten |
 | `agent.subagent_auto_max` | `32` | Absolute ceiling on the computed cap (provider-concurrency stand-in) |
 | `agent.spawn_min_memory_gb` | `4.0` | Per-spawn admission gate (separate runtime guard, refuses a spawn when free memory is low) |
 | `agent.subagent_spawn_stagger_secs` | `0.25` | Delay between successive spawns (initial fill and queued drain), so a high cap never bursts on cold start |
@@ -148,13 +156,27 @@ The cap interacts with `spawn_min_memory_gb` but does not replace it: the cap is
 a startup count limit, while `spawn_min_memory_gb` is a real-time per-spawn
 memory floor. They are independent guards.
 When the memory floor is enabled, admission also reserves memory for the next
-start and for live dedicated workers whose RSS has not yet reached the larger of
-`subagent_cost_gb` and the live dedicated peak RSS. Claimed starts awaiting
-registration and parents waiting without a slot retain this reservation;
-confirmed shared sessions do not add a dedicated-process cost. Observed RSS
-replaces reserved memory, so it is not counted twice. This lets short spawn
+start, for claimed starts awaiting registration, and for live dedicated workers.
+A start that has not settled yet -- fewer than two reaper sweeps have measured
+it -- is priced at the learned p90 from `cost_samples.jsonl` for the agent being
+spawned (the named agent, or the template an agent-less spawn inherits -- the
+same key its own samples are recorded under; only that agent's own history counts,
+only from runs that ran as their own process, and only samples younger than 30
+days, since a session-shared run's figure is a per-session share and a price
+learned under a removed workload must be able to expire), never less than
+`subagent_cost_gb`, less whatever RSS it already holds;
+so the reserve prices it at what runs on this host have actually cost rather than
+at the first-boot fallback (the reaper refreshes those figures off the event
+loop, so they can lag a new sample by up to one sweep). A settled worker owes only
+the gap between the larger of `subagent_cost_gb` and its own peak and what it
+holds now, so observed memory is never counted twice and a learned cost above
+what a particular worker needed does not hold memory it will never use. Parents waiting without a slot retain their reservation; confirmed
+shared sessions do not add a dedicated-process cost. This lets short spawn
 intervals fill available capacity without spending the same headroom repeatedly
 while processes warm up. It cannot predict allocations beyond the estimated cost.
+A deferral for low memory states the per-start price it used; if a learned cost
+no longer reflects this host, delete `subagents/cost_samples.jsonl` under the
+data home (or lower `spawn_min_memory_gb`) and it re-learns from the next runs.
 
 ## Notes
 

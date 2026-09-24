@@ -39,6 +39,7 @@ from kiro_crew.constants import DATA_WARNING, MIN_NODE_MAJOR
 from kiro_crew.dashboard.urls import _resolve_hostname_bounded
 from kiro_crew.sandbox import unavailable_kind
 from kiro_crew.secrets.migrate import _env_lock_path
+from kiro_crew.security import redact
 from kiro_crew.sel import sel
 from kiro_crew.skills import remove_retired_conductor_skill
 from kiro_crew.validation import USER_ID_RE
@@ -216,7 +217,9 @@ def _setup_electron() -> None:
         timeout=120,
     )
     if npm_install.returncode != 0:
-        print(f"  ❌ npm install failed: {npm_install.stderr.strip()[:200]}")
+        # npm / electron-builder print the failing error LAST: redact the whole
+        # stream (it can echo registry URLs with tokens), then keep the tail.
+        print(f"  ❌ npm install failed: {redact(npm_install.stderr.strip())[-200:]}")
         return
 
     build = subprocess.run(
@@ -227,7 +230,7 @@ def _setup_electron() -> None:
         timeout=300,
     )
     if build.returncode != 0:
-        print(f"  ❌ Electron build failed: {build.stderr.strip()[:200]}")
+        print(f"  ❌ Electron build failed: {redact(build.stderr.strip())[-200:]}")
         return
 
     arch = "mac-arm64" if platform.machine() == "arm64" else "mac"

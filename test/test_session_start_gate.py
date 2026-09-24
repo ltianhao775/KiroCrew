@@ -711,3 +711,76 @@ async def test_run_start_timeout_continues_on_adopted_late_session():
     assert info.result == "shared response"
     assert info._session_sharing is True
     assert info._start_queue_wait_ms == 123.0
+
+
+@pytest.mark.asyncio
+async def test_a_gate_queued_claim_already_counts_as_initializing():
+    """A claim still queued behind the admission gate reads as initializing.
+
+    ``has_active_or_initializing_sessions`` is the predicate every recycle and
+    displacement decision asks -- including the spawn-identity mismatch pass,
+    whose drain reap kills parked runtimes it reads as idle. The init scope
+    must therefore open at ``create_session`` entry, BEFORE the gate whose
+    queue is unbounded in practice: a runtime handed to a claim that is still
+    queued must never read as idle, or a concurrent pass kills it under the
+    claim (the run-runtime caller has no fallback for that kill).
+    """
+    rt, _reader, _ = _make_runtime()
+    admitted = asyncio.Event()
+
+    class _BlockingGate:
+        async def acquire(self):
+            await admitted.wait()
+            raise RuntimeError("not admitted in this test")
+
+    async def _fake_gate():
+        return _BlockingGate()
+
+    with patch.object(runtime_mod, "session_start_gate", _fake_gate):
+        start = asyncio.create_task(rt.create_session(cwd="/w"))
+        for _ in range(200):
+            if rt._session_inits_in_flight:
+                break
+            await asyncio.sleep(0.005)
+        try:
+            assert rt._session_inits_in_flight == 1, "queued claim never opened its init scope"
+            assert rt.has_active_or_initializing_sessions(), (
+                "a gate-queued claim must read as initializing, or a concurrent "
+                "displacement pass kills the runtime under it"
+            )
+        finally:
+            admitted.set()
+            with pytest.raises(RuntimeError):
+                await start
+    # The failed admission closed the scope on the way out: the counter
+    # balances, so the runtime does not read busy forever.
+    assert rt._session_inits_in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_gate_wait_closes_the_init_scope():
+    """A cancellation landing in the gate queue must not leak the init scope.
+
+    The scope opens before the gate, so the cancellation path through the
+    wait has to close it -- a leaked scope would make the runtime read busy
+    forever, exempting it from every recycle and displacement decision.
+    """
+    rt, _reader, _ = _make_runtime()
+    entered = asyncio.Event()
+
+    class _HangingGate:
+        async def acquire(self):
+            entered.set()
+            await asyncio.Event().wait()
+
+    async def _fake_gate():
+        return _HangingGate()
+
+    with patch.object(runtime_mod, "session_start_gate", _fake_gate):
+        start = asyncio.create_task(rt.create_session(cwd="/w"))
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        assert rt._session_inits_in_flight == 1
+        start.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start
+    assert rt._session_inits_in_flight == 0

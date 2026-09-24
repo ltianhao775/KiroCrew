@@ -265,10 +265,33 @@ def _fake_request(local_only=True):
     return SimpleNamespace(app={"local_only": local_only})
 
 
+def _trusted(monkeypatch, path="/usr/bin/osascript"):
+    """Answer the trusted-binary lookup without touching this host's filesystem.
+
+    Every darwin-simulating picker test needs it. The real lookup probes the
+    system directories, and the machine running these tests has no osascript in
+    them, so an unpatched probe would send every test down the unavailable arm.
+    Pass ``None`` to exercise that arm deliberately.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.knowledge.platform_compat.trusted_system_bin",
+        lambda name: path,
+    )
+
+
 class TestFolderPickerAvailable:
     def test_available_on_mac_local(self, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.handlers.knowledge.sys.platform", "darwin")
+        _trusted(monkeypatch)
         assert _folder_picker_available(_fake_request(local_only=True)) is True
+
+    def test_unavailable_when_osascript_is_not_trusted(self, monkeypatch):
+        """A macOS host whose osascript does not resolve out of the system
+        directories offers no picker, so the UI hides the button instead of
+        showing one whose only possible answer is a refusal."""
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.knowledge.sys.platform", "darwin")
+        _trusted(monkeypatch, None)
+        assert _folder_picker_available(_fake_request(local_only=True)) is False
 
     def test_unavailable_off_mac(self, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.handlers.knowledge.sys.platform", "linux")
@@ -286,11 +309,31 @@ class TestFolderPickerAvailable:
 class TestRunFolderDialog:
     def test_picked_returns_path(self, monkeypatch):
         completed = MagicMock(returncode=0, stdout="/home/user/notes\n")
+        seen: dict[str, list[str]] = {}
+
+        def run(cmd, *a, **k):
+            seen["cmd"] = cmd
+            return completed
+
         monkeypatch.setattr(
-            "kiro_crew.dashboard.handlers.knowledge.subprocess.run",
-            lambda *a, **k: completed,
+            "kiro_crew.dashboard.handlers.knowledge.subprocess.run", run,
         )
+        _trusted(monkeypatch)
         assert _run_folder_dialog() == "/home/user/notes"
+        # The resolved absolute path, never the bare name a planted shim answers.
+        assert seen["cmd"][0] == "/usr/bin/osascript"
+
+    def test_untrusted_binary_never_spawns(self, monkeypatch):
+        """An osascript that does not resolve out of the trusted directories is a
+        refusal: no process starts, and the caller reads it as a failed launch."""
+        def boom(*a, **k):
+            raise AssertionError("spawned a dialog with an untrusted binary")
+
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.knowledge.subprocess.run", boom,
+        )
+        _trusted(monkeypatch, None)
+        assert _run_folder_dialog() is None
 
     def test_cancel_returns_none(self, monkeypatch):
         completed = MagicMock(returncode=1, stdout="")
@@ -298,6 +341,7 @@ class TestRunFolderDialog:
             "kiro_crew.dashboard.handlers.knowledge.subprocess.run",
             lambda *a, **k: completed,
         )
+        _trusted(monkeypatch)
         assert _run_folder_dialog() is None
 
     def test_launch_failure_returns_none(self, monkeypatch):
@@ -306,6 +350,7 @@ class TestRunFolderDialog:
         monkeypatch.setattr(
             "kiro_crew.dashboard.handlers.knowledge.subprocess.run", boom,
         )
+        _trusted(monkeypatch)
         assert _run_folder_dialog() is None
 
 
@@ -325,8 +370,17 @@ class TestPickFolderHandler:
             assert resp.status == 403
 
     @pytest.mark.asyncio
+    async def test_blocked_when_osascript_is_not_trusted(self, store, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.knowledge.sys.platform", "darwin")
+        _trusted(monkeypatch, None)
+        async with TestClient(TestServer(_make_pick_app(store, local_only=True))) as client:
+            resp = await client.post("/api/knowledge/pick-folder")
+            assert resp.status == 403
+
+    @pytest.mark.asyncio
     async def test_returns_picked_path(self, store, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.handlers.knowledge.sys.platform", "darwin")
+        _trusted(monkeypatch)
         monkeypatch.setattr(
             "kiro_crew.dashboard.handlers.knowledge._run_folder_dialog",
             lambda: "/home/user/notes",
@@ -339,6 +393,7 @@ class TestPickFolderHandler:
     @pytest.mark.asyncio
     async def test_returns_null_on_cancel(self, store, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.handlers.knowledge.sys.platform", "darwin")
+        _trusted(monkeypatch)
         monkeypatch.setattr(
             "kiro_crew.dashboard.handlers.knowledge._run_folder_dialog",
             lambda: None,
@@ -353,6 +408,7 @@ class TestConfigFolderPickerFlag:
     @pytest.mark.asyncio
     async def test_reports_true_on_mac_local(self, store, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.handlers.knowledge.sys.platform", "darwin")
+        _trusted(monkeypatch)
         async with TestClient(TestServer(_make_pick_app(store, local_only=True))) as client:
             resp = await client.get("/api/knowledge/config")
             assert (await resp.json())["folder_picker"] is True

@@ -58,6 +58,7 @@ being a formality. There is deliberately no operation that adds one.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import importlib.util
 import os
 import re
@@ -72,6 +73,7 @@ DEFAULT_TARGETS = ("src", "test")
 # contributor's black defaults differ. Matches ci.yml and AGENTS.md.
 TARGET_VERSION = "py310"
 WOULD_REFORMAT = re.compile(r"^would reformat (.+)$")
+BLACK_PIN = re.compile(r"""^\s*["']black==([^"'\s]+)["']""", re.MULTILINE)
 HEADER = """\
 # Files that are not black-clean yet. The gate requires every OTHER file to be
 # clean, so this list can only shrink.
@@ -149,6 +151,24 @@ def _unformatted(targets: tuple[str, ...]) -> set[str]:
     return found
 
 
+def _require_pinned_black() -> None:
+    """Refuse a prune unless the running black is the pin: a prune revokes a file's exemption."""
+    pyproject = ROOT / "pyproject.toml"
+    match = BLACK_PIN.search(pyproject.read_text(encoding="utf-8"))
+    if match is None:
+        raise SystemExit(f"no black== pin found in {pyproject}")
+    pinned = match.group(1)
+    try:
+        installed = importlib.metadata.version("black")
+    except importlib.metadata.PackageNotFoundError:
+        installed = "(not installed)"
+    if installed != pinned:
+        raise SystemExit(
+            f"refusing to prune: black {installed} is running, not the pinned "
+            f"{pinned}; pip install 'black=={pinned}'"
+        )
+
+
 def _load_scope():
     """The shared diff-scope answer (see scripts/ratchet_scope.py).
 
@@ -196,6 +216,9 @@ def main(argv: list[str] | None = None) -> int:
         help="prune entries that are now clean or gone; never adds a path",
     )
     args = parser.parse_args(argv)
+
+    if args.update_baseline:
+        _require_pinned_black()
 
     unformatted = _unformatted(DEFAULT_TARGETS)
 

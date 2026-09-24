@@ -33,19 +33,16 @@ from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
 FIELD = "agent.acp_backend"
 
 #: Known ids the public baseline deliberately does not offer, each entry carrying its
-#: reason in ``test_baseline_ships_every_known_backend``. Empty was the state until the
-#: first exception; an entry is a reasoned exclusion rather than a defect, and it earns
-#: its place by naming what the id fails. ``deepseek`` is the one member today.
-#:
-#: deepseek passes the install-probe half of the selectability bar and fails the
-#: ROUTING half. Its sandbox decides its own tool calls -- an in-policy action runs
-#: silently and an out-of-policy one is denied with the denial in the tool result --
-#: and ``session/request_permission`` carries only a model-initiated request to
-#: escalate past that sandbox, refused outright when the model omits its
-#: justification. Four live captures across its confined and read-only postures raised
-#: no permission request at all. So Crew's PreToolUse gate would not run for what a
-#: session actually does, and the switch would be offering a harness Crew cannot gate.
-NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_DEEPSEEK})
+#: reason in ``test_baseline_ships_every_known_backend``. An entry is a reasoned
+#: exclusion rather than a defect, and it earns its place by naming what the id fails.
+#: Empty today: no id is excluded. ``deepseek`` was the one member while it failed the
+#: ROUTING half of the selectability bar -- its sandbox decides its own tool calls and
+#: its ``session/request_permission`` carries only a model-initiated escalation, so
+#: Crew's PreToolUse gate never ran for what a session did. It left the set when Crew
+#: composed its own gate plugin into the harness and read the plugin's load marker
+#: back before the first prompt (``Routing.VERIFIED_GATE_EXTENSION``), which is the
+#: routing half met the way the exclusion said it had to be.
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset()
 
 
 @pytest.fixture
@@ -187,6 +184,7 @@ def test_baseline_ships_every_known_backend():
             ACP_BACKEND_OPENCODE,
             ACP_BACKEND_PI,
             ACP_BACKEND_GOOSE,
+            ACP_BACKEND_DEEPSEEK,
         ]
     )
     assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE)

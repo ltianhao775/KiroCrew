@@ -198,7 +198,7 @@ class _Sessions:
                 return key
         return ""
 
-    def clear_queue(self, key) -> None:
+    def clear_queue(self, key, owned_by=None) -> None:
         self.cleared.append(key)
 
     def dequeue(self, key):

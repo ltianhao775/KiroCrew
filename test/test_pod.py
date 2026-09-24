@@ -4731,9 +4731,10 @@ class TestRuntimeHelpers:
     ) -> None:
         """Never hand this pod's secret to whatever happens to answer.
 
-        Sharper than the health misreport: mint sends the pod's own
-        ``.local_secret`` and returns a dashboard token for the responder, so
-        against a squatter it prints a URL that drives the wrong instance.
+        Sharper than the health misreport: mint sends the pod's own internal-API
+        credential -- the per-listener ``run/gateway-<port>.secret`` when the
+        gateway published one -- and returns a dashboard token for the responder,
+        so against a squatter it prints a URL that drives the wrong instance.
         """
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
         c = PodConfig.load()
@@ -4791,6 +4792,393 @@ class TestRuntimeHelpers:
         monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
         with pytest.raises(rt.PodError):
             rt.mint_token(PodConfig.load(), "ghost", "1h")
+
+
+class TestMintRefusalNamesTheGateThatRefused:
+    """A 403 from ``/api/token/local`` must report the gate that actually refused.
+
+    The endpoint refuses at three independent gates and says which one in the body it
+    already sends. Listing candidates instead sends the operator to a remedy for a gate
+    that did not refuse, and the remedy those candidates want is a recreate, whose
+    ``down`` half reclaims the pod's HOME. No gate this endpoint names is repaired by
+    one: transport admission and owner provenance both judge who connected, and a
+    credential mismatch can come from a live second gateway in the same pod home
+    rather than from the pod's state. Any message that still carries a recreate must
+    state what it costs.
+    """
+
+    def _refused(self, body: bytes | None) -> object:
+        import io
+        import urllib.error
+
+        fp = io.BytesIO(body) if body is not None else None
+
+        def _raise(*a: object, **k: object) -> None:
+            raise urllib.error.HTTPError(
+                "http://127.0.0.1/api/token/local",
+                403,
+                "Forbidden",
+                {},  # type: ignore[arg-type]
+                fp,  # type: ignore[arg-type]
+            )
+
+        return _raise
+
+    def _mint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        body: bytes | None,
+    ) -> str:
+        """Drive the real ``mint_token`` unix-socket path to its 403 branch.
+
+        Idempotent in the pod home so one test can drive several causes in turn.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        home = c.home_dir("demo")
+        home.mkdir(parents=True, exist_ok=True)
+        (home / ".local_secret").write_text("s3cret")
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: 4242)
+        monkeypatch.setattr(rt, "unix_socket_urlopen", self._refused(body))
+        with pytest.raises(rt.PodError) as exc:
+            rt.mint_token(c, "demo", "1h")
+        return str(exc.value)
+
+    @staticmethod
+    def _recreate_cost_is_stated(message: str) -> bool:
+        """A message may name ``pod down`` only while stating what it deletes."""
+        return "pod down" not in message or "DELETES the pod's HOME" in message
+
+    def test_owner_refusal_is_named_and_not_blamed_on_transport_or_secret(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate that refuses a CALLER must not be reported as the other two.
+
+        This is the refusal a healthy, serving pod produces: the transport was
+        admitted and the secret accepted, so naming those two as the candidates
+        describes a pod whose state is fine and sends the operator to a recreate
+        that cannot change the verdict.
+        """
+        body = json.dumps(
+            {
+                "error": "The gateway could not verify this process as the local owner.",
+                "code": "member_owner_token_refused",
+            }
+        ).encode()
+        message = self._mint(tmp_path, monkeypatch, body)
+
+        assert "member_owner_token_refused" in message
+        assert "unverified-owner-process" in message  # the pod's own audit record
+        # The credential is named by ROLE, not as the shared file: the mint reads
+        # the per-listener secret first, so that file may not be what was accepted.
+        assert ".local_secret" not in message
+        # The two causes that did NOT refuse are not offered as candidates.
+        assert "predates unix-socket admission" not in message
+        assert "stale" not in message
+        # And a recreate is not presented as the fix for a caller-provenance verdict.
+        assert "does NOT change this verdict" in message
+
+    def test_the_owner_refusal_never_recommends_deleting_the_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``pod down`` reclaims the pod's HOME and cannot fix a caller verdict.
+
+        Pinned separately from the wording above because this is the destructive
+        half: a remedy that deletes a pod's data must never be printed for a
+        refusal it cannot repair, and if it is named at all its cost is stated.
+        """
+        body = json.dumps({"error": "no", "code": "member_owner_token_refused"}).encode()
+        message = self._mint(tmp_path, monkeypatch, body)
+
+        assert "kirocrew pod down demo && kirocrew pod up demo" not in message
+        assert self._recreate_cost_is_stated(message)
+
+    def test_transport_refusal_names_the_peer_verdict_not_a_stale_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A code-bearing transport refusal cannot be an outdated gateway.
+
+        The codes ship with the same handler that admits this socket, so a gateway able
+        to say `loopback_only` is not one that predates that admission. What it means is
+        that the kernel did not positively confirm the connecting peer as the gateway's
+        own principal. Blaming a stale worktree there would re-offer the HOME-deleting
+        recreate for a refusal it cannot repair, which is this issue's defect moved one
+        gate over.
+        """
+        body = json.dumps({"error": "loopback only", "code": "loopback_only"}).encode()
+        message = self._mint(tmp_path, monkeypatch, body)
+
+        assert "loopback_only" in message and "TRANSPORT" in message
+        assert "non-loopback" in message  # the pod's own audit record
+        assert "peer" in message  # the verdict that actually fired
+        # The impossible cause is not offered, and neither is its remedy.
+        assert "predates unix-socket admission" not in message
+        assert "Update the pod's worktree" not in message
+        assert "kirocrew pod down demo && kirocrew pod up demo" not in message
+        assert self._recreate_cost_is_stated(message)
+
+    def test_secret_refusal_names_both_causes_and_offers_no_recreate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A credential mismatch is two causes, and neither is repaired by a recreate.
+
+        A gateway that starts while a sibling serves another port in the same pod home
+        publishes its credential only to the per-listener file, so the shared slot
+        keeps pointing at the sibling. A caller reading that slot is refused here with
+        the pod's state perfectly healthy, which makes a recreate both useless and
+        destructive.
+        """
+        body = json.dumps({"error": "invalid secret", "code": "invalid_secret"}).encode()
+        message = self._mint(tmp_path, monkeypatch, body)
+
+        assert "invalid_secret" in message and ".local_secret" in message
+        assert "TRANSPORT" not in message
+        assert "earlier run" in message
+        assert "second gateway" in message
+        assert "kirocrew pod down" not in message
+        assert self._recreate_cost_is_stated(message)
+
+    def test_only_a_codeless_reply_may_blame_an_outdated_gateway(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The stale-worktree cause lives in exactly one branch: the code-less one.
+
+        A reply with no code is the only one that can have come from a gateway old
+        enough for the missing-admission cause to be real, so that is the only branch
+        allowed to name it, and the only transport-flavoured branch allowed to suggest
+        updating the worktree before a recreate.
+        """
+        codeless = self._mint(tmp_path, monkeypatch, json.dumps({"error": "nope"}).encode())
+        assert "predates unix-socket admission" in codeless
+        assert "updating the pod's worktree" in codeless
+
+        for code in ("loopback_only", "invalid_secret", "member_owner_token_refused"):
+            body = json.dumps({"error": "x", "code": code}).encode()
+            message = self._mint(tmp_path, monkeypatch, body)
+            assert "predates unix-socket admission" not in message, code
+            assert "worktree" not in message, code
+
+    def test_a_codeless_body_sends_the_operator_to_the_audit_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a code the honest answer is where the pod wrote the answer.
+
+        A gateway that answers 403 without one leaves three possible gates, so the
+        message names the record that distinguishes them instead of picking one.
+        """
+        message = self._mint(tmp_path, monkeypatch, json.dumps({"error": "nope"}).encode())
+
+        assert "no machine-readable cause" in message
+        assert "security_events.jsonl" in message
+        assert "non-loopback" in message and "unverified-owner-process" in message
+        assert "nope" in message  # the pod's own words are still relayed
+        assert self._recreate_cost_is_stated(message)
+
+    def test_the_relayed_words_cannot_drive_the_operators_terminal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pod chooses this text, and `pod` prints it to a terminal unchanged.
+
+        A pod's gateway runs that pod's own worktree checkout, so the ``error``
+        string is chosen by the code under test, and it reaches the operator through
+        a plain write to stderr. Control bytes would let it repaint the screen, and
+        a newline would let it forge further lines of this very message.
+        """
+        hostile = "\x1b[2Jwiped\x07 \x1b]0;retitled\x07\r\nfake: pod is fine"
+        message = self._mint(tmp_path, monkeypatch, json.dumps({"error": hostile}).encode())
+
+        for forbidden in ("\x1b", "\x07", "\r"):
+            assert forbidden not in message
+        # The escape BODIES survive as inert text; only the control bytes are gone.
+        assert "wiped" in message
+        # And the forged line is folded into the one line the relay occupies.
+        relayed = [ln for ln in message.splitlines() if "It said:" in ln]
+        assert len(relayed) == 1 and "fake: pod is fine" in relayed[0]
+
+    def test_an_overlong_relayed_error_is_capped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 64 KiB body is readable, so the quoted slice needs its own bound.
+
+        The body cap admits far more text than a terminal line holds, so without a
+        second bound one reply could bury the remedy under its own length.
+        """
+        message = self._mint(tmp_path, monkeypatch, json.dumps({"error": "A" * 5000}).encode())
+
+        assert "A" * rt._MAX_ECHOED_DETAIL_LEN in message
+        assert "A" * (rt._MAX_ECHOED_DETAIL_LEN + 1) not in message
+        # The remedy is still reachable after the quote.
+        assert "security_events.jsonl" in message
+
+    @pytest.mark.parametrize("body", [None, b"", b"<html>403</html>", b"[]"])
+    def test_an_unreadable_body_still_produces_a_refusal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes | None
+    ) -> None:
+        """Reading the body must not be able to replace the 403 with a crash.
+
+        A missing file object, an empty body, HTML and valid JSON that is not an
+        object all reach the same reader, and a raise there would lose the refusal.
+        """
+        message = self._mint(tmp_path, monkeypatch, body)
+
+        assert "HTTP 403" in message
+        assert "no machine-readable cause" in message
+        assert self._recreate_cost_is_stated(message)
+
+    def test_the_no_fallback_guarantee_survives_the_rewrite(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The refusal still states that the secret was not retried over TCP.
+
+        That sentence is the security property of this path, not decoration: it
+        tells the operator the secret was never offered to whatever holds the port.
+        """
+        body = json.dumps({"error": "x", "code": "member_owner_token_refused"}).encode()
+        message = self._mint(tmp_path, monkeypatch, body)
+
+        assert "Not retried on 127.0.0.1:" in message
+
+    def test_a_body_over_the_cap_is_read_no_further_and_falls_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An over-long reply is not parsed for a cause, however well it is formed.
+
+        The reader is what a refused mint hands an untrusted length, so it takes at
+        most the cap plus the one byte that proves the cap was passed. A reply longer
+        than every 403 this route sends is not one of them, so its ``code`` is not
+        honoured: it takes the same path as a body that could not be read at all.
+        """
+        padding = " " * (rt._MINT_403_BODY_CAP + 1)
+        body = (json.dumps({"error": "x", "code": "invalid_secret"}) + padding).encode()
+        message = self._mint(tmp_path, monkeypatch, body)
+
+        assert "no machine-readable cause" in message
+        assert "invalid_secret" not in message
+        assert self._recreate_cost_is_stated(message)
+
+    def test_no_code_bearing_remedy_blames_a_rebound_socket(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rebound socket cannot produce any of these replies, so none may name it.
+
+        ``_attested_gateway_verifier`` runs as the connection's peer check and raises
+        before the request line is written, so a rebound path never answers with HTTP
+        at all. Offering it as a cause here repeats this refusal's original defect:
+        sending the operator after something the path itself has already excluded.
+        """
+        for code in ("member_owner_token_refused", "loopback_only", "invalid_secret"):
+            body = json.dumps({"error": "x", "code": code}).encode()
+            message = self._mint(tmp_path, monkeypatch, body)
+
+            assert "rebound" not in message and "rebind" not in message, code
+
+    def test_the_owner_remedy_states_the_condition_of_the_running_platform(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The owner gate is not one condition, so the remedy may not name only one.
+
+        ``local_owner_bootstrap_allowed`` accepts an ordinary host process by the
+        running platform's own measure: matching user and mount namespaces on Linux,
+        and the absence of a sandbox profile on macOS. A remedy naming namespaces
+        alone tells a sandboxed macOS caller to fix something that is not the gate it
+        failed.
+        """
+        body = json.dumps({"error": "x", "code": "member_owner_token_refused"}).encode()
+        message = self._mint(tmp_path, monkeypatch, body)
+
+        assert "namespace" in message
+        assert "sandbox" in message
+        assert "Linux" in message and "macOS" in message
+
+
+class TestMintSendsTheCredentialOfTheGatewayItDials:
+    """The mint must authenticate as the generation that owns the port it dials.
+
+    The shared ``.local_secret`` holds one slot per data home. A gateway starting
+    while a sibling still serves another port in that home publishes its credential
+    only to the per-listener file, deliberately leaving the shared slot pointing at
+    the sibling. A mint reading the slot then presents one generation's credential to
+    another and is refused with nothing wrong with the pod, and the refusal is
+    indistinguishable at the wire from a credential left behind by an earlier run.
+    """
+
+    @staticmethod
+    def _capturing_urlopen(seen: dict) -> object:
+        """A stub gateway that records the credential the mint presented."""
+
+        class _Resp:
+            def __enter__(self) -> "_Resp":
+                return self
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b'{"token":"tok-xyz"}'
+
+        def _open(req: object, *a: object, **k: object) -> "_Resp":
+            seen["secret"] = req.get_header("X-local-secret")  # type: ignore[attr-defined]
+            return _Resp()
+
+        return _open
+
+    def _pod(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[object, int]:
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        c.home_dir("demo").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(rt, "IS_WINDOWS", False)
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: 4242)
+        return c, rt.derive_port(c, "demo")
+
+    def test_the_per_listener_credential_wins_over_the_shared_slot(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With both files present the mint sends the one paired with the port.
+
+        This is the live-sibling shape: the shared slot names the sibling, and the
+        per-listener file names the generation actually answering this port.
+        """
+        c, port = self._pod(tmp_path, monkeypatch)
+        (c.home_dir("demo") / ".local_secret").write_text("sibling-generation")
+        per_port = rt._pod_secret_path(c, "demo", port)
+        per_port.parent.mkdir(parents=True, exist_ok=True)
+        per_port.write_text("owns-this-port")
+
+        seen: dict[str, str] = {}
+        monkeypatch.setattr(rt, "unix_socket_urlopen", self._capturing_urlopen(seen))
+
+        assert rt.mint_token(c, "demo", "1h") == "tok-xyz"
+        assert seen["secret"] == "owns-this-port"
+
+    def test_the_shared_slot_is_used_when_no_per_listener_file_exists(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A gateway predating the per-listener file is still mintable."""
+        c, _ = self._pod(tmp_path, monkeypatch)
+        (c.home_dir("demo") / ".local_secret").write_text("only-shared")
+
+        seen: dict[str, str] = {}
+        monkeypatch.setattr(rt, "unix_socket_urlopen", self._capturing_urlopen(seen))
+
+        assert rt.mint_token(c, "demo", "1h") == "tok-xyz"
+        assert seen["secret"] == "only-shared"
+
+    def test_neither_credential_present_names_both_paths(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The refusal must say where it looked, in the order it looked."""
+        c, port = self._pod(tmp_path, monkeypatch)
+
+        with pytest.raises(rt.PodError) as exc:
+            rt.mint_token(c, "demo", "1h")
+
+        message = str(exc.value)
+        assert str(rt._pod_secret_path(c, "demo", port)) in message
+        assert ".local_secret" in message
 
 
 class TestAuditEvents:

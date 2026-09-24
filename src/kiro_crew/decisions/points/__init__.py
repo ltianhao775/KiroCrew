@@ -1,13 +1,15 @@
 """Business adapters for the Jev decision seam.
 
-Three adapters. ``skills.select`` picks the skill a message loads: an exact
-offered key selects one, an explicit no-skill answer selects none, and a refusal
-keeps trigger matching. ``message.steer`` decides whether a message sent into a
-RUNNING turn steers it or queues for the next one, and a refusal takes the steer
-path the composer has always defaulted to. ``model.route`` answers how hard a
-chat turn is and maps that tier to a model id, and a refusal keeps the model the
-session was already on. Each adapter's refusal is the shipped behaviour, never a
-third outcome.
+``skills.select`` picks the skill a message loads: an exact offered key selects
+one, an explicit no-skill answer selects none, and a refusal keeps trigger
+matching. ``message.steer`` decides whether a message sent into a RUNNING turn
+steers it or queues for the next one, and a refusal takes the steer path the
+composer has always defaulted to. ``model.route`` answers how hard a chat turn is
+and maps that tier to a model id, and a refusal keeps the model the session was
+already on. ``memory.recall`` decides which of the memories vector similarity
+recalled are worth their place in the prompt, and a refusal injects the similarity
+top-k unchanged. ``tool.risk`` decides nothing and only annotates. Each adapter's
+refusal is the shipped behaviour, never a third outcome.
 
 The core package owns transport, sampling and diagnostic logging.
 
@@ -19,6 +21,12 @@ pays for no transcript read, and only ``user`` / ``assistant`` text is ever
 projected. A second copy of that walk in the second adapter would be a second
 place for the budget to be spent differently, which is the one property the
 keystone ceiling exists to make checkable.
+
+:func:`as_text` is here for the same reason at a smaller scale: every function in
+this package that coerces an UNTYPED payload before a redactor can scan it --
+today ``compaction_keep.redacted``, ``memory_recall.scrubbed`` and
+``tool_risk.scrubbed`` -- calls it, and a second spelling of that coercion would
+be a second answer to what ``None`` sends.
 
 Nothing here imports an adapter: the shared helpers are below the points, so a
 broken adapter cannot make another one unimportable.
@@ -33,8 +41,9 @@ from kiro_crew import decisions as core
 
 logger = logging.getLogger(__name__)
 
-# Skill identifiers must remain exact when passed to the loader. Drop a key
-# exceeding this bound rather than truncating it into a different identifier.
+# Skill keys and memory ids must remain exact when passed back to the loader or
+# matched against a search result. Drop a key exceeding this bound rather than
+# truncating it into a different identifier.
 MAX_KEY_CHARS = 120
 
 #: How many prior transcript rows a point will even look at, before the CHAR
@@ -48,6 +57,30 @@ MAX_HISTORY_MESSAGES = 20
 #: not sent: it is the largest and least selective text in a transcript, and it
 #: routinely quotes files the message itself never mentioned.
 HISTORY_ROLES = frozenset({"user", "assistant"})
+
+
+def as_text(text: object) -> str:
+    """*text* as a string, with ``None`` reading as empty rather than ``"None"``.
+
+    Every function in this package that hands an UNTYPED payload to a redactor
+    calls this -- today ``compaction_keep.redacted``, ``memory_recall.scrubbed``
+    and ``tool_risk.scrubbed``, each annotating its text ``object`` because a
+    provider payload or a tool argument is whatever the caller had. A bare
+    ``str()`` would turn an absent field into the four characters ``None`` and put
+    them on the wire.
+
+    ``message_steer.redacted`` cleans text the same way and is deliberately NOT a
+    caller: it annotates ``str``, because its own walk drops a row whose content
+    is not a string before any of it reaches a redactor.
+
+    A ``str`` is returned unchanged rather than re-stringified, so a ``str``
+    subclass survives the call as itself.
+    """
+    if isinstance(text, str):
+        return text
+    if text is None:
+        return ""
+    return str(text)
 
 
 def history_budget() -> int:

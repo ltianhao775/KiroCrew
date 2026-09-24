@@ -88,6 +88,20 @@ def receipt_text(
     return f"⏳ Queued ({count}): {items}"
 
 
+@dataclass(frozen=True)
+class ReceiptLine:
+    """One queued message as the receipt lists it: whose it is, and what it shows.
+
+    The owner is the token :func:`kiro_crew.messaging.queue_drain.owner_token` builds,
+    the same value the queue entry itself carries, so the bubble and the queue agree
+    about who queued what. Empty for a producer that cannot name its principal, which
+    makes the line nobody's to withdraw.
+    """
+
+    owner: str
+    text: str
+
+
 @dataclass
 class QueueReceipt:
     """The single, in-place receipt bubble tracking messages queued mid-turn.
@@ -96,10 +110,39 @@ class QueueReceipt:
     and Discord's are strings, the two are never interleaved in one process, and
     a generic parameter would add ceremony without catching a real mixup -- the
     id is only ever handed straight back to the surface that produced it.
+
+    One registry entry serves a whole session key, and under
+    ``messaging.dm_scope = "unified"`` that key spans several chats, so the
+    lines on one bubble can belong to several principals while ``msg_id``
+    addresses a message in exactly one of their conversations --
+    ``opened_by``'s. Two rules follow from that pairing: a transition may only
+    render lines back to the principal they came from (:meth:`withdraw` returns
+    exactly the caller's own), and only ``opened_by`` may be handed this
+    ``msg_id``, because in anybody else's conversation the same number is
+    another message.
     """
 
     msg_id: Any
-    texts: list[str] = field(default_factory=list)
+    opened_by: str = ""
+    lines: list[ReceiptLine] = field(default_factory=list)
+
+    @property
+    def texts(self) -> list[str]:
+        """What the bubble shows, in order. What :func:`receipt_text` renders."""
+        return [line.text for line in self.lines]
+
+    def withdraw(self, owner: str) -> list[str]:
+        """Drop *owner*'s lines and return what they showed, in order.
+
+        An empty *owner* drops nothing, matching the queue-side predicate: a caller that
+        cannot name its principal withdraws nothing rather than everybody's lines.
+        """
+        if not owner:
+            return []
+        taken = [line.text for line in self.lines if line.owner == owner]
+        if taken:
+            self.lines = [line for line in self.lines if line.owner != owner]
+        return taken
 
 
 class ReceiptSurface(Protocol):
@@ -148,7 +191,11 @@ class ReceiptQueue:
         return session_key in self._receipts
 
     async def create_or_grow_locked(
-        self, session_key: str, surface: ReceiptSurface, display_text: str
+        self,
+        session_key: str,
+        surface: ReceiptSurface,
+        display_text: str,
+        owner: str = "",
     ) -> None:
         """Create the receipt, or append to it and edit in place.
 
@@ -157,14 +204,22 @@ class ReceiptQueue:
         for an attachment-only message so the bubble is not blank. Caller MUST hold
         :attr:`lock`, and MUST have already enqueued the message under that same
         hold.
+
+        ``owner`` is who queued this one line -- the same token the queue entry carries
+        -- so a later ``/stop`` for one principal can withdraw that person's lines and
+        leave the rest alone. Pass the value the entry was tagged with; empty means the
+        line is nobody's to withdraw.
         """
         receipt = self._receipts.get(session_key)
+        line = ReceiptLine(owner=owner, text=display_text)
         if receipt is None:
             msg_id = await surface.send_receipt(receipt_text([display_text]))
             if msg_id is not None:
-                self._receipts[session_key] = QueueReceipt(msg_id=msg_id, texts=[display_text])
+                self._receipts[session_key] = QueueReceipt(
+                    msg_id=msg_id, opened_by=owner, lines=[line]
+                )
             return
-        receipt.texts.append(display_text)
+        receipt.lines.append(line)
         try:
             await surface.edit_receipt(receipt.msg_id, receipt_text(receipt.texts))
         except Exception:
@@ -196,15 +251,53 @@ class ReceiptQueue:
         except Exception:
             logger.debug("%s: queue receipt flip failed", surface.label, exc_info=True)
 
-    async def finish_cancelled_locked(self, session_key: str, surface: ReceiptSurface) -> None:
+    async def finish_cancelled_locked(
+        self, session_key: str, surface: ReceiptSurface, owner: str = ""
+    ) -> None:
         """Finalize the receipt to a "🛑 Cancelled" record, if present.
 
         Caller MUST hold :attr:`lock` across clear_queue + this call.
+
+        ``owner`` names the ONE principal whose messages were cleared, and then only
+        that person's lines are withdrawn from the record. The registry entry is then
+        DROPPED, and whether anything is written depends on who opened the bubble:
+
+        * the caller opened it -- ``surface`` addresses it, so it finalizes as cancelled
+          over the caller's OWN withdrawn lines. Not over what remains: those lines
+          belong to other principals, and this is their sender's conversation only by
+          coincidence of who queued first.
+        * somebody else opened it -- nothing is written at all, because ``msg_id``
+          belongs to that person's conversation and in the caller's the same number is
+          another message entirely.
+
+        Dropping the entry is what keeps a later drain safe. A drain flips using the
+        chat of the entry it is answering, so an entry left behind after its opener
+        stopped would hand that drain an id minted in a DIFFERENT chat, and the edit
+        would land on whatever message happens to hold that number there. The cost is
+        that a bubble whose opener stopped goes stale rather than being flipped; the
+        next mid-turn burst opens a fresh one, and which conversation a shared bubble
+        belongs to is the registry key's own question.
+
+        Omitted, the whole receipt is finalized, which is what the whole-session callers
+        mean: the queue they cleared was all of it.
         """
-        receipt = self._receipts.pop(session_key, None)
+        receipt = self._receipts.get(session_key)
         if receipt is None:
             return
+        if owner:
+            withdrawn = receipt.withdraw(owner)
+            if not withdrawn:
+                return
+            self._receipts.pop(session_key, None)
+            if owner == receipt.opened_by:
+                await self._edit(surface, receipt.msg_id, receipt_text(withdrawn, cancelled=True))
+            return
+        self._receipts.pop(session_key, None)
+        await self._edit(surface, receipt.msg_id, receipt_text(receipt.texts, cancelled=True))
+
+    async def _edit(self, surface: ReceiptSurface, msg_id: Any, body: str) -> None:
+        """Rewrite the bubble to *body*, logging rather than raising on failure."""
         try:
-            await surface.edit_receipt(receipt.msg_id, receipt_text(receipt.texts, cancelled=True))
+            await surface.edit_receipt(msg_id, body)
         except Exception:
             logger.debug("%s: queue receipt cancel-finalize failed", surface.label, exc_info=True)

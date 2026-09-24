@@ -7,7 +7,7 @@
  * the meaning of its timestamps live beside each other.
  */
 import { i18nT } from '../i18n/t'
-import { fmtDuration } from '../i18n/format'
+import { fmtDuration, fmtTimeNumeric } from '../i18n/format'
 
 export interface AutoNudgeLoop {
   id: string
@@ -36,6 +36,16 @@ export interface AutoNudgeLoop {
    *  which is broadcast without an owner gate and withholds filesystem paths.
    *  So `undefined` means "not known here", while '' is a real "no sentinel". */
   stop_sentinel_path?: string
+  /** The wake judge's brief, as the owner armed it; absent or `{}` = no judge.
+   *  The two sentences are the owner's own words about their own loop, so the
+   *  popover shows them back rather than making the owner reopen the tool call to
+   *  remember what a loop is screening on. */
+  judge?: { wake_when?: string; quiet_when?: string; targets?: string[] }
+  /** The last verdict, deliberately text-free: an outcome, how many evidence
+   *  items it was based on, and when. It carries NO transcript text and no
+   *  per-answer probability; those live in the decisions log, which is where the
+   *  thresholds are meant to be tuned from. */
+  judge_last_verdict?: { outcome?: string; evidence_items?: number; at?: number }
 }
 
 /** `GET /api/autonudge`: every loop record the service holds, active or stopped.
@@ -123,4 +133,70 @@ export function nextCycleText(loop: AutoNudgeLoop | null | undefined, nowTs: num
     case 'in':
       return i18nT('components.autoNudgePopover.next_cycle_in', { time: next.time })
   }
+}
+
+/** The judge line as DATA, so each surface words it for its own layout -- the
+ *  same split `nextCycle` uses, and for the same reason: the popover has room for
+ *  the brief, a compact row may want only the last reading.
+ *
+ *  `kind: 'none'` is a loop with no judge, which is every loop by default. A
+ *  `verdict` of undefined is a judge that has not answered yet, which is not the
+ *  same thing and must not read as one: the first is "this loop fires on a timer",
+ *  the second is "it will be screened, starting next cycle". */
+export type JudgeReading =
+  | { kind: 'none' }
+  | { kind: 'armed'; sense: 'wake' | 'quiet'; criterion: string; verdict?: JudgeVerdict }
+
+export interface JudgeVerdict {
+  /** The outcome word as the point spells it, e.g. 'quiet', 'progress_only'. */
+  outcome: string
+  /** How many evidence items the answer was based on. */
+  items: number
+  /** When it was answered, epoch seconds; 0 when the record carried no time. */
+  at: number
+}
+
+/**
+ * Read one loop's judge state.
+ *
+ * A brief with neither sentence reads as `none`, and that is what a loop stores when
+ * its owner named no criteria of their own. Such a loop may still be SCREENED, under
+ * the default brief the gateway supplies per tick, which is never written back to the
+ * record — so this reading is "does the owner have a criterion here", not "is a judge
+ * running". The row is the owner's own sentence or nothing; the per-tick transcript
+ * notice is where a verdict reached under the default is reported, and it names which
+ * brief it used.
+ */
+export function judgeReading(loop: AutoNudgeLoop | null | undefined): JudgeReading {
+  const wakeWhen = (loop?.judge?.wake_when ?? '').trim()
+  const quietWhen = (loop?.judge?.quiet_when ?? '').trim()
+  if (!wakeWhen && !quietWhen) return { kind: 'none' }
+  const raw = loop?.judge_last_verdict
+  const outcome = (raw?.outcome ?? '').trim()
+  // No outcome means no answer yet. The item count alone is not enough to call it
+  // one: a verdict is identified by what it decided, and a 0-item tick is a real
+  // answer the judge gave on nothing.
+  const verdict: JudgeVerdict | undefined = outcome
+    ? { outcome, items: Math.max(0, Math.trunc(raw?.evidence_items ?? 0)), at: raw?.at ?? 0 }
+    : undefined
+  // Which SENTENCE the criterion is, not just its text. A brief may carry either one,
+  // and they say opposite things: printing a `quiet_when` under a "wake when" label
+  // tells the owner the inverse of what they armed, on every visit. `wake_when` wins
+  // when both are present, because a wake condition is the one that costs a turn.
+  return {
+    kind: 'armed',
+    sense: wakeWhen ? 'wake' : 'quiet',
+    criterion: wakeWhen || quietWhen,
+    verdict,
+  }
+}
+
+/** The verdict's clock reading, e.g. "12:30", in the reader's own zone. */
+export function judgeVerdictTime(at: number): string {
+  // The SAME formatter the last-fire line one row above uses. A hand-rolled UTC
+  // clock here put two times in one block that disagree by the reader's offset,
+  // every visit, and spelled the zone as a bare `Z` that only names itself to
+  // someone who already knows it.
+  if (!at || at <= 0) return ''
+  return fmtTimeNumeric(at)
 }

@@ -15,7 +15,7 @@ vi.mock('../api/client', () => ({
   },
 }))
 
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 import { isPlanAction, usePlanActionMutation } from '../hooks/usePlanActionMutation'
 
 const planAction = api.planAction as unknown as ReturnType<typeof vi.fn>
@@ -94,5 +94,54 @@ describe('usePlanActionMutation stale-click guard', () => {
     await act(async () => { result.current.mutate({ slot: 'slot-nokey', action: 'Cancel' }) })
     expect(planAction).toHaveBeenCalledTimes(1)
     expect(planAction).toHaveBeenCalledWith('slot-nokey', 'Cancel')
+  })
+})
+
+/* `isRefused` is what both hosts feed the FULL followUpOptions row through, and
+ * a plan row is not necessarily plan-only — ChatPage's own handler routes
+ * non-protocol labels to the composer. So the latch class lookup has to be
+ * gated on `isPlanAction` first: without it every non-"cancel" label on the row
+ * (an "Approve" or a free-text suggestion) falls into the Go class and dims the
+ * moment a Go is held, refusing chips the dispatch never owned. */
+describe('usePlanActionMutation isRefused', () => {
+  it('refuses only plan labels in the held class, never a mixed row\'s other chips', async () => {
+    const { result } = renderHook(() => usePlanActionMutation('slot-refused', 'row-1'), { wrapper })
+    await act(async () => { result.current.mutate({ slot: 'slot-refused', action: 'Go', clickedSourceKey: 'row-1' }) })
+    expect(planAction).toHaveBeenCalledWith('slot-refused', 'Go')
+    // Go's class is held, so both of its labels are refused...
+    expect(result.current.isRefused('Go')).toBe(true)
+    expect(result.current.isRefused('Go All')).toBe(true)
+    // ...Cancel is a different class and stays live...
+    expect(result.current.isRefused('Cancel')).toBe(false)
+    // ...and a non-protocol label on the same row is not a plan action at all.
+    for (const label of ['Approve', 'Stage-1-APPROVE', 'Tell me more', '']) {
+      expect(result.current.isRefused(label)).toBe(false)
+    }
+  })
+})
+
+/* The component refuses a click on a chip it has DIMMED, so the hook's own
+ * `latch.has(vars.slot)` guard is no longer reachable from a dimmed chip. It is
+ * still reachable from every caller that has no dim to go on — a second mount
+ * whose props lag a publish, keyboard activation, a host that passes no
+ * `refusedOptions` at all — and the ORDER inside it is load-bearing: clearing the
+ * failure before the guard would retire the only account of why the chip is inert
+ * while leaving the latch wedged. That is what this pins. */
+describe('usePlanActionMutation refused-click guard order', () => {
+  it('a refused click sends nothing AND keeps the failure that explains why', async () => {
+    planAction.mockRejectedValueOnce(new ApiError(500, 'internal error'))
+    const { result } = renderHook(() => usePlanActionMutation('slot-guard', 'row-1'), { wrapper })
+
+    // A 5xx KEEPS the latch: the server may have committed and lost the response.
+    await act(async () => { result.current.mutate({ slot: 'slot-guard', action: 'Go', source: 'row-1', clickedSourceKey: 'row-1' }) })
+    await act(async () => { await Promise.resolve() })
+    expect(result.current.failure).toBe('internal error')
+
+    // Same class, so the held latch drops this one before any request goes out...
+    await act(async () => { result.current.mutate({ slot: 'slot-guard', action: 'Go All', source: 'row-1', clickedSourceKey: 'row-1' }) })
+    expect(planAction).toHaveBeenCalledTimes(1)
+    // ...and the explanation must survive it. Clearing on the way IN would leave a
+    // wedged latch with nothing on screen saying so.
+    expect(result.current.failure).toBe('internal error')
   })
 })

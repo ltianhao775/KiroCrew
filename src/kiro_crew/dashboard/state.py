@@ -17,6 +17,8 @@ import time
 import traceback
 import uuid
 from collections.abc import Coroutine, Iterable, Iterator
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
@@ -30,8 +32,16 @@ from kiro_crew.config.loader import (
     config_dir,
     resolve_effective_agent,
 )
-from kiro_crew.constants import (
+from kiro_crew.constants import (  # noqa: F401 -- DENY_CAUSE_* / STEER_NOTICE_BOUND_SECS re-exported
+    DENY_CAUSE_APPROVAL_NO_BUDGET,
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    DENY_CAUSE_APPROVAL_UNDELIVERABLE,
+    DENY_CAUSE_BATCH_CASCADE,
+    DENY_CAUSE_HOOK_ERROR,
+    DENY_CAUSE_INVALID_NAME,
+    DENY_CAUSE_POLICY,
     OPTIONS_RE_LINE,
+    STEER_NOTICE_BOUND_SECS,
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
 )
@@ -60,6 +70,11 @@ from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.dashboard.websocket_hub import WebSocketHub
 from kiro_crew.deny_guidance import remediation_for
+from kiro_crew.deny_notice import (  # noqa: F401 -- re-exported for dashboard importers
+    _DENY_CAUSE_TEXT,
+    build_refusal_steer_notice,
+    steer_refusal_notice,
+)
 from kiro_crew.history import (
     latest_transcript_ts,
     mint_row_mid,
@@ -400,6 +415,205 @@ def _slots_serialization_note(slots_data: object, *, path: str = "slots-broadcas
         return f"[{path}] slot list fails serialization; no offending entry found"
     except Exception:  # defensive: a diagnostic must not raise
         return f"[{path}] slot projection is not JSON-serializable (offender walk failed)"
+
+
+#: Guards :func:`_request_lineage_seed` so a burst of slot frames arriving before the
+#: projection is seeded costs ONE seed rather than one per frame.
+_lineage_seed_lock = threading.Lock()
+_lineage_seed_in_flight = False
+
+#: Latches :func:`_attach_slot_parents`'s failure WARNING to once per process. The
+#: function runs on every slots frame, so the line is worth a warning the first time
+#: and worth nothing the thousandth. Not reset when the store changes: the point is one
+#: report per process that something is wrong, not a per-store tally.
+_lineage_failure_warned = False
+
+
+def _attach_slot_parents(rows: "list[dict]") -> None:
+    """Give every slot row its ``parent`` -- ``{slot, key}`` or ``None``. IN PLACE.
+
+    This is what lets the chat sidebar nest a session under the one that opened it
+    through ``session_create``: the sidebar already receives the slots broadcast, so
+    the edge rides a frame it gets anyway rather than a route it would have to poll.
+
+    The SHAPE is byte-identical to the Sessions table's ``parent`` -- same two keys,
+    same meaning, same ``key: None`` for a creator that is not running or sits on a
+    cycle -- because one moved ``nestsUnder`` serves both views and a second shape
+    would be a second way to nest the same gateway. What differs, necessarily, is the
+    KEY SPACE: ``key`` names the creator's row IN THIS PAYLOAD, so here it is the bare
+    slot key and on the memory payload it is the full ``dashboard:`` session key.
+    ``nestsUnder`` resolves ``parent.key`` against its own payload's keys, so that is
+    the invariant it needs; a session key here would name no row and every child would
+    silently detach.
+
+    Whole-population work, so it lives after the per-slot loop rather than inside
+    :meth:`DashboardState.serialize_slot`: resolving a citation to a LIVE creator needs
+    every row's key, which one slot does not have.
+
+    NO DISK, and no blocking, because this runs on the event loop. The lineage is read
+    only when the projection is ALREADY seeded for the store now configured; otherwise
+    every row ships ``parent: None`` for this frame and the seed is handed to the
+    maintenance pool. Seeding is a checkpoint load plus a names-only listing, or on the
+    very first boot of this build one full scan -- work measured in milliseconds but
+    still disk, and disk on this loop stalls every other request and the heartbeat
+    behind it.
+
+    It does NOT broadcast when the seed lands, and that is deliberate. Every path that
+    would -- ``push_slots_update``, the trailing timer, a frame of its own -- either
+    writes the coalescer's clock or adds a frame, and both are load-bearing elsewhere: a
+    request inside ``suspend_slots_push`` needs that window open so its own flush
+    broadcasts INLINE and a broadcast failure reaches its caller, and the create path
+    pins exactly one coalesced frame per change.
+
+    Instead the frame SAYS it is provisional: while the projection is not seeded for this
+    store, every row carries ``lineage_pending: true``, and a client that sees it reads
+    the slot list again shortly. That keeps the recovery on the read side, where it costs
+    neither contract, and it closes the case a "next ordinary broadcast" cannot: an IDLE
+    gateway, where nothing is running and no further frame is coming, so an unnested cold
+    start would otherwise persist until the user happened to act. The flag is set only
+    when a later read would genuinely answer differently -- never with the crew log off,
+    and never after a failure this cannot promise will clear.
+
+    Nor is the seed started at boot, which would close that one-frame window: seeding is
+    bound to one store and re-runs when the data home changes, so a process serving
+    several homes would queue a full cold scan per bind onto the shared maintenance pool.
+
+    Never raises, and every row gets the key either way. A sidebar that cannot paint is
+    a worse failure than a sidebar that does not nest, and a row silently MISSING the
+    key would make the frontend's ``parent === undefined`` mean two different things.
+
+    A failure IS reported, once per process at WARNING with its traceback, because it is
+    the only outcome this leaves no evidence of: the payload it produces is
+    byte-identical to a store that genuinely holds no lineage, so without the line a
+    missing conductor lane cannot be told from a gateway with nothing to nest.
+    """
+    if not rows:
+        return
+    parents: dict = {}
+    # Set ONLY when a later read would answer differently, which is now two cases: the
+    # projection is not seeded for this store yet, and a seed that FAILED is due for
+    # another attempt. Both have a seed asked for behind them, so the promise the flag
+    # makes is one something is working to keep. With the crew log off it stays off -- a
+    # client must never be told to come back for an answer that will never change.
+    pending = False
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        # Checked BEFORE the storage import, the way the memory payload's ``_lineage``
+        # does it. With the crew log off there are no records to read and never will
+        # be, so seeding would scan a store nobody is writing -- and every row's answer
+        # is the same ``None`` either way.
+        if not crew_log_emit.enabled():
+            for row in rows:
+                row["parent"] = None
+            return
+
+        from kiro_crew.crew_log.session_tree_projection import projection
+        from kiro_crew.dashboard.session_memory import lineage_parents
+
+        proj = projection()
+        if proj.seeded_for_current_store:
+            parents = lineage_parents(rows, proj.nodes())
+            # A seed that FAILED leaves a readable but EMPTY state, so the check above
+            # is satisfied and this path would otherwise never ask for another one --
+            # the projection's own retry is reached only by a caller that seeds, and
+            # the one that does is the System page's sampler. A sidebar on a gateway
+            # nobody opens that page on would stay unnested for the life of the
+            # process. Asking here is what makes the retry reach this payload.
+            if proj.seed_retry_due:
+                _request_lineage_seed()
+                pending = True
+        else:
+            _request_lineage_seed()
+            # Say that this frame's answer is PROVISIONAL, so a reader can come back for
+            # the real one. Without it a cold start is indistinguishable from a store
+            # with no lineage at all, and an idle sidebar -- nothing running, no frame
+            # coming -- paints unnested and stays that way until the user happens to act.
+            # The seed does not broadcast when it lands (see above), so the recovery has
+            # to be a READ the client chooses to repeat, not a frame this pushes.
+            pending = True
+    except Exception:
+        # Reached only by a genuine failure. The crew log being off returns above, so
+        # this is a broken read, not a configuration -- and it is the ONE outcome of
+        # this function that leaves no trace a reader can find. A parent, an explicit
+        # ``None`` and ``lineage_pending`` are all visible in the payload, so a
+        # sidebar that never offers the conductor lane is diagnosable from the wire in
+        # every case but this one, where the payload is byte-identical to a store that
+        # genuinely holds no lineage. Report it at WARNING, with the traceback: the
+        # alternative is what actually happened, an investigation that could not tell
+        # a swallowed exception from an empty store.
+        #
+        # Latched to once per process because this runs on EVERY slots frame, and a
+        # failure here is far more likely to be persistent (a bad store, an import
+        # that cannot load) than one-off, so an unlatched WARNING would fill the log
+        # with one line per broadcast. Later occurrences keep the traceback at DEBUG.
+        global _lineage_failure_warned
+        if not _lineage_failure_warned:
+            _lineage_failure_warned = True
+            logger.warning(
+                "slot lineage could not be resolved; slots ship without parents and "
+                "the chat sidebar will not offer its conductor lane",
+                exc_info=True,
+            )
+        else:
+            logger.debug("slot lineage could not be resolved", exc_info=True)
+    for row in rows:
+        key = row.get("key")
+        row["parent"] = parents.get(key) if isinstance(key, str) else None
+        # Omitted rather than sent as False, the same distinction `parent` keeps: the
+        # ordinary frame carries no flag at all, so nothing is added to the steady state.
+        if pending:
+            row["lineage_pending"] = True
+
+
+def _request_lineage_seed() -> None:
+    """Seed the session-tree projection on the maintenance pool. Returns immediately.
+
+    One seed in flight at a time. The guard is an in-flight flag rather than a
+    once-per-process latch, because the projection legitimately needs re-seeding when
+    the data home changes underneath the process -- a latch would leave the sidebar
+    permanently un-nested after a pod or a relocated home, which is the bug the flag
+    avoids while still collapsing a burst of frames into one seed.
+
+    Never raises. A pool that will not take the job leaves the flag clear so the next
+    caller can try, and until some seed succeeds every row simply ships no parent.
+
+    A no-op with the crew log off: there are no records to fold, so seeding would only
+    scan a store nobody is writing.
+    """
+    global _lineage_seed_in_flight
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        if not crew_log_emit.enabled():
+            return
+    except Exception:
+        return
+    with _lineage_seed_lock:
+        if _lineage_seed_in_flight:
+            return
+        _lineage_seed_in_flight = True
+
+    def _seed() -> None:
+        global _lineage_seed_in_flight
+        try:
+            from kiro_crew.crew_log.session_tree_projection import projection
+
+            projection().ensure_seeded()
+        except Exception:
+            logger.debug("session tree projection could not be seeded", exc_info=True)
+        finally:
+            with _lineage_seed_lock:
+                _lineage_seed_in_flight = False
+
+    try:
+        from kiro_crew.executors import maintenance_executor
+
+        maintenance_executor().submit(_seed)
+    except Exception:
+        with _lineage_seed_lock:
+            _lineage_seed_in_flight = False
+        logger.debug("lineage seed could not be scheduled", exc_info=True)
 
 
 def _slots_ws_frame(
@@ -876,6 +1090,18 @@ _DEFAULT_PORT = DASHBOARD_PORT
 _SSE_INTERVAL_SECS = 5
 _NOTIFICATIONS_FILE = "notifications.jsonl"
 _MAX_PERSISTED_NOTIFICATIONS = 200
+
+# Fraction of the recency cap reserved for UNSERVABLE notification lines -- a line
+# ``_servable_note`` rejects, so ``_load_notifications`` can never serve it. Such a
+# line is kept rather than destroyed, but in its own window: see
+# ``_maybe_trim_notifications`` for why a shared window turns an append into an
+# eviction.
+#
+# A fraction rather than a second full cap. Two full windows put the post-trim file
+# exactly AT the trim threshold, so every later append would re-read and re-write the
+# whole file; and this window is a sample of recent damage for a human to look at, not
+# history the product serves, so it does not need history's budget.
+_UNSERVABLE_NOTIFICATION_CAP_DIVISOR = 4
 _AUTO_COMPACT_NOTICE = "🔄 Auto-compacted at {pct:.0f}%."
 #: The notice for the arm that REPLACES the session instead of summarizing it. A
 #: separate template because ``_AUTO_COMPACT_NOTICE`` would announce a summary that
@@ -1402,6 +1628,18 @@ COMPACTION_RECOVERY_PREFIX = "[Context compacted — automatic recovery]"
 # say "automatic recovery" like the five above: a person pressed the button, and
 # the card must not claim the system recovered by itself.
 MANUAL_RESUME_RECOVERY_PREFIX = "[Continue — requested by the user]"
+# Prefix on the continuation injected when a content-filter refusal landed AFTER
+# the turn had already dispatched tool calls and agent.refusal_fallback_model
+# names a different model. The user's message is NOT replayed there -- the
+# completed tool calls would run a second time -- so the session is moved to the
+# fallback model and asked to carry on from the completed work, the same
+# continuation a person gets from Continue. Body: _REFUSAL_FALLBACK_RESUME_MSG
+# in chat_utils. Named into the *_RECOVERY_PREFIX family so
+# test_recovery_card_prefixes.py's drift guard sees it. The VALUE names the
+# cause (a model's filter) and the remedy (another model); it says neither
+# "requested by the user" (nobody pressed anything) nor "automatic recovery"
+# (nothing faulted -- the model declined).
+REFUSAL_FALLBACK_RECOVERY_PREFIX = "[Content filter — continuing on the fallback model]"
 # Prefix on the continuation injected when a Stop hook returns a block decision
 # (`{"decision": "block", "reason": ...}` on exit-0 stdout). The reason IS the
 # instruction, handed back as the next turn so a hook can steer the session
@@ -1664,146 +1902,10 @@ def build_refusal_recovery_prompt(
     return "\n".join(lines)
 
 
-#: Why a tool call was denied, for the in-band notice's cause-specific wording.
-#: The notice's INVARIANT half — that this was not a user action, the generic
-#: string it is correcting, and the instruction to decide inside this turn — is
-#: identical for every cause; only the clause naming the cause and the guidance
-#: about what to do next differ. Kept as data rather than a near-copy of the
-#: notice per cause so the invariant half cannot drift between them, which is the
-#: half doing the actual work of overwriting the model's wrong conclusion.
-DENY_CAUSE_POLICY = "policy"
-DENY_CAUSE_INVALID_NAME = "invalid_name"
-DENY_CAUSE_HOOK_ERROR = "hook_error"
-DENY_CAUSE_BATCH_CASCADE = "batch_cascade"
-DENY_CAUSE_APPROVAL_TIMEOUT = "approval_timeout"
-DENY_CAUSE_APPROVAL_NO_BUDGET = "approval_no_budget"
-DENY_CAUSE_APPROVAL_UNDELIVERABLE = "approval_undeliverable"
-
-#: cause → (clause completing "The tool call you just made …", what to do next).
-_DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
-    DENY_CAUSE_POLICY: (
-        "was blocked by a Kiro Crew safety policy",
-        "use an allowed alternative (for a shell command, a read-only variant), use "
-        "a different tool, or — if the block is correct and you genuinely cannot "
-        "proceed — say so and stop with the reason.",
-    ),
-    DENY_CAUSE_INVALID_NAME: (
-        "was refused because its tool name failed validation",
-        "reissue the call with a name that passes validation. The action itself was "
-        "never judged, so do not abandon it or look for a different approach on this "
-        "evidence — and do not repeat the same malformed name.",
-    ),
-    DENY_CAUSE_HOOK_ERROR: (
-        "could not be authorized because a PreToolUse hook raised while deciding it",
-        "treat this as a host fault, not a verdict on the action: nothing judged the "
-        "call itself. Retrying the identical call is reasonable once; if it faults "
-        "again, say what happened rather than working around it silently.",
-    ),
-    DENY_CAUSE_BATCH_CASCADE: (
-        "was auto-declined along with every remaining call in its batch, because "
-        "the host declined an earlier tool of the same batch",
-        "nothing judged these calls themselves — the group was cut short as a "
-        "whole. Address what declined that earlier tool (the reason above), then "
-        "re-issue the calls you still need; if you genuinely cannot proceed "
-        "without them, say so and stop with the reason.",
-    ),
-    DENY_CAUSE_APPROVAL_TIMEOUT: (
-        "was auto-declined because its approval prompt expired unanswered",
-        "nobody answered within the window, so the action itself was never judged — "
-        "do not abandon it or route around it on this evidence. State the "
-        "permission you need and why, then continue with what you can do without "
-        "it. Do not immediately reissue the same call: the person who did not "
-        "answer is still away, and re-prompting re-arms the same wait for the "
-        "same silence.",
-    ),
-    DENY_CAUSE_APPROVAL_NO_BUDGET: (
-        "was auto-declined because the turn had no budget left to host its approval prompt",
-        "the prompt was never shown, so the action itself was never judged — do "
-        "not abandon it or route around it on this evidence. State the "
-        "permission you need and why, then continue with what you can do "
-        "without it. Do not immediately reissue the same call: this turn cannot "
-        "host an approval wait, so the identical call would be declined the "
-        "same way.",
-    ),
-    DENY_CAUSE_APPROVAL_UNDELIVERABLE: (
-        "was auto-declined because its approval prompt could not be delivered "
-        "to the operator's channel",
-        "delivery failed, so the action itself was never judged — do not "
-        "abandon it or route around it on this evidence. State the permission "
-        "you need and why, then continue with what you can do without it.",
-    ),
-}
-
-
-def build_refusal_steer_notice(
-    title: str,
-    reason: str,
-    *,
-    cause: str = DENY_CAUSE_POLICY,
-    credential_tool_hint: str = "",
-) -> str:
-    """Body of the in-band deny notice steered into the RUNNING turn.
-
-    Sent BEFORE the permission rejection goes back on the wire, which is what
-    makes it race-free: while the ``session/request_permission`` is still
-    unanswered the turn is provably in flight, so the steer is queued rather than
-    dropped, and kiro-cli folds it in at the next model-inference boundary — the
-    one immediately after the rejected tool resolves. The model therefore learns
-    why inside the SAME turn and no recovery continuation is needed.
-
-    The notice must correct an attribution the model has already been handed:
-    a rejected permission is reported to the model as a generic tool failure with
-    no channel for the host to say more (ACP's permission response carries only
-    ``outcome``/``optionId``). Naming kiro-cli's exact wording — measured against
-    kiro-cli 2.19.1 — is what lets the model overwrite the wrong conclusion rather
-    than hold both, and attributing the quote to that backend keeps the sentence
-    true on another steer-capable harness whose wording has not been measured.
-    ``title``/``reason`` must already be redacted by the caller.
-
-    *cause* selects the wording. The distinction is not cosmetic: a policy block
-    is a verdict the model must route around, an invalid tool name is the model's
-    own malformed output and is the one case it can simply fix, a hook fault
-    judged nothing at all, a batch cascade cut the group short without judging
-    its members, and an expired approval prompt means nobody answered. Telling
-    the model "safety policy" for any non-policy cause would send it looking for
-    an allowed alternative to an action nobody refused.
-    An unknown cause degrades to the policy wording rather than raising: a wrong
-    noun is recoverable, and losing the notice would hand the model back
-    kiro-cli's "user denied" with nothing to correct it.
-
-    Returns "" when there is nothing to say, so a caller can treat the empty
-    string as "no notice was sent" and fall back to the recovery continuation.
-    """
-    if not (title or "").strip() and not (reason or "").strip():
-        return ""
-    clause, guidance = _DENY_CAUSE_TEXT.get(cause, _DENY_CAUSE_TEXT[DENY_CAUSE_POLICY])
-    what = f"{title}: {reason}" if reason else title
-    # Class-specific remediation, for the policy cause only. The non-policy
-    # causes judged nothing about the action — an invalid tool name is the
-    # model's own malformed output, a hook fault is a host fault, a cascaded
-    # batch member was never reached, and an expired approval prompt was simply
-    # never answered — so naming a sanctioned alternative there would answer a
-    # question nobody asked and imply the action itself had been refused.
-    remediation = (
-        remediation_for(reason, title, credential_tool_hint=credential_tool_hint)
-        if cause == DENY_CAUSE_POLICY
-        else ""
-    )
-    tail = f"\n\nHow to do this properly: {remediation}" if remediation else ""
-    # "host notice", not "policy notice": the tag has to be true for every
-    # cause, and only one of them IS a policy. Naming the ACTOR is also what the
-    # notice exists to do — the model has just been told the user denied this, and
-    # every sentence after this one is spent correcting that.
-    return (
-        f"[Kiro Crew host notice] The tool call you just made {clause}. "
-        "This was NOT a user action — the user did not "
-        "cancel, reject, or interrupt anything. The tool result you were handed for "
-        "it is generic and wrong about who denied it — on kiro-cli it reads "
-        '"User denied tool execution".\n\n'
-        f"Blocked: {what}\n\n"
-        "Do not apologise for a cancellation and do not ask the user whether to "
-        f"retry. Decide and continue in this same turn: {guidance}{tail}"
-    )
+#: The in-band deny notice (cause wording, builder, bounded steer helper) lives
+#: in ``kiro_crew.deny_notice``, a leaf the messaging core may import; the names
+#: are re-exported from this module (see the import block) for the dashboard's
+#: existing importers.
 
 
 def build_stale_recovery_prompt() -> str:
@@ -2149,6 +2251,112 @@ def request_slot_origin(app: str) -> str:
     return SlotOrigin.APP if app else SlotOrigin.USER
 
 
+STAGE_BOUNDARY_OWNER_META_KEY = "stageBoundaryOwner"
+
+
+@dataclass
+class StageBoundary:
+    """One stage's delivery, recovery, and cancellation ownership."""
+
+    stage: int | None = None
+    consumed: bool = True
+    retry_queue_id: str = ""
+    continuation_required: bool = False
+    preserve_stop_generation: int = -1
+    parent_session_keys: set[str] = dataclass_field(default_factory=set)
+    synthetic_recovery_inflight: int = 0
+    recovery_retrigger_count: int = 0
+    report_retention_refused: str | None = None
+    cancellation_hold_refused: str | None = None
+    generation: str = ""
+    armed_at: int = 0
+
+    @property
+    def owner(self) -> str | None:
+        """The current queue-ownership token, if a boundary is armed."""
+        return self.generation if self.stage is not None and self.generation else None
+
+    def arm(self, stage: int, *, consumed: bool = False) -> None:
+        """Start a new stage boundary and mint its queue ownership token."""
+        new_boundary = self.stage != stage or self.owner is None
+        if new_boundary:
+            self.generation = uuid.uuid4().hex
+            self.report_retention_refused = None
+            self.cancellation_hold_refused = None
+        self.stage = stage
+        self.armed_at = time.monotonic_ns()
+        self.consumed = consumed
+        self.retry_queue_id = ""
+        self.continuation_required = False
+        self.preserve_stop_generation = -1
+        self.parent_session_keys.clear()
+        self.synthetic_recovery_inflight = 0
+
+    def preserve(self, stage: int, *, consumed: bool) -> None:
+        """Keep an interrupted stage armed until a later guarded Go."""
+        if self.stage != stage:
+            self.arm(stage, consumed=consumed)
+        else:
+            self.consumed = consumed
+        self.continuation_required = consumed
+
+    def mark_consumed(self, consumed: bool) -> None:
+        """Record provider consumption and retire an obsolete exact retry."""
+        self.consumed = consumed
+        if consumed:
+            self.retry_queue_id = ""
+
+    def clear(self) -> None:
+        """Atomically release every live field owned by the current boundary."""
+        self.stage = None
+        self.armed_at = 0
+        self.consumed = True
+        self.retry_queue_id = ""
+        self.continuation_required = False
+        self.preserve_stop_generation = -1
+        self.parent_session_keys.clear()
+        self.synthetic_recovery_inflight = 0
+        self.report_retention_refused = None
+        self.cancellation_hold_refused = None
+
+    def tag_meta(self, meta: dict | None = None, *, owner: str | None = None) -> dict:
+        """Copy *meta* and tag it with an explicit or current owner token."""
+        tagged = dict(meta or {})
+        actual_owner = self.owner if owner is None else owner
+        if actual_owner:
+            tagged[STAGE_BOUNDARY_OWNER_META_KEY] = actual_owner
+        return tagged
+
+    def owns_entry(self, entry: dict, *, owner: str | None = None) -> bool:
+        """Whether a queue entry belongs to the selected boundary token."""
+        meta = entry.get("meta")
+        actual_owner = self.owner if owner is None else owner
+        return bool(
+            actual_owner
+            and isinstance(meta, dict)
+            and meta.get(STAGE_BOUNDARY_OWNER_META_KEY) == actual_owner
+        )
+
+
+def stage_boundary_for(slot: object) -> StageBoundary:
+    """Return *slot*'s boundary; a minimal test double starts unarmed."""
+    boundary: StageBoundary | None = getattr(slot, "stage_boundary", None)
+    if boundary is not None:
+        return boundary
+    boundary = StageBoundary()
+    try:
+        setattr(slot, "stage_boundary", boundary)
+    except (AttributeError, TypeError):
+        if isinstance(slot, _ChatSlot):
+            raise
+        logger.warning(
+            "stage_boundary_for could not attach a boundary to non-slot object "
+            "of type %s; using an ephemeral boundary",
+            type(slot).__qualname__,
+        )
+    return boundary
+
+
 class _ChatSlot:
     """Independent chat session that runs server-side."""
 
@@ -2202,9 +2410,11 @@ class _ChatSlot:
         "_title_origin",
         "_title_epoch",
         "_title_refresh_mark",
+        "_title_low_signal",
         "_auto_tagged",
         "_title_in_flight",
         "_title_retry_pending",
+        "_title_task",
         "_summary_in_flight",
         "_summary_turn_mark",
         "_detail_render_lock",
@@ -2221,6 +2431,7 @@ class _ChatSlot:
         "_mcp_report_session_id",
         "_on_message",
         "_on_question_retired",
+        "_coordinator_approvals",
         "_has_reader_flag",
         "_stop_state_raw",
         "_stop_generation",
@@ -2237,6 +2448,8 @@ class _ChatSlot:
         "_plan_cancelled",
         "_auto_run",
         "_in_stage_execution",
+        "_stage_controller_task",
+        "stage_boundary",
         "_last_turn_auth_required",
         "_recovery_chat_triggered",
         "_stage_titles",
@@ -2246,6 +2459,7 @@ class _ChatSlot:
         "_slack_channel",
         "_slack_thread_ts",
         "channel_origin",
+        "_channel_runtime_origin",
         "folder_id",
         "_folder_changed",
         "_folder_suggested",
@@ -2258,7 +2472,6 @@ class _ChatSlot:
         "_subagent_deliveries_inflight",
         "_subagents_inline_collected",
         "_subagent_delivery_pending",
-        "_recovery_retrigger_count",
         "_prompt_busy_retries",
         "_acp_pipe_death_retries",
         "_stale_recovery_retries",
@@ -2298,9 +2511,11 @@ class _ChatSlot:
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
         "_empty_response_retries",
+        "_empty_episode_productive",
         "_promise_only_retries",
         "_promise_only_stop_gen",
         "_promise_only_session_stop_gen",
+        "_promise_only_session_key",
         "_compaction_continue_retries",
         "_batch_rejected",
         "_batch_rejected_cause",
@@ -2359,7 +2574,9 @@ class _ChatSlot:
         "_steer_send_ids",
         "_steer_user_origin",
         "_steer_admissions",
+        "_steer_decision_strips",
         "_steer_audience_fences",
+        "_steer_attachment_meta",
         "_wait_state",
         "_end_wait_request",
         "_wait_last_ping",
@@ -2553,10 +2770,13 @@ class _ChatSlot:
         # "user" so a possibly-manual name is never rewritten. "" = untitled.
         self._title_origin: str = ""
         # Monotonic counter bumped on every EXPLICIT title assignment (manual
-        # rename or the manual generate-title endpoint). Background title tasks
-        # snapshot it before generating and re-check it after each await, so an
-        # explicit title landing mid-generation is never overwritten (see
-        # chat_title._maybe_auto_title / maybe_refresh_title).
+        # rename or the manual generate-title endpoint). Title generators --
+        # the background tasks and the foreground generate-title endpoint
+        # alike -- snapshot it before generating and re-check it before
+        # applying what they generated, so an explicit title landing
+        # mid-generation is never overwritten (see
+        # chat_title._maybe_auto_title / maybe_refresh_title /
+        # api_chat_slot_generate_title).
         self._title_epoch: int = 0
         # User-message count at the last background title refresh ATTEMPT (0 =
         # never refreshed). Each milestone in chat_title._TITLE_REFRESH_MILESTONES
@@ -2564,10 +2784,25 @@ class _ChatSlot:
         # the refresh token budget is hard-bounded. Persisted so a gateway
         # restart cannot re-spend consumed milestones.
         self._title_refresh_mark: int = 0
+        # True when the current AUTO title was derived from a low-signal first
+        # message (URL/identifier-dominated, e.g. a pasted ticket link) — the
+        # one case where the name can only restate the link. Makes the title
+        # refresh due once the first turn's transcript exists (see
+        # chat_title._TITLE_EARLY_REFRESH_MILESTONE) instead of waiting for the
+        # first ordinary milestone. Persisted as ``title_low_signal`` and
+        # rehydrated in chat_persistence; absent on legacy sessions = False.
+        self._title_low_signal: bool = False
         self._auto_tagged: bool = False  # True once auto-tag has been attempted
         # Guards against concurrent LLM auto-title attempts (on-send trigger vs
         # the end-of-turn chat_done trigger racing on the same slot).
         self._title_in_flight: bool = False
+        # Handle of the on-send auto-title task (chat_handlers), so chat_done's
+        # chained title→refresh pass can WAIT for the in-flight attempt to
+        # settle instead of bouncing off the ``_title_in_flight`` guard. Without
+        # the wait, a slow on-send attempt locks a low-signal title AFTER both
+        # chained calls returned — and a one-message session gets no later
+        # chat_done to spend its early refresh milestone. Never persisted.
+        self._title_task: asyncio.Task[None] | None = None
         # Records a chat_done retry that arrived during the on-send attempt.
         self._title_retry_pending: bool = False
         # Excludes concurrent session-summary generations for this slot. A
@@ -2659,6 +2894,12 @@ class _ChatSlot:
         # is invisible to a second window, and to a /pending response already in
         # flight — either would re-render a card whose answer has been sent.
         self._on_question_retired: object | None = None
+        # Live ApprovalCoordinator records owned by this slot, wired by
+        # DashboardState like _on_message. A sub-agent spawn gate or a tool
+        # approval inside a running sub-agent parks its future on the STATE
+        # registry, never on _approval_futures, so the projection has to ask
+        # the state to learn that this slot is waiting.
+        self._coordinator_approvals: Callable[[str], list[dict]] | None = None
         self._has_reader_flag: bool = False  # True when HTTP SSE stream is draining
         self._stop_state_raw: str = "idle"  # 'idle' | 'soft_pending' | 'killing'
         # Monotonic count of stop INITIATIONS (idle → active edges of
@@ -2728,8 +2969,16 @@ class _ChatSlot:
         # user message (chip card) even when slot.task is momentarily idle between
         # stages, and _start_next_queued_turn HOLDS user messages (recovery/system
         # still drain) until the plan ends — so autopilot reuses the normal-chat
-        # queue/chip path without changing slot.task / slot.running semantics.
+        # queue/chip path. After the controller exits, an uncancelled pending
+        # boundary keeps ``running`` true until guarded Go settles or reruns it.
         self._in_stage_execution: bool = False
+        # Outer Python stage driver, kept separately while ``task`` names the
+        # active LLM turn so slot teardown can cancel both lifetimes.
+        self._stage_controller_task: asyncio.Task[Any] | None = None
+        # Atomic owner of the active stage's delivery, recovery, parent-session,
+        # and cancellation state. Compatibility properties below expose the old
+        # names to focused tests, but production paths mutate this object.
+        self.stage_boundary = StageBoundary()
         # Set by _run_chat's teardown to that turn's ACP auth-required outcome, so
         # the orchestrator _stage_loop can mirror the "hold the queue for
         # post-login resume" guard on its end-of-plan handoff (a signed-out CLI
@@ -2783,7 +3032,6 @@ class _ChatSlot:
         # retention TTL is measured from consumption rather than from run
         # completion. See ``take_pending_subagent_deliveries``.
         self._subagent_delivery_pending: dict[str, list[str]] = {}
-        self._recovery_retrigger_count: int = 0
         self._prompt_busy_retries: int = 0
         self._acp_pipe_death_retries: int = 0
         # Auto-recovery of a genuinely-wedged (stale) turn: bumped when the ACP
@@ -2975,6 +3223,8 @@ class _ChatSlot:
         # discard loop.
         self._poisoned_reset_used: bool = False
         self._empty_response_retries: int = 0
+        # True once any turn of the CURRENT empty-turn episode was productive.
+        self._empty_episode_productive: bool = False
         # One bounded synthetic continuation when a turn ended on a promise-only
         # final message (announced an immediate action, then yielded with no tool
         # call). Reset like the other per-turn retry budgets on a landed turn.
@@ -2987,6 +3237,11 @@ class _ChatSlot:
         # slot's session key at enqueue, so the same purge also sees a stop
         # issued on a linked channel surface while the continuation waited.
         self._promise_only_session_stop_gen: int = 0
+        # The effective session binding at enqueue. A cron injection can rebind
+        # an idle slot while the queued continuation waits; the dispatch-point
+        # purge compares against this snapshot and drops the replay rather than
+        # draining it into the new session's context. Empty = never enqueued.
+        self._promise_only_session_key: str = ""
         # One bounded synthetic continuation when the BACKEND compacted the
         # conversation mid-turn and then ended the turn without finishing the
         # work (see COMPACTION_RECOVERY_PREFIX). Bounded separately from the
@@ -3193,6 +3448,12 @@ class _ChatSlot:
         # name would let `POST /api/chat/slots` with a colliding `slack_<ts>`
         # name write a fresh conversation into an existing thread's transcript.
         self.channel_origin: bool = False
+        # Set ONLY by the path that surfaced this slot from a channel session THIS
+        # process observed. `channel_origin` cannot carry that weight: it round-trips
+        # through the transcript's own metadata line, which an agent can write, so a
+        # lookalike named for a live stem can arrive already claiming it. Never
+        # persisted, so a restored slot always starts without it.
+        self._channel_runtime_origin: bool = False
         self._side: SideState | None = None
         # Live inner AcpClient for the in-flight turn, published by _run_chat at
         # turn start and cleared in its finally. Lets a concurrent request (the
@@ -3272,6 +3533,16 @@ class _ChatSlot:
         # key, which puts it on the drain's fail-closed floor: checked against every
         # currently held constraint rather than against a baseline built at teardown.
         self._steer_admissions: dict[str, dict] = {}
+        # The `message.steer` decision row that chose the STEER path for an
+        # in-flight steer, keyed by the same message text as the maps above and
+        # kept in the same LOCKSTEP. Only the requeue reads it: the receipt is
+        # stamped on the persisted row by the steer path itself and on the queue
+        # entry by `queue_for_next_turn`, but a steer the turn's teardown requeues
+        # takes neither of those writers -- the teardown is a different coroutine
+        # that never sees the caller's argument -- so without this map the one
+        # outcome a decision did choose lands as a queue entry with no receipt.
+        # Absent for a manual steer, which has none to carry.
+        self._steer_decision_strips: dict[str, dict] = {}
         # Admission snapshots of the peer steers that influenced THIS turn, keyed by
         # an opaque token. The turn consults them before publishing its CROSS-SURFACE
         # reply leg and withholds it when a constraint newly holds:
@@ -3291,6 +3562,10 @@ class _ChatSlot:
         # TURN-SCOPED: the turn's teardown empties it, so one turn's withheld reply
         # never silences the next, whose authorization is its own.
         self._steer_audience_fences: dict[str, dict] = {}
+        # Validated attachment lists for a pending steer. Requeue moves them
+        # to the queue entry; a consumption echo releases them after an accepted
+        # steer has stamped its own row.
+        self._steer_attachment_meta: dict[str, dict[str, list[str]]] = {}
         # In-flight `wait` tool sleep, as reported by the tool's own keepalive
         # ping: {"wait_id": str, "seconds": int, "deadline_ts": float}. The
         # deadline is on the dashboard's clock (see api_session_keepalive) so
@@ -3917,6 +4192,16 @@ class _ChatSlot:
         """
         return queue_persist_signature(self.durable_queue_entries()) != self._queue_persisted_sig
 
+    def track_stage_controller(self, task: asyncio.Task[Any]) -> None:
+        """Keep the outer stage driver reachable while ``task`` names a child turn."""
+        self._stage_controller_task = task
+
+        def _clear(done: asyncio.Task[Any]) -> None:
+            if self._stage_controller_task is done:
+                self._stage_controller_task = None
+
+        task.add_done_callback(_clear)
+
     @property
     def task(self) -> asyncio.Task[Any] | None:
         return self._task
@@ -3928,8 +4213,22 @@ class _ChatSlot:
         self._task = value
 
     @property
+    def turn_running(self) -> bool:
+        """Whether an active model turn or stage controller still owns the slot."""
+        task = self.task
+        controller = self._stage_controller_task
+        return bool(
+            (task is not None and not task.done())
+            or (controller is not None and not controller.done())
+        )
+
+    @property
     def running(self) -> bool:
-        return self.task is not None and not self.task.done()
+        """Admission/reservation predicate; use ``turn_running`` for execution.
+
+        See ``docs/system-specs/modules/session.md``.
+        """
+        return bool(self.turn_running or self.stage_boundary.stage is not None)
 
     @property
     def queue_depth(self) -> int:
@@ -4084,6 +4383,8 @@ class _ChatSlot:
         prompt: str,
         run_chat_coro: Callable[[DashboardState, _ChatSlot, str], Coroutine[Any, Any, None]],
         state: DashboardState,
+        *,
+        extra_meta: dict[str, Any] | None = None,
     ) -> bool:
         """Queue *prompt* if busy, otherwise start an agent turn.
 
@@ -4094,6 +4395,15 @@ class _ChatSlot:
         Returns ``True`` if the prompt started an agent turn, ``False`` if
         it was queued. Lets callers gate UI-visible side-effects (notifications,
         SSE pushes) on whether the prompt actually ran.
+
+        *extra_meta* is merged onto the queued entry's ``meta`` beside the
+        containment stamp, for a producer that must record something about the
+        ADMISSION for the drain to read later -- ``session_control.send_to_target``
+        stamps the sending session there (``send_origin_meta``) so a drop can be
+        reported back to it. Ignored on the run arm: a prompt that starts its turn
+        immediately has no queue entry and no later drain to tell anything to. The
+        containment keys win a collision, since the drain's own authorization
+        decision must not be overwritable by a caller's extra fields.
 
         Busy is ``running or _in_stage_execution``, not ``running`` alone. A
         multi-stage plan closes each stage's own turn before opening the next, so
@@ -4127,7 +4437,13 @@ class _ChatSlot:
             # queue drain can re-assert them at delivery: a target
             # that gains a channel/mirror link while this prompt waits must not
             # execute it under the weaker constraints that admitted it.
-            self.queue_append(prompt, meta=containment_meta(state, self))
+            #
+            # *extra_meta* rides alongside, applied FIRST so the containment keys
+            # win a collision: a caller's extra fields are descriptive, and the
+            # drain's authorization input must not be replaceable from here.
+            _meta: dict[str, Any] = dict(extra_meta or {})
+            _meta.update(containment_meta(state, self))
+            self.queue_append(prompt, meta=_meta)
             # Returning False IS the receipt that the prompt was accepted onto the
             # queue, and until the drain writes its transcript row the queue is the
             # prompt's only record -- so a restart inside the periodic flush
@@ -4198,7 +4514,7 @@ class _ChatSlot:
             "total": len(links),
         }
 
-    def to_dict(self, *, include_check_status: bool = False, dashboard_user: bool = False) -> dict:
+    def _summary_source_links(self) -> list[dict]:
         # Skip extraction itself when the chips are off, not just the two fields
         # the projection derives from it: `_pr_source_links()` scans the transcript
         # under a per-call parse budget, and paying for a payload nothing renders
@@ -4209,11 +4525,39 @@ class _ChatSlot:
             session_card_source_links_enabled,
         )
 
-        source_links = self._pr_source_links() if session_card_source_links_enabled() else []
+        return self._pr_source_links() if session_card_source_links_enabled() else []
+
+    def source_links_view(
+        self, *, include_check_status: bool = False, dashboard_user: bool = False
+    ) -> list[dict]:
+        """The ``source_links`` field ``to_dict`` emits for one audience.
+
+        ``include_check_status`` and ``dashboard_user`` change NOTHING in the
+        slot summary except this field (``slot_projection.SlotProjection.to_dict``
+        reads them only through ``project_source_links``). The broadcast uses
+        that: it serializes each slot once and swaps this field per audience
+        instead of re-running the projection body (last-message markdown strip,
+        credential redaction, options parse) three times per slot on the event
+        loop. The source-link transcript scan itself is memoized per slot
+        revision, so it was never the repeated cost.
+        """
+        return _project_source_links(
+            _budgeted_source_links(self._summary_source_links()),
+            include_check_status,
+            dashboard_user=dashboard_user,
+        )
+
+    def to_dict(self, *, include_check_status: bool = False, dashboard_user: bool = False) -> dict:
+        source_links = self._summary_source_links()
+        coordinator_approvals = self._coordinator_approvals
+        coordinator_pending: list[dict] = (
+            coordinator_approvals(self.key) if coordinator_approvals is not None else []
+        )
         return self._projection.to_dict(
             self,
             include_check_status=include_check_status,
             source_links=source_links,
+            coordinator_pending=coordinator_pending,
             prompt_roles=_PROMPT_ROLES,
             redact=_redact,
             parse_options=_parse_options,
@@ -4297,6 +4641,23 @@ class DashboardState:
         owner_id: str = "",
     ):
         self.sessions = sessions
+        # The decisions seam's LLM lane needs ONE callable that runs a prompt on a
+        # tool-less background session, and ``decisions/`` deliberately imports
+        # nothing above itself -- so the wiring happens here, where the session
+        # manager first exists. Here rather than in ``server.py`` because both the
+        # gateway and the standalone dashboard construct this object, and a lane
+        # wired on only one of those paths is a lane that answers on one boot and
+        # refuses on the other. Guarded: a lane that cannot be wired must not stop
+        # the dashboard from booting, and an unwired lane already has a defined
+        # behaviour -- every judged tick fires exactly as the ungated timer does.
+        try:
+            from kiro_crew.decisions import impl_llm
+
+            impl_llm.set_runner_factory(
+                lambda model: impl_llm.build_session_runner(sessions, model=model)
+            )
+        except Exception:
+            logger.debug("decisions: LLM lane runner not registered", exc_info=True)
         self.crons = crons
         self.lessons = lessons
         self.start_time = start_time
@@ -4344,6 +4705,23 @@ class DashboardState:
         self.workflow_startup_task: asyncio.Task[None] | None = None
         self.context_builder = context_builder
         self.conversation_log = conversation_log
+        # Set except while the startup crewmate prune is pending: the gateway
+        # clears it before the listener binds (``_register_crewmate_prune_gate``)
+        # and sets it once the pass has returned; that function's middleware
+        # holds every mutating request, and every read of the member roster,
+        # on it, so no session can bind an agent and no member log can be
+        # folded between the prune's history check of a candidate and its
+        # delete. Set by default so every other entry point -- tests, the CLI
+        # -- never waits.
+        self.crewmate_prune_settled = asyncio.Event()
+        self.crewmate_prune_settled.set()
+        # Read by the prune's worker thread: once set, the pass judges no
+        # further candidate and deletes no further row (checked again inside
+        # the config lock, before the delete). ``await_crewmate_prune_settled``
+        # sets it when the pass outlives its budget, then keeps waiting for
+        # ``crewmate_prune_settled`` -- a writer starts only after the pass has
+        # returned, never beside a pass that can still delete.
+        self.crewmate_prune_abandon = threading.Event()
         self.consolidator = consolidator
         self.task_runner = task_runner
         self.slack_client = slack_client
@@ -5624,6 +6002,28 @@ class DashboardState:
             redact_secret=redact_credentials,
         )
 
+    def pending_coordinator_approvals(self, slot_key: str) -> list[dict]:
+        """Live coordinator approvals owned by *slot_key*, oldest first.
+
+        A record counts only while its state-level future is still open: a
+        resolved or expired approval whose ``finally`` has not yet popped the
+        record must not keep the slot in the Needs Approval lane. An approval
+        with no owning slot belongs to no slot and is never returned.
+        """
+        if not slot_key:
+            return []
+        records = getattr(self, "_pending_approvals", None) or {}
+        futures = getattr(self, "_approval_futures", None) or {}
+        pending: list[dict] = []
+        for approval_id, record in records.items():
+            if record.get("slot") != slot_key:
+                continue
+            future = futures.get(approval_id)
+            if future is None or future.done():
+                continue
+            pending.append(record)
+        return pending
+
     def _audit_and_broadcast_approval(
         self,
         session_key: str,
@@ -6077,6 +6477,7 @@ class DashboardState:
         slot._tab_id = uuid.uuid4().hex[:12]
         slot._on_message = self._broadcast_chat_message
         slot._on_question_retired = self._broadcast_question_retired
+        slot._coordinator_approvals = self.pending_coordinator_approvals
         slot._app = app
         # ``origin`` must be declared by the layer that actually knows it, and
         # an undeclared non-app slot stays UNTAGGED ("") rather than being
@@ -6334,12 +6735,20 @@ class DashboardState:
                     _ev_ts = float(_raw_ts)
                 except (TypeError, ValueError):
                     _ev_ts = time.time()
-                # Same redaction chain the members roster uses, run before the
-                # length cap so a credential split by truncation cannot leak.
-                _prev = content if isinstance(content, str) else str(content or "")
-                _prev, _ = redact_exfiltration_urls(_prev)
-                _prev, _ = redact_credentials(_prev)
-                _prev = _prev[:140]
+
+                # Same redaction chain the members roster read uses, run
+                # before the length cap so a credential split by truncation
+                # cannot leak. The payload is built by the one shared spelling
+                # (`member_message_payload` -> `speech_preview`) so the folded
+                # preview equals what `GET /api/members` reads back.
+                def _sanitize_preview(text: str) -> str:
+                    text, _ = redact_exfiltration_urls(text)
+                    text, _ = redact_credentials(text)
+                    return text
+
+                _payload = eventlog_hooks.member_message_payload(
+                    role, content, msg.get("meta"), _ev_ts, sanitize=_sanitize_preview
+                )
 
                 # Off the event loop: emit opens the member log and does a
                 # synchronous os.fsync append. This callback runs loop-side, so
@@ -6351,7 +6760,7 @@ class DashboardState:
                         _mslug,
                         None,
                         MEMBER_MESSAGE,
-                        {"ts": _ev_ts, "preview": _prev},
+                        _payload,
                     )
 
                 # Queued on the ordered executor either way -- see the slot
@@ -6746,6 +7155,16 @@ class DashboardState:
     async def read_folders(self, read: Callable[[list[dict[str, Any]]], _T]) -> _T:
         """Run a synchronous reader against committed folder state."""
         return await _FOLDER_REPOSITORY.read(lambda: self._folders, self._folders_lock, read)
+
+    async def hold_folders(self, section: Callable[[list[dict[str, Any]]], Awaitable[_T]]) -> _T:
+        """Hold the folder store lock across an awaitable, read-only section.
+
+        The section sees a snapshot of the committed folders and may hop off
+        the loop; no folder mutation can commit until it returns. This is how
+        a delete elsewhere excludes a concurrent folder pin (the agent
+        templates guard) without doing its file work on the loop.
+        """
+        return await _FOLDER_REPOSITORY.hold(lambda: self._folders, self._folders_lock, section)
 
     def _write_folders_confirmed(self, path: Path, snapshot: list[dict[str, Any]]) -> None:
         """Persist the complete folder value and prove it landed."""
@@ -7392,6 +7811,61 @@ class DashboardState:
             )
             d["subagents_running"] = bool(subs and subs.running_agents_for(f"dashboard:{s.key}"))
             out.append(d)
+        _attach_slot_parents(out)
+        return out
+
+    def serialize_slot_views(
+        self, *, owner: bool
+    ) -> tuple[list[dict], list[dict], list[dict] | None]:
+        """One serialization pass, three audience views of the slot list.
+
+        Returns ``(bare, dashboard_user, owner)``; ``owner`` is ``None`` when
+        ``owner`` is False (no owner socket to build it for).
+
+        The three views the broadcast ships differ ONLY in each slot's
+        ``source_links`` field -- the audience gates are read nowhere else in the
+        summary (see ``_ChatSlot.source_links_view``). Serializing the list three
+        times therefore ran the per-slot projection body (last-message markdown
+        strip, credential redaction, options parse) and the source-link
+        budgeting three times for identical output, synchronously on the
+        event loop: measured at ~200 ms per pass on a sidebar of ~80 tabs, so a
+        broadcast stalled the loop for ~600 ms. Those stalls read as host pressure
+        to the adaptive concurrency controller (``loop_lag >= 250 ms`` is a
+        sufficient-alone decrease signal) and pinned the subagent cap at its floor
+        on an idle machine. Serialize once, then re-project only the one field.
+
+        The derived dicts are shallow copies: every other value is shared with
+        the bare list. Nothing mutates a slot payload after serialization (the
+        bare list is ``json.dumps``-ed for SSE and the WS frames are built from
+        the lists as-is), so sharing is safe and avoids a deep copy per audience.
+        A payload whose key has no live slot (a patched ``serialize_slots`` in
+        tests, or a slot closed between the two loops) is carried over unchanged.
+        """
+        bare = self.serialize_slots()
+        return (
+            bare,
+            self._reproject_slots(bare, dashboard_user=True),
+            self._reproject_slots(bare, include_check_status=True) if owner else None,
+        )
+
+    def _reproject_slots(
+        self,
+        slots_data: list[dict],
+        *,
+        include_check_status: bool = False,
+        dashboard_user: bool = False,
+    ) -> list[dict]:
+        out: list[dict] = []
+        for payload in slots_data:
+            slot = self._slots.get(payload.get("key", ""))
+            if slot is None or "source_links" not in payload:
+                out.append(payload)
+                continue
+            view = dict(payload)
+            view["source_links"] = slot.source_links_view(
+                include_check_status=include_check_status, dashboard_user=dashboard_user
+            )
+            out.append(view)
         return out
 
     def _drop_orphaned_mcp_report(self, slot: "_ChatSlot") -> None:
@@ -7552,6 +8026,13 @@ class DashboardState:
         Called from an app startup hook: that is the earliest point the loop
         exists, so every later reader finds it already bound instead of racing to
         latch a copy from whichever thread happens to arrive first.
+
+        Deliberately does NOT seed the session-lineage projection. Seeding is bound to
+        one store and re-runs whenever the data home changes, so a process that binds
+        several states over several homes -- a test run, a pod host -- would queue one
+        full cold scan per bind onto the shared maintenance pool and starve everything
+        else waiting on it. The seed is requested lazily instead, by the first slots
+        frame that finds the projection cold (see :func:`_attach_slot_parents`).
         """
         self._serving_loop = loop
 
@@ -7618,8 +8099,13 @@ class DashboardState:
         # allowed that route. Keep the broadcast list bare and put
         # the public-repo enrichment only on the WS path, where
         # ``_serialize_for_client`` re-filters app tokens.
-        slots_data = self.serialize_slots()
-        slots_data_ws = self.serialize_slots(dashboard_user=True)
+        #
+        # One serialization pass for all three audiences -- see
+        # ``serialize_slot_views`` for why three passes stalled the event loop.
+        owner_ws_clients = getattr(self, "_owner_ws_clients", None)
+        slots_data, slots_data_ws, owner_slots = self.serialize_slot_views(
+            owner=bool(owner_ws_clients)
+        )
         # The evidenced way this broadcast fails is a non-serializable value in
         # slot state: the dump raises, and the bare TypeError
         # names neither the slot nor the field. Serialize up front and annotate
@@ -7699,9 +8185,7 @@ class DashboardState:
         # invalidation, so a subset here leaves the owner without them. Both frames
         # are built by `_slots_ws_frame`, so a key cannot reach one and not the
         # other.
-        owner_ws_clients = getattr(self, "_owner_ws_clients", None)
-        if owner_ws_clients:
-            owner_slots = self.serialize_slots(include_check_status=True)
+        if owner_ws_clients and owner_slots is not None:
             self._send_ws_owners(
                 _slots_ws_frame(
                     owner_slots,
@@ -8264,6 +8748,69 @@ def sweep_expired_notifications(log: list[dict[str, Any]], *, now: float | None 
     return removed
 
 
+def _read_notification_lines(path: Path) -> list[str]:
+    """Every line of the notifications file, terminators intact.
+
+    ``newline=""`` disables the newline translation text mode applies by default. With
+    translation on, a read turns a CRLF or a bare CR into a bare LF, so a caller that
+    writes those lines back silently rewrites bytes it meant to preserve: the snapshot
+    dedupe key for a timestamp-less row is its RAW bytes, so a rewritten terminator
+    makes the row differ from its source record, and a later merge appends a duplicate
+    instead of collapsing it. A bare CR is worse than a terminator change, because it
+    is the byte that split a record into the fragments the merge deliberately keeps.
+
+    Line BOUNDARIES are identical either way: ``str.splitlines`` breaks on CR, LF and
+    CRLF whether or not the read translated them. Only the retained bytes differ, so
+    reading this way changes what is preserved and never what counts as a line.
+    """
+    with open(path, encoding="utf-8", newline="") as handle:
+        return handle.read().splitlines(keepends=True)
+
+
+def _servable_note(line: str) -> dict[str, Any] | None:
+    """The note a persisted JSONL line yields, or ``None`` when none can be served.
+
+    The single acceptance test for a notification row, shared by the loader and by the
+    append-time trim so the two cannot drift apart. A line the loader would skip must
+    not occupy a slot in the trim's live window: it would displace a servable row, and
+    the rewrite that follows deletes that row permanently.
+
+    Parsing to a JSON object is not sufficient on its own. ``normalize_note`` raises
+    for an object whose ``channel`` is unhashable, so such a row parses here and is
+    still unservable, and a trim that asked only ``isinstance(row, dict)`` would count
+    it as live history.
+
+    Redaction is part of acceptance rather than the caller's job, for two reasons. Rows
+    written before delivery-time redaction existed may carry unredacted LLM-derived
+    content and are served to SSE clients straight from the loader's list; and the
+    redactor is one of the two steps that can reject a row, so leaving it out of the
+    test would reopen the divergence this function closes.
+
+    The note is normalized and redacted in place. A caller that writes the file back
+    writes the ORIGINAL bytes, never this dict, so nothing here migrates what is on
+    disk.
+
+    Leading and trailing whitespace is stripped HERE rather than by a caller, because
+    ``str.strip()`` removes whitespace ``json`` does not accept -- a no-break space, for
+    one -- so a caller that strips and a caller that does not reach opposite verdicts on
+    the same row. This stripping decides only whether a row can be served; it never
+    reaches disk, so it is not the stripping hazard the snapshot dedupe key avoids,
+    where a stripped key makes two distinct byte sequences collide and deletes one.
+    """
+    try:
+        note = normalize_note(json.loads(line.strip()))
+        for key, value in note.items():
+            if key != "ts":
+                note[key] = _redact_note_value(value)
+        return note
+    except Exception:  # noqa: BLE001 -- skip the bad row, not the whole file
+        # normalize_note/_redact_note_value can raise on valid-JSON rows with
+        # unexpected shapes (e.g. a top-level array); keep the per-line skip
+        # semantics instead of losing all history to a caller's outer except.
+        logger.debug("Skipping malformed notification row", exc_info=True)
+        return None
+
+
 def _load_notifications() -> list[dict[str, Any]]:
     """Load persisted notifications from disk (newest last)."""
     path = _notifications_path()
@@ -8271,26 +8818,11 @@ def _load_notifications() -> list[dict[str, Any]]:
         return []
     try:
         entries: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
+        for line in _read_notification_lines(path):
+            parsed = _servable_note(line)
+            if parsed is None:
                 continue
-            try:
-                parsed = normalize_note(json.loads(line))
-                # Redact at load: rows written before delivery-time redaction
-                # existed may carry unredacted LLM-derived content; they are
-                # served to SSE clients straight from this list.
-                for key, value in parsed.items():
-                    if key != "ts":
-                        parsed[key] = _redact_note_value(value)
-                entries.append(parsed)
-            except Exception:  # noqa: BLE001 — skip the bad row, not the whole file
-                # normalize_note/_redact_note_value can raise on valid-JSON
-                # rows with unexpected shapes (e.g. a top-level array); keep
-                # the per-line skip semantics instead of losing all history
-                # to the outer except.
-                logger.debug("Skipping malformed notification row", exc_info=True)
-                continue
+            entries.append(parsed)
         # RFC Phase 5: drop expired passive rows BEFORE the recency cap.
         # Sweeping after truncation loses data: with more than N rows on
         # disk, newer expired-passive rows would displace older LIVE rows
@@ -8378,24 +8910,52 @@ def _maybe_trim_notifications(path: Path) -> None:
     displacement hazard as the load path: trimming the
     raw tail first would retain newer expired-passive rows while deleting
     older LIVE rows, permanently losing history after the next load-time
-    sweep. Unparseable lines are kept (never destroy on ambiguity).
+    sweep.
+
+    The recency cap counts only LIVE lines: a line ``_servable_note`` accepts and this
+    sweep does not find expired, which is exactly what ``_load_notifications`` goes on
+    to serve. Both paths ask that one predicate, so the trim cannot come to disagree
+    with the loader about what counts as history. An UNSERVABLE line, one the predicate
+    rejects, is still kept, because destroying a line on ambiguity is worse than
+    holding one nobody can read. It is kept in a separate, smaller window so that it
+    cannot displace a live notification.
+
+    Two windows rather than one, because one shared window turns an append into an
+    eviction. An unservable line has no dedupe key, so a merge appends it instead of
+    collapsing it, which puts it among the NEWEST lines; a single newest-N window over
+    the combined list then discards valid older notifications in its favour, and the
+    rule meant to avoid destroying data is what destroys it. Neither the framing that
+    produces unparseable fragments nor the withheld dedupe key is the thing to change:
+    both are deliberate, and both are what stop a fragment being skipped as a false
+    duplicate and its bytes lost.
+
+    Retained lines keep their original file order AND their exact bytes, terminator
+    included, so a fragment stays beside the neighbours that explain it, a final line
+    with no terminator stays final instead of gluing onto the row written after it, and
+    a CRLF or bare-CR row still matches the raw dedupe key its source record carries.
     """
     try:
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        lines = _read_notification_lines(path)
         if len(lines) <= _MAX_PERSISTED_NOTIFICATIONS * 2:
             return
-        keep: list[str] = []
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except Exception:
-                keep.append(line)
+        live: list[int] = []
+        unservable: list[int] = []
+        for index, line in enumerate(lines):
+            row = _servable_note(line)
+            if row is None:
+                unservable.append(index)
                 continue
-            if isinstance(row, dict) and sweep_expired_notifications([row]) == 1:
+            if sweep_expired_notifications([row]) == 1:
                 continue  # expired passive row -- drop before the cap
-            keep.append(line)
-        kept = keep[-_MAX_PERSISTED_NOTIFICATIONS:]
-        path.write_text("".join(kept), encoding="utf-8")
+            live.append(index)
+        # Never zero. A zero cap does not empty the window, it removes the bound:
+        # ``unservable[-0:]`` is the WHOLE list, so a small cap would silently
+        # retain every unservable line instead of a recent sample of them.
+        unservable_cap = max(
+            1, _MAX_PERSISTED_NOTIFICATIONS // _UNSERVABLE_NOTIFICATION_CAP_DIVISOR
+        )
+        kept = sorted(set(live[-_MAX_PERSISTED_NOTIFICATIONS:]) | set(unservable[-unservable_cap:]))
+        path.write_text("".join(lines[index] for index in kept), encoding="utf-8", newline="")
     except Exception:
         pass
 

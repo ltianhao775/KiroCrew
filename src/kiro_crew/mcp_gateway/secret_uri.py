@@ -46,7 +46,9 @@ def _is_valid_secret_name(name: str) -> bool:
     return bool(name) and name == name.strip()
 
 
-def resolve_secret_uris(env: dict[str, str], config_dir: Path) -> tuple[dict[str, str], set[str]]:
+def resolve_secret_uris(
+    env: dict[str, str], config_dir: Path, *, subject: str = "MCP server"
+) -> tuple[dict[str, str], set[str]]:
     """Return a copy of *env* with ``secret://NAME`` values resolved.
 
     Returns ``(resolved_env, secret_keys)`` where *secret_keys* is the set
@@ -54,6 +56,13 @@ def resolve_secret_uris(env: dict[str, str], config_dir: Path) -> tuple[dict[str
     The caller MUST clear these keys from the returned dict after the child
     process has been spawned (``exec`` copies them into the child's address
     space) so that plaintext secrets do not linger in parent-process memory.
+
+    *subject* names WHOSE env mapping is being resolved, and appears in every
+    error this function raises. It exists because this resolver is not
+    MCP-only: the DeepSeek Harness's ``agent.deepseek_env`` runs through it too,
+    and a refusal telling that operator about an "MCP server" would send them to
+    the wrong configuration surface. It never carries a secret name or value --
+    see the note on :func:`_is_valid_secret_name`.
 
     Non-matching values pass through unchanged. Any value beginning with the
     ``secret://`` scheme is treated as a secret reference — including
@@ -91,7 +100,7 @@ def resolve_secret_uris(env: dict[str, str], config_dir: Path) -> tuple[dict[str
             # propagates to the spawn path's logs unsanitised. Name only the
             # env-var key, which is operator-declared config.
             raise ValueError(
-                f"MCP server env var {key!r} has a malformed secret:// "
+                f"{subject} env var {key!r} has a malformed secret:// "
                 f"reference: the name after 'secret://' must be non-empty with "
                 f"no leading or trailing whitespace (stored names are "
                 f"stripped, so such a reference can never match). "
@@ -111,9 +120,9 @@ def resolve_secret_uris(env: dict[str, str], config_dir: Path) -> tuple[dict[str
         secret_value = fetched.get(secret_name)
         if secret_value is None:
             raise ValueError(
-                f"MCP server env var {key!r} references a secret that does not "
-                f"exist in the vault (read the referenced name from the "
-                f"server's env config under {key!r}). "
+                f"{subject} env var {key!r} references a secret that does not "
+                f"exist in the vault (read the referenced name from the env "
+                f"mapping's own entry under {key!r}). "
                 f"Store it under Settings > Secrets in the dashboard (or "
                 f"migrate it with `kirocrew secrets import`)."
             )

@@ -20,11 +20,14 @@ from typing import Any
 
 from aiohttp import BodyPartReader, web
 
-from kiro_crew import agent_state, model_registry, model_scope
+from kiro_crew import agent_state
+from kiro_crew import crew_teams as teams_mod
+from kiro_crew import model_registry, model_scope
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_KIRO,
     model_registry_namespace,
     selectable_backend_values,
 )
@@ -50,6 +53,7 @@ from kiro_crew.agent_discovery import (
     spec_model,
     spec_str,
 )
+from kiro_crew.agent_files import KAS_RESERVED_AGENT_IDS
 from kiro_crew.agent_sdk.capabilities import capabilities_for, capabilities_of
 from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
@@ -114,6 +118,12 @@ from kiro_crew.dashboard.handlers._shared import (
     agent_skill_views,
     apply_skill_mapping,
     read_bounded_json,
+)
+from kiro_crew.dashboard.handlers.agent_templates import (
+    TEMPLATE_DEFINITION_KEYS,
+    apply_definition_patch,
+    read_only_reason_for_path,
+    validate_definition_patch,
 )
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
@@ -1959,11 +1969,18 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
     session already resolved", so it stays selectable even on a backend that does
     not advertise it by name.
 
-    Fails open in every unknowable case — no live session, a backend that
-    advertises nothing, or an advertised set that does not intersect the catalog
-    at all (a namespace mismatch rather than an entitlement, e.g. the claude
-    backend's bare ids). Filtering on any of those would empty the picker, which
-    is worse than listing one model too many.
+    Only a session whose ids live in the catalog's own namespace can narrow it
+    (``capabilities_of(provider).model_id_namespace``, the same gate
+    :func:`_advertised_cc_models` applies). A live claude session advertises
+    ``global.anthropic.…[1m]`` ids; ``resolve_pin_spelling`` folds those onto the
+    catalog's bare ids because they name the same models, so without the gate a
+    claude list would rewrite kiro's picker rows into claude's spelling and narrow
+    them to claude's entitlements. Namespace is the question here, not spelling.
+
+    Fails open in every unknowable case — no live session in this namespace, a
+    backend that advertises nothing, or an advertised set that does not intersect
+    the catalog at all under any spelling. Filtering on any of those would empty
+    the picker, which is worse than listing one model too many.
     """
     try:
         state: DashboardState = request.app["state"]
@@ -1978,6 +1995,10 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
     # entitlements, i.e. keep offering exactly the models this narrowing exists to
     # hide. The most recently started session carries the most recent snapshot.
     for provider in reversed(providers):
+        if capabilities_of(provider).model_id_namespace != model_registry_namespace(
+            ACP_BACKEND_KIRO
+        ):
+            continue
         getter = getattr(provider, "available_models", None)
         if not callable(getter):
             continue
@@ -2415,9 +2436,33 @@ async def api_models(request: web.Request) -> web.Response:
         # seeding above uses kiro's authoritative context_window_tokens to give
         # the backfill real GPT/DeepSeek/Qwen windows, independent of the
         # wire-format choice.
-        if model_registry.refresh_kiro_windows(models):
+        #
+        # The same rows also warm the ``acp`` advertised-model cache, kiro's
+        # VOCABULARY: which ids are kiro's own, so model_scope can tell a pin
+        # chosen for another harness from one chosen here before any session
+        # exists (the chip and the provider factory judge from the cache; the
+        # wire holds the live list). ONE admission feeds both caches
+        # (refresh_kiro_catalog), so an id the bound refuses gets no row in
+        # either. Fed from the UNFILTERED catalog on purpose: a deprecated or
+        # unentitled row is still a kiro id, and dropping it here would make
+        # model_scope call a native pin foreign. Entitlement stays with the
+        # live ``session/new`` list downstream (_entitled_kiro_models,
+        # model_is_unusable) -- ``--list-models`` is a catalog and no reader
+        # of this cache treats it as more. Sourced here rather than from any
+        # ``session/new`` payload because the registry attributes that payload
+        # to claude-agent-acp and a kiro session's list is scoped to the agent
+        # that session started. In-memory updates on the loop, disk persists
+        # off it.
+        windows_changed, advertised_changed = model_registry.refresh_kiro_catalog(
+            models, model_registry_namespace(ACP_BACKEND_KIRO)
+        )
+        if windows_changed:
             await asyncio.get_running_loop().run_in_executor(
                 maintenance_executor(), model_registry.persist_kiro_windows
+            )
+        if advertised_changed:
+            await asyncio.get_running_loop().run_in_executor(
+                maintenance_executor(), model_registry.persist_advertised_models
             )
         models = [m for m in models if not is_deprecated_model(m.get("model_name", ""))]
         models = _entitled_kiro_models(request, models)
@@ -2915,7 +2960,12 @@ async def api_agent_fork(request: web.Request) -> web.Response:
         # ...) are rebuilt on boot; a copy landing on one of those stems while
         # the managed file is absent would be overwritten by that rebuild, so
         # they count as taken whether or not the file exists right now. Same
-        # rule the publish handler applies to a user-chosen name.
+        # rule the publish handler applies to a user-chosen name. The ids the
+        # KAS engine keeps for itself (``KAS_RESERVED_AGENT_IDS``: ``default``,
+        # the seeded first crewmate's own name, and the built-in mode ids) are
+        # taken for the same reason, matched exactly as the engine matches
+        # them: a copy on such a stem binds the crew to a mode KAS never
+        # advertises, or to the engine's own agent instead of the copy.
         managed_stems = {Path(f).stem.lower() for f in OWNED_KIRO_AGENT_FILES}
 
         def _create_record_bind() -> tuple[str, Path]:
@@ -2986,6 +3036,7 @@ async def api_agent_fork(request: web.Request) -> web.Response:
                         copy_name.lower() in taken
                         or copy_name.lower() in bound
                         or copy_name.lower() in managed_stems
+                        or copy_name in KAS_RESERVED_AGENT_IDS
                         or _is_reserved_basename(copy_name)
                         or _spec_stem_on_disk(agents_dir, copy_name)
                     ):
@@ -3119,6 +3170,19 @@ async def api_agent_publish(request: web.Request) -> web.Response:
     if f"{new_name.lower()}.json" in {f.lower() for f in OWNED_KIRO_AGENT_FILES}:
         return web.json_response(
             {"error": f"'{new_name}' is reserved", "code": "template_name_reserved"}, status=400
+        )
+    if new_name in KAS_RESERVED_AGENT_IDS:
+        # The KAS engine keeps its own agent under this id (or drops the entry)
+        # without an error, so a template published under it never runs there.
+        # Exact match, as the engine matches: ``Default`` registers normally.
+        # Its own code, distinct from the runtime-owned stems above, so the
+        # dashboard can say WHOSE name it is rather than "reserved" alone.
+        return web.json_response(
+            {
+                "error": f"'{new_name}' is reserved by the KAS agent engine",
+                "code": "template_name_reserved_by_engine",
+            },
+            status=400,
         )
 
     from kiro_crew.dashboard.handlers.agent_capabilities import inherited_template_action
@@ -3465,7 +3529,23 @@ async def api_agent_detail(request: web.Request) -> web.Response:
     # directory must not stall every other request on the loop. Only the specs
     # that claim *name* come back, in scan order, so the body below keeps its
     # skip-to-next-file shape over exactly the files it would have acted on.
-    for f, spec in await asyncio.to_thread(_agent_detail_candidates, name):
+    candidates = await asyncio.to_thread(_agent_detail_candidates, name)
+    if request.method == "PATCH" and patch_body is not None and len(candidates) > 1:
+        # A PATCH rewrites ONE file -- model, skills, prompt, tools alike. Two
+        # files claiming the name (``atlas.json`` beside ``SomePkg-atlas.json``,
+        # or a hand-edited declared name colliding with another file's stem)
+        # would be resolved by unordered scan order, so the file the roster
+        # showed and the file overwritten could differ. Refused for every key,
+        # like the fork/publish resolvers refuse ``_AmbiguousTemplateName``;
+        # the same check runs again under the write lock below.
+        return web.json_response(
+            {
+                "error": f"'{name}' matches more than one template file; rename one first.",
+                "code": "ambiguous_template_name",
+            },
+            status=409,
+        )
+    for f, spec in candidates:
         # Two-step so ``data`` stays typed ``dict`` for the PATCH branch's
         # re-read below, which reassigns it from a raw ``json.loads``.
         data = spec
@@ -3510,6 +3590,28 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                         return web.json_response(
                             {"error": f"at most {MAX_AGENT_SKILLS} skills per agent"},
                             status=400,
+                        )
+                if TEMPLATE_DEFINITION_KEYS & patch_body.keys():
+                    # The templates tab's definition edit (prompt, description,
+                    # tools). Shape-checked here; refused for a spec the tab
+                    # cannot own -- a package or runtime file would be reverted
+                    # on its next install, a private copy belongs to its crew's
+                    # pane. ``model`` / ``skills`` keep their existing reach: the
+                    # crew pane writes those onto private copies.
+                    problem = validate_definition_patch(patch_body)
+                    if problem is not None:
+                        return web.json_response(
+                            {"error": problem, "code": "invalid_definition"}, status=400
+                        )
+                    read_only = await asyncio.to_thread(read_only_reason_for_path, f)
+                    if read_only is not None:
+                        return web.json_response(
+                            {
+                                "error": f"Template '{name}' is read-only ({read_only})",
+                                "code": "template_read_only",
+                                "reason": read_only,
+                            },
+                            status=409,
                         )
                 mapped: list[str] = []
                 loop = asyncio.get_running_loop()
@@ -3603,6 +3705,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                         # before persisting (same contract as
                         # _write_spec_file and the PUT handler).
                         with agents_spec_lock(f.parent):
+                            # The pre-lock ambiguity check re-run where it
+                            # decides: a second claimant that landed after the
+                            # scan (a package install) must refuse, not let
+                            # the stale single match be overwritten.
+                            if [c for c, _spec in _agent_detail_candidates(name)] != [f]:
+                                raise _AmbiguousTemplateName(name)
                             fresh = _read_agent_spec(
                                 f, operation="api_agent_detail", source="dashboard"
                             )
@@ -3621,6 +3729,7 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                     clear_model_pin(data, agent_name)
                                 else:
                                     agent_state.set_model_managed(agent_name, False)
+                            apply_definition_patch(data, patch_body)
                             agent_state.lift_and_strip_bookkeeping(data, agent_name)
                             for key, value in data.items():
                                 if key not in before_patch or before_patch[key] != value:
@@ -3640,6 +3749,15 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                     except CapabilityError as exc:
                         return web.json_response(
                             {"error": exc.code, "code": exc.code}, status=exc.status
+                        )
+                    except _AmbiguousTemplateName:
+                        return web.json_response(
+                            {
+                                "error": f"'{name}' matches more than one template file; "
+                                "rename one first.",
+                                "code": "ambiguous_template_name",
+                            },
+                            status=409,
                         )
                     except FileNotFoundError:
                         return web.json_response(
@@ -4265,17 +4383,45 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
             # asyncio lock while the worker is mid-write.
             to_add = {n: cfg.agents[n] for n in synced if n in cfg.agents}
 
-            def _write_sync() -> list[str]:
+            def _write_sync() -> tuple[list[str], list[str], list[str]]:
                 retired_stores: list[str] = []
+                # The names _mutate REALLY deleted -- a subset of the snapshot
+                # candidates, because an entry edited between the snapshot and
+                # the lock hold survives (see the comment inside _mutate).
+                deleted_names: list[str] = []
+                # Names this sync could NOT register: their stale team
+                # membership could not be purged (see below).
+                deferred_names: list[str] = []
 
                 def _mutate(doc: dict) -> dict | None:
                     agents = coerce_dict_section(doc, "agents")
                     stores = coerce_dict_section(doc, "memory_stores")
                     changed = False
+                    deferred_names.clear()
                     for aname, acfg in to_add.items():
-                        if aname not in agents:
-                            agents[aname] = dataclasses.asdict(acfg)
-                            changed = True
+                        if aname in agents:
+                            continue
+                        # A discovered name may have been a crew before (its
+                        # package was removed and has come back): purge any
+                        # stale team membership INSIDE this locked mutation,
+                        # right before the name is registered, as every create
+                        # path does. The sync is periodic, so a name whose
+                        # purge cannot be made is left out of THIS sync and
+                        # picked up by the next one -- never registered while
+                        # its old membership could resurface.
+                        try:
+                            teams_mod.release_for_create(aname)
+                        except teams_mod.TeamsUnavailable:
+                            logger.warning(
+                                "sync: deferring agent %r -- its stale team membership "
+                                "could not be purged; retrying next sync",
+                                aname,
+                                exc_info=True,
+                            )
+                            deferred_names.append(aname)
+                            continue
+                        agents[aname] = dataclasses.asdict(acfg)
+                        changed = True
                     # Prune ONLY this sync's snapshot candidates, and only
                     # while the in-lock entry still equals the snapshot entry:
                     # an agent (re)added or edited between the discovery
@@ -4293,18 +4439,34 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
                                     )
                                 retired_stores.append(store_name)
                             del agents[aname]
+                            deleted_names.append(aname)
                             changed = True
                     return doc if changed else None
 
+                def _drop_pruned() -> None:
+                    # A pruned package agent may be on a team; drop it like the
+                    # delete route does -- AFTER the registry write committed,
+                    # still inside its lock. ONLY the names _mutate actually
+                    # deleted: a snapshot candidate that survived (edited
+                    # concurrently) keeps its team. Best-effort: the list route
+                    # reconciles against the registry anyway.
+                    for deleted_name in deleted_names:
+                        teams_mod.drop_member(deleted_name)
+
                 with memory_store_namespace_lock():
-                    update_config_locked(mutate=_mutate)
+                    update_config_locked(mutate=_mutate, after_write=_drop_pruned)
                 from kiro_crew.context import release_cached_memory_store
 
                 for store_name in retired_stores:
                     release_cached_memory_store(store_name)
-                return retired_stores
+                return retired_stores, deleted_names, deferred_names
 
-            retired_stores = await _drained_to_thread(_write_sync)
+            retired_stores, deleted_names, deferred_names = await _drained_to_thread(_write_sync)
+            # A deferred name is NOT a synced name: it leaves `synced` too, so
+            # neither the response nor the audit record reports a registration
+            # that did not happen (a refusal is not a commit).
+            if deferred_names:
+                synced[:] = [n for n in synced if n not in deferred_names]
             if (state := request.app.get("state")) is not None:
                 from kiro_crew.dashboard.handlers._shared import release_markdown_memory_store
 
@@ -4591,6 +4753,23 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    # The crew name must satisfy the same grammar ``GET /api/members`` applies
+    # when it lists the roster (``members.py`` skips any row failing
+    # ``_AGENT_NAME_RE``). Persisting a name that fails it -- a space, a non-ASCII
+    # letter, a leading dash -- would create a crew no roster surface can show or
+    # open; refused here, once, for every client of this route. Same BOUNDARY
+    # as the credential rule above: names already stored are not renamed.
+    if not _AGENT_NAME_RE.match(name):
+        return web.json_response(
+            {
+                "error": (
+                    "Agent name must use letters, digits, '-' or '_' only, "
+                    "start and end with a letter or digit, and be at most 64 characters."
+                ),
+                "code": "invalid_agent_name",
+            },
+            status=400,
+        )
     # The template pointer must be EXPLICIT. Defaulting it to "kirocrew" would
     # make every crew created without naming a template an alias for the DEFAULT
     # agent: dispatch flattens an alias to its `kiro_agent`
@@ -4736,6 +4915,14 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+        # A crew that carried this name before may still be listed on a team
+        # (every removal path drops it best-effort). persist_member_config
+        # purges that INSIDE the registry's locked mutation, right before the
+        # record is published, on every create path: the in-process config
+        # lock keeps this process's team writes out, and the cross-process
+        # sidecar lock keeps `kirocrew agent create` out, so no writer can
+        # create and team the same name between the purge and the registration.
+        # A purge that cannot be made refuses the create (409 below).
         new_agent = KiroCrewAgentConfig(
             kiro_agent=kiro_agent,
             workspace=body.get("workspace", "default"),
@@ -4777,6 +4964,16 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": f"Agent '{name}' already exists", "code": "agent_exists"}, status=409
             )
+        except teams_mod.TeamsUnavailable as exc:
+            return web.json_response(
+                {
+                    "error": f"A previous crew named '{name}' may still be on a team and "
+                    f"the crew-teams store is unavailable ({exc}); retry once it is "
+                    "readable and writable.",
+                    "code": "teams_unavailable",
+                },
+                status=409,
+            )
         except (OSError, UnknownMemoryStore) as exc:
             return web.json_response(
                 {"error": str(exc), "code": "member_memory_unavailable"}, status=409
@@ -4794,8 +4991,18 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         source="dashboard",
         resources=name,
     )
+    # `member_id` is the crew's IMMUTABLE identity (allocated with its member
+    # memory; `member_config_for_id` resolves it and never a name or slug), so a
+    # client that must bind something to the crew it just made -- the Meet
+    # CrewMates flow's schedule -- can do so without going back through the
+    # mutable display name.
     return web.json_response(
-        {"ok": True, "name": name, "memory_store": cfg.agents[name].memory_store}
+        {
+            "ok": True,
+            "name": name,
+            "memory_store": cfg.agents[name].memory_store,
+            "member_id": cfg.agents[name].member_id,
+        }
     )
 
 
@@ -5361,7 +5568,19 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
                 del agents[name]
                 return doc
 
-            update_config_locked(mutate=mutate)
+            # Drop the crew from its team AFTER the registry write has
+            # committed and still INSIDE its lock. After the commit, so a
+            # config write that fails leaves the membership untouched (the
+            # crew stays, on its team); inside the lock, so a same-name create
+            # in another process (which needs this same sidecar lock) cannot
+            # land between the delete and the drop and have its fresh
+            # membership dropped instead. Best-effort (drop_member swallows
+            # its own failures): a team entry the drop could not remove is
+            # hidden by every reader and purged by the next same-name create.
+            def _drop_from_team() -> None:
+                teams_mod.drop_member(name)
+
+            update_config_locked(mutate=mutate, after_write=_drop_from_team)
             return retired_store
 
         retired_store = await _drained_to_thread(_delete_member)

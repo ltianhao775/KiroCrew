@@ -9,7 +9,10 @@
 // cookies, localStorage, or navigate the parent page. allow-popups (+escape)
 // lets target="_blank" links open in a real new tab; reverse-
 // tabnabbing stays blocked by the mandated rel="noopener noreferrer" on
-// widget links. Same security model as Claude's artifacts (Anthropic).
+// widget links. A bare absolute link (no target) would otherwise navigate the
+// sandboxed frame itself, so EXTERNAL_LINK_TARGET_SHIM_BODY rewrites it to
+// _blank + noopener at click time (hosts that withhold allow-popups opt out
+// via rewriteBareLinks: false). Same security model as Claude's artifacts (Anthropic).
 //
 // DOMPurify is NOT applied because it strips <script> tags, which are
 // required for widget interactivity (Chart.js, D3, Tailwind CDN, etc.).
@@ -400,6 +403,71 @@ const CLIPBOARD_FALLBACK_SHIM_BODY = `(function(){
       } catch (e) {}
     }
   } catch (e) {}
+})();`
+
+/** Absolute web links inside the sandboxed document open OUTSIDE it.
+ *
+ * The frame's sandbox grants `allow-popups allow-popups-to-escape-sandbox`, so
+ * a link with `target="_blank"` becomes a window-open request the host handles
+ * -- in the desktop app that is `setWindowOpenHandler` -> `shell.openExternal`,
+ * i.e. the user's own default browser with their own logins; in a plain browser
+ * it is a new tab. A link WITHOUT a target navigates the sandboxed frame
+ * itself: the widget body is replaced by the target site rendered with no
+ * cookies (an SSO login page where a code-review page should be), inside a
+ * chat row that has no address bar and no way back. The agent is instructed to
+ * write `target="_blank"` on every link, but that instruction is only as
+ * reliable as the model that follows it, so this rewrites a bare absolute
+ * `http(s)://` link to `_blank` at click time.
+ *
+ * Scope is deliberately narrow:
+ *   - Only hrefs that parse (`new URL(href)`, no base) to an `http:`/`https:`
+ *     URL. Parsing rather than regex-matching the raw attribute means a link
+ *     the browser WOULD navigate (leading whitespace, embedded tab/newline)
+ *     is caught too. Fragment links (`#section`, in-widget tab navigation)
+ *     and relative paths do not parse without a base, so they keep their
+ *     default behaviour -- a `<base target="_blank">` would have sent those to
+ *     a new window too, which is why this is a click hook and not a `<base>`.
+ *     `mailto:` and other non-web schemes are left alone as well: the desktop
+ *     host's window-open handler (`electron/external-scheme.js`) hands only
+ *     web URLs and an exact allowlist to the OS and denies the rest, so
+ *     rewriting a `mailto:` to `_blank` would turn it into a dead click there.
+ *   - Only anchors with NO `target` attribute. An explicit `_self` is author
+ *     intent and stays.
+ *   - `data-action` anchors are the composer pre-fill buttons; that handler
+ *     (in HEIGHT_REPORTER_BODY) preventDefaults them, so they are skipped here.
+ *   - `rel="noopener noreferrer"` is set alongside so the opened page gets no
+ *     `window.opener` back into the frame.
+ *
+ * Registered on `window` in the capture phase, and this script runs before the
+ * widget's own, so it is the first click listener to fire: a widget-authored
+ * capture listener on `window` or `document` that stops propagation cannot get
+ * ahead of it. The anchor is resolved from `e.composedPath()[0]` so a link
+ * inside an open shadow root (where `e.target` is retargeted to the host) is
+ * still found. Setting the attribute during dispatch is sufficient: the
+ * anchor's activation behaviour reads `target` after dispatch completes.
+ *
+ * Only injected when the HOST frame grants popups (`rewriteBareLinks`, on by
+ * default). A frame whose sandbox withholds `allow-popups` -- the mochi pet
+ * frame, the crew webview -- turns a `_blank` link into a blocked popup, i.e. a
+ * dead click, which is worse than the in-frame navigation it replaces; those
+ * hosts pass `rewriteBareLinks: false` and keep their pre-existing behaviour.
+ * Not a security boundary (the frame is null-origin and, where this runs,
+ * popups are already allowed); it is a usability fix for the
+ * frame-replaced-by-login-page case.
+ */
+const EXTERNAL_LINK_TARGET_SHIM_BODY = `(function(){
+  window.addEventListener('click', function(e){
+    var path = typeof e.composedPath === 'function' ? e.composedPath() : null;
+    var t = (path && path.length) ? path[0] : e.target;
+    if (!t || typeof t.closest !== 'function') return;
+    var a = t.closest('a[href]');
+    if (!a || a.hasAttribute('target') || a.closest('[data-action]')) return;
+    var u;
+    try { u = new URL(a.getAttribute('href') || ''); } catch (_) { return; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+    a.setAttribute('target', '_blank');
+    a.setAttribute('rel', 'noopener noreferrer');
+  }, true);
 })();`
 
 const COMMENT_BRIDGE_BODY = `(function(){
@@ -844,6 +912,12 @@ interface BuildSrcdocOptions {
    * default here would visibly flip to English mid-load in every non-English
    * locale. */
   loadingLabel?: string
+  /** Rewrite bare absolute `http(s)` links to `target="_blank"` at click time
+   * so they open outside the frame (see EXTERNAL_LINK_TARGET_SHIM_BODY). On by
+   * default. Set false when the host iframe's sandbox withholds
+   * `allow-popups`: there a `_blank` link is a blocked popup (a dead click),
+   * so in-frame navigation must be left alone. */
+  rewriteBareLinks?: boolean
 }
 
 /** Build the srcdoc HTML for a sandboxed widget iframe. The LLM `html`
@@ -858,6 +932,7 @@ export function buildSrcdoc({
   enableComments = false,
   showLoadingOverlay = false,
   loadingLabel = '',
+  rewriteBareLinks = true,
 }: BuildSrcdocOptions): string {
   // A widget hardcoded for a light canvas renders on a light canvas even when
   // the dashboard is dark -- see resolveWidgetTheme. Resolved once here so the
@@ -976,6 +1051,17 @@ export function buildSrcdoc({
   const clipboardShim = doc.createElement('script')
   clipboardShim.textContent = CLIPBOARD_FALLBACK_SHIM_BODY
   body.appendChild(clipboardShim)
+
+  // Bare absolute links open outside the frame (see
+  // EXTERNAL_LINK_TARGET_SHIM_BODY). Installed before the LLM html so its
+  // capture-phase listener is registered ahead of any widget-authored one.
+  // Skipped for hosts whose sandbox withholds popups, where the rewrite would
+  // be a dead click. textContent assignment only.
+  if (rewriteBareLinks) {
+    const linkTargetShim = doc.createElement('script')
+    linkTargetShim.textContent = EXTERNAL_LINK_TARGET_SHIM_BODY
+    body.appendChild(linkTargetShim)
+  }
 
   // Parse LLM html into a document fragment via the typed DOM API. The
   // `html` argument flows through createContextualFragment() — NOT through

@@ -462,6 +462,7 @@ class TestStartApiServerWiring:
         monkeypatch.setattr(_loader, "config_dir", lambda: tmp_path)
         service = MagicMock()
         service.close = AsyncMock()
+        service.seed_sessions_baseline = AsyncMock(return_value=True)
         monkeypatch.setattr(
             _prerequisite, "KiroPrerequisiteService", MagicMock(return_value=service)
         )
@@ -501,6 +502,7 @@ class TestStartApiServerWiring:
         monkeypatch.setattr(_loader, "config_dir", lambda: tmp_path)
         service = MagicMock()
         service.close = AsyncMock()
+        service.seed_sessions_baseline = AsyncMock(return_value=True)
         service_factory = MagicMock(return_value=service)
         monkeypatch.setattr(
             _prerequisite,

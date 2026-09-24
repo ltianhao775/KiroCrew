@@ -77,6 +77,18 @@ _TELEMETRY_SALT_BYTES = 32
 # id-cloning hazard is closed by that non-selection, not by a basename filter.
 NEVER_SNAPSHOT_FILES: frozenset = frozenset({"sel_hmac.key"})
 
+#: Data-home-relative paths, besides the host-local half of ``memory_stores/``, that no
+#: bundle carries in either direction. ``crew-teams/.lock`` is the advisory lock file
+#: `crew_teams.document_lock` opens around every write: empty, this host's runtime state,
+#: and recreated by the first locked write on the restoring host. Matched by POSITION, not
+#: by name -- ``.lock`` is a name an operator's workspace can easily hold.
+_HOST_LOCAL_PATHS: frozenset[tuple[str, ...]] = frozenset({("crew-teams", ".lock")})
+
+
+def _is_host_local(rel_parts: tuple[str, ...]) -> bool:
+    """Is the data-home-relative path *rel_parts* this host's own runtime state?"""
+    return tuple(rel_parts) in _HOST_LOCAL_PATHS or is_host_local_store_state(rel_parts)
+
 
 def _never_ships(member_name: str) -> bool:
     """Is this archive member one no bundle carries in EITHER direction?
@@ -94,7 +106,7 @@ def _never_ships(member_name: str) -> bool:
     parts = PurePosixPath(member_name).parts
     if parts and parts[-1] in NEVER_SNAPSHOT_FILES:
         return True
-    return is_host_local_store_state(parts[1:])
+    return _is_host_local(parts[1:])
 
 
 def _tree_roots_replace_clears() -> frozenset[str]:
@@ -394,6 +406,16 @@ COMPONENTS: dict[str, ComponentSpec] = {
         help="skills/ directory",
         trees=("skills",),
     ),
+    # The crewmate team list: `crew_teams.TEAMS_DIR_NAME` / `TEAMS_FILE_NAME`, one JSON
+    # document naming crews that live in config.json. A tree rather than a flat file so the
+    # restore paths that already exist for a whole tree carry it; the directory's lock
+    # file is host-local and never rides (`_HOST_LOCAL_PATHS`). Team names are the
+    # operator's, so UNRESOLVED like every other component.
+    "crew-teams": ComponentSpec(
+        policy=SecretPolicy.UNRESOLVED,
+        help="crew-teams/ directory (teams.json, the crewmate team list)",
+        trees=("crew-teams",),
+    ),
     "workspace": ComponentSpec(
         policy=SecretPolicy.UNRESOLVED,
         help="workspace/, plan_memory/ directories",
@@ -523,6 +545,114 @@ _JSON_OBJECT_LISTS: dict[str, tuple[str, ...]] = {
     "crons.json": ("jobs",),
 }
 
+#: The one document a component TREE carries whose reader REFUSES a damaged file rather
+#: than reading it empty: `crew_teams.read_teams` raises on anything its parser rejects,
+#: which fails every team route and refuses every crew create with no in-product repair.
+#: So a restore validates it with THAT parser (`crew_teams.read_document`), not with the
+#: flat files' shape check -- a document the shape check admits and the parser refuses
+#: (a bad id, an over-cap name, a newer version) would otherwise install and report success.
+_TREE_DOCUMENT_VALIDATORS: tuple[tuple[str, str, str], ...] = (
+    ("crew-teams", "crew-teams/teams.json", "crew_teams"),
+)
+
+#: Component trees that are restored as ONE DOCUMENT under their owner's lock, never as a
+#: directory swap. `crew-teams/` holds the team document AND the lock file every writer
+#: of that document holds (`crew_teams.document_lock`); removing and recreating the
+#: directory would hand a writer already inside the lock a file nobody else can see, and
+#: its next commit would land over the restored document. So replace, merge and rollback
+#: all go through `crew_teams.install_document` / `remove_document`, which take the same
+#: lock and touch only `teams.json`. Keyed by tree name; the value is the document's
+#: bundle-relative path, which is also the rollback target's granularity.
+_LOCKED_DOCUMENT_TREES: dict[str, str] = {"crew-teams": "crew-teams/teams.json"}
+
+
+def _save_locked_document_to(backup: Path, rel: str) -> Callable[[Path], None]:
+    """The rollback copy of a locked document, taken INSIDE the store's lock hold.
+
+    Phase one of replace copies every other target before any mutation. This document
+    is the exception: a copy taken there, outside the lock, could miss a team write
+    that commits between the copy and phase two's install, and that write would then
+    be lost from the live store AND from the rollback. So the installer takes the
+    copy itself, under the same lock hold that replaces or removes the document.
+    """
+
+    def _save(live: Path) -> None:
+        # Staged beside its final name and PUBLISHED by rename only once the copy has
+        # completed: a copy that fails midway must never leave a truncated file at the
+        # name recovery reads, or the rollback would put that truncation back over a
+        # live document the failed install never touched.
+        final = backup / rel
+        final.parent.mkdir(parents=True, exist_ok=True)
+        partial = final.with_name(final.name + ".partial")
+        try:
+            pinned_fs.copy_file_pinned(
+                str(live),
+                str(partial),
+                on_skip=pinned_fs.fatal_skip_reporter(f"backup of {rel!r}"),
+            )
+            os.replace(partial, final)
+        finally:
+            try:
+                partial.unlink()
+            except FileNotFoundError:
+                pass
+
+    return _save
+
+
+def _install_locked_document(
+    tree: str,
+    snap: Path,
+    mc: Path,
+    *,
+    only_if_absent: bool = False,
+    save_existing: Callable[[Path], None] | None = None,
+) -> bool:
+    """Install (or, with *only_if_absent*, offer) a bundle's locked document into *mc*."""
+    from kiro_crew import crew_teams  # a store module; imported on first use only
+
+    rel = _LOCKED_DOCUMENT_TREES[tree]
+    try:
+        return crew_teams.install_document(
+            snap / rel, mc / tree, only_if_absent=only_if_absent, save_existing=save_existing
+        )
+    except crew_teams.TeamsUnreadable as e:  # pragma: no cover - validated before mutation
+        raise SourceComponentUnsound(
+            f"{rel} in this snapshot would be refused by its reader ({e})."
+        ) from e
+
+
+def _restore_locked_document(tree: str, saved: Path, mc: Path) -> None:
+    from kiro_crew import crew_teams  # a store module; imported on first use only
+
+    crew_teams.restore_document(saved, mc / tree)
+
+
+def _remove_locked_document(
+    tree: str, mc: Path, *, save_existing: Callable[[Path], None] | None = None
+) -> None:
+    from kiro_crew import crew_teams  # a store module; imported on first use only
+
+    crew_teams.remove_document(mc / tree, save_existing=save_existing)
+
+
+def _refuse_unless_valid_tree_document(src: Path, label: str, validator: str) -> None:
+    """Raise `SourceComponentUnsound` unless *src* passes its own consumer's reader."""
+    if validator == "crew_teams":
+        from kiro_crew import crew_teams  # a store module; imported on first use only
+
+        try:
+            crew_teams.read_document(src)
+        except crew_teams.TeamsUnreadable as e:
+            raise SourceComponentUnsound(
+                f"{label} in this snapshot would be refused by its reader ({e}).\n"
+                "   Refusing to restore it: an installed document the team store cannot "
+                "read fails every team route and refuses every crew create."
+            ) from e
+        return
+    raise AssertionError(f"no validator named {validator!r}")
+
+
 # The tree counterpart of CORE_FILES. Derived from the same specs so a component that
 # gains a tree is covered by everything keyed on this without a second edit.
 COMPONENT_TREES: dict[str, tuple[str, ...]] = {
@@ -547,7 +677,13 @@ _CORE_FILE_COMPONENTS: tuple[str, ...] = (
 #: Components restored as whole trees: replace removes the live tree and writes the
 #: archive's, merge copies in without overwriting. Every member declares trees ONLY -- a
 #: component with a flat file belongs above, where a file is moved aside and replaced.
-_WHOLE_TREE_COMPONENTS: tuple[str, ...] = ("workspace", "skills", "artifacts", "uploads")
+_WHOLE_TREE_COMPONENTS: tuple[str, ...] = (
+    "workspace",
+    "skills",
+    "crew-teams",
+    "artifacts",
+    "uploads",
+)
 
 #: Components a MERGE does not restore, so it says so rather than importing them by halves.
 #: The reason is the DATA's shape, not unfinished work, and :func:`_do_merge` states it at
@@ -1480,7 +1616,7 @@ def _staging_ignore(tree: str, root: Path) -> Callable[[str, list[str]], set[str
         rel = os.path.relpath(directory, root_str)
         below = () if rel == os.curdir else Path(rel).parts
         for name in contents:
-            if is_host_local_store_state((*tree_parts, *below, name)):
+            if _is_host_local((*tree_parts, *below, name)):
                 skipped.add(name)
         return skipped
 
@@ -4034,6 +4170,28 @@ def _refuse_corrupt_source_databases(
                 will_install = mc_for_merge is None or not (mc_for_merge / name).is_file()
                 _refuse_unless_json_object(src, name, installed=will_install)
 
+    # A document inside a component tree is validated by ITS OWN reader. The tree is copied
+    # wholesale on replace and file-by-file where the destination lacks the file on merge,
+    # so "installed" is the same question as for a flat file; only an installed document
+    # is checked, because only an installed one reaches the reader.
+    for component, rel, validator in _TREE_DOCUMENT_VALIDATORS:
+        if not _want(components, component):
+            continue
+        src = snap / rel
+        if not src.exists() and not platform_compat.is_link_or_junction(src):
+            continue  # absent from a selective bundle; nothing to validate
+        # A directory or a link standing at the document's name is refused outright, in
+        # every mode, exactly as for a declared flat file above: read as "absent" it would
+        # let the install displace the live document with something no reader can open.
+        if not src.is_file() or platform_compat.is_link_or_junction(src):
+            raise SourceComponentUnsound(
+                f"{rel} in this snapshot is not a regular file.\n"
+                "   Refusing to restore: a document that is a directory or a link cannot "
+                "replace the live one."
+            )
+        if mc_for_merge is None or not (mc_for_merge / rel).is_file():
+            _refuse_unless_valid_tree_document(src, rel, validator)
+
     # Component TREES carry databases too, and a tree is copied wholesale: the knowledge
     # store lives at `workspace/knowledge/knowledge.db`, inside a tree the memory
     # component declares. Checking only the top-level declared files leaves exactly the
@@ -4441,6 +4599,12 @@ def _do_replace(
                 continue
             for dirname in COMPONENTS[comp].trees:
                 d = mc / dirname
+                if dirname in _LOCKED_DOCUMENT_TREES:
+                    # Saved in phase two instead, inside the lock hold that replaces it
+                    # (`_save_locked_document_to`): a copy taken here could miss a team
+                    # write committed before the install. Only the document is ever saved;
+                    # the directory and its lock file are never touched.
+                    continue
                 # Saved only when phase two will REPLACE it, which is exactly when the
                 # archive carries the tree -- `_do_replace_mutations` leaves a wanted
                 # component whose bundle half is absent standing untouched. Saving it anyway
@@ -4458,7 +4622,9 @@ def _do_replace(
                 targets.extend(COMPONENTS[comp].files)
         for comp in _WHOLE_TREE_COMPONENTS:
             if _want(components, comp):
-                targets.extend(COMPONENTS[comp].trees)
+                targets.extend(
+                    _LOCKED_DOCUMENT_TREES.get(tree, tree) for tree in COMPONENTS[comp].trees
+                )
         targets.extend(tree for tree, _ in mem_roots)
 
         # Grows as phase two touches each target; recovery reads it to tell a creation from a
@@ -4658,6 +4824,26 @@ def _do_replace_mutations(
             if safe_tree_root(d, what="destination root", home=mc) is None:
                 raise UnsafeComponentRoot(f"{comp}:{dirname} no longer resolves inside {mc}")
             sd = snap / dirname
+            if dirname in _LOCKED_DOCUMENT_TREES:
+                # Replace means the destination matches the archive, so a bundle WITHOUT
+                # the document -- a tree that lacks it OR no tree at all, the ordinary
+                # shape of an export from a home that never made a team -- removes the
+                # live one. Not gated on `sd.is_dir()` like the trees below: that guard
+                # let the destination's own teams survive a reported full replace.
+                # Either way only the document moves, under its owner's lock, and the
+                # directory is never swapped.
+                rel = _LOCKED_DOCUMENT_TREES[dirname]
+                save = _save_locked_document_to(backup, rel)
+                # The rollback copy is taken by the installer inside its lock hold, so
+                # `installed` is recorded only once the mutation has run: a failure
+                # before it leaves the live document exactly as it was, with nothing
+                # saved and nothing for recovery to undo.
+                if (snap / rel).is_file():
+                    _install_locked_document(dirname, snap, mc, save_existing=save)
+                else:
+                    _remove_locked_document(dirname, mc, save_existing=save)
+                installed.add(rel)
+                continue
             if sd.is_dir():
                 installed.add(dirname)
                 if d.is_dir():
@@ -4784,10 +4970,24 @@ def _restore_everything_from_rollback(
         return list(sorted(set(targets)))
     print(f"↩️  Restoring the previous state from {backup} ...")
     failed: list[str] = []
+    locked_documents = {rel: tree for tree, rel in _LOCKED_DOCUMENT_TREES.items()}
     for rel in sorted(set(targets)):
         saved = store_backup if rel == MEMORY_STORES_DIR_NAME and store_backup else backup / rel
         target = mc / rel
         try:
+            if rel in locked_documents:
+                # A locked document goes back the way it was installed: under its owner's
+                # lock, document only. Saved -> the copy goes back VERBATIM (recovery puts
+                # the operator's state back, it does not validate it -- the saved copy may
+                # be a document the reader already refused, and refusing it here would
+                # strand every later target); not saved but installed by this run ->
+                # remove what the run created; otherwise leave it alone. Nothing on this
+                # branch raises anything but ``OSError``, which the loop names per target.
+                if saved.is_file():
+                    _restore_locked_document(locked_documents[rel], saved, mc)
+                elif rel in installed:
+                    _remove_locked_document(locked_documents[rel], mc)
+                continue
             if platform_compat.is_link_or_junction(saved):
                 # FIRST, because both tests below DEREFERENCE. A core file that was a
                 # relative symlink stops resolving the moment it is moved into the rollback
@@ -5097,6 +5297,10 @@ def _do_merge(
             continue
         for dirname in COMPONENTS[comp].trees:
             sd = snap / dirname
+            if dirname in _LOCKED_DOCUMENT_TREES:
+                if (snap / _LOCKED_DOCUMENT_TREES[dirname]).is_file():
+                    _install_locked_document(dirname, snap, mc, only_if_absent=True)
+                continue
             if sd.is_dir():
                 dd = mc / dirname
                 dd.mkdir(parents=True, exist_ok=True)

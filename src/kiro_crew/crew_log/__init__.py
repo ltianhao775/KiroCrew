@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 #: on demand, so the storage layer stays unloaded until a caller reaches it.
 _EXPORTS: dict[str, str] = {
     # entry_types
+    "CREW_ENTRY_TYPES": "entry_types",
     "ENTRY_TYPES": "entry_types",
     "SESSION_ENTRY_TYPES": "entry_types",
     "EntryType": "entry_types",
@@ -120,6 +121,7 @@ def __dir__() -> list[str]:
 
 if TYPE_CHECKING:  # keep the names visible to type checkers and IDEs
     from kiro_crew.crew_log.entry_types import (  # noqa: F401
+        CREW_ENTRY_TYPES,
         ENTRY_TYPES,
         SESSION_ENTRY_TYPES,
         EntryType,

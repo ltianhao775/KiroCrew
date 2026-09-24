@@ -76,6 +76,7 @@ from kiro_crew.session_directive import (
     clear_vouch,
     refuse_if_markerless,
 )
+from kiro_crew.session_pid_sig import session_pid_mapping_path
 from kiro_crew.session_token_sig import session_key_from_env_token
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.trigger_match import rank_triggered
@@ -400,8 +401,10 @@ def _reverify_refused_target(refused_base: str) -> tuple[str, str] | None:
     * the port is not PROVEN to be held by this user's gateway. The source
       label alone cannot carry that proof: ``KIROCREW_BOUND_PORT`` is
       inherited process state naming the gateway that SPAWNED us, exported
-      once its site was listening (``dashboard.server._export_bound_port``),
-      and it ranks above the marker step — so ``bound``, not ``marker``, is
+      from the port that gateway owns — reserved (bound and listening, not yet
+      accepting) on the dashboard path, republished by
+      ``dashboard.server._export_bound_port`` once its
+      site serves, and it ranks above the marker step — so ``bound``, not ``marker``, is
       the source for every gateway-spawned process, and it is never
       ownership-checked. A refusal is affirmative evidence the previous owner
       is gone, and a retry that SLEEPS first is exactly the window in which
@@ -924,13 +927,34 @@ def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
             f"token but its signed mapping did not verify. Check `kirocrew doctor` "
             f"(SEL trust root) — {server} needs no routing when this channel works."
         )
-    if os.environ.get("KIROCREW_HOST_PID", "").isdigit():
+    host_pid = os.environ.get("KIROCREW_HOST_PID", "")
+    if host_pid.isdigit():
         # The sandbox launcher declared a host pid, so the channel exists and
         # the sidecar is what failed — a signing/trust-root problem, not routing.
+        # Name the directory the verifier actually searched: when an agent spec
+        # pinned a foreign KIROCREW_HOME into this stub's environment,
+        # the path is the poisoned home, and without it the operator is sent to
+        # `kirocrew doctor` on the real gateway, which reports a healthy trust
+        # root and points nowhere.
+        suffix = ""
+        try:
+            mapping = session_pid_mapping_path(host_pid)
+            # Existence-independent on purpose: the mapping directory is
+            # same-uid agent-writable, so any wording that varies with what is
+            # at the path (present, absent, a planted symlink) becomes an
+            # existence oracle. Naming the searched path is the whole of the
+            # diagnostic; whether anything is there is one `ls` away.
+            suffix = f" (mapping searched: {mapping})"
+        except (OSError, RuntimeError, ValueError):
+            # A diagnostic must never replace the denial it decorates with a
+            # crash: Path.home() raises RuntimeError with no resolvable home,
+            # expanduser RuntimeError on "~unknown", resolution OSError, and
+            # garbage ValueError. On any of them, keep the generic wording.
+            suffix = ""
         return (
-            f" No identity channel: the signed pid mapping for this session did not "
-            f"verify. Check `kirocrew doctor` (trust root) — {server} does not need "
-            f"routing when this channel works."
+            f" No identity channel: the signed pid mapping for this session did "
+            f"not verify{suffix}. Check `kirocrew doctor` (trust root) — {server} "
+            f"does not need routing when this channel works."
         )
     return (
         f" No identity channel on this install: {server}'s MCP element carries "
@@ -961,6 +985,7 @@ REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
         "mcp_crew_log.py",
         "mcp_cron.py",
         "mcp_dashboard.py",
+        "mcp_debug.py",
         "mcp_work.py",
         "mcp_panel.py",
         "mcp_tools/apps.py",

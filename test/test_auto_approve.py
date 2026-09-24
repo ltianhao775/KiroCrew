@@ -471,6 +471,7 @@ class TestAutoApproveProvenanceGating:
         }
         req = make_mocked_request(
             "POST", "/api/taskrunner", app=app,
+            headers={"Content-Type": "application/json"},
             payload=BodyStreamPayload(json.dumps(start_body).encode()),
         )
         req["app"] = request_app  # set by token_auth_middleware; "" == dashboard itself
@@ -506,7 +507,8 @@ class TestAutoApproveProvenanceGating:
         raw = json.dumps(exec_body).encode()
         req = make_mocked_request(
             "POST", "/api/taskrunner/t1/execute", app=app, match_info={"task_id": "t1"},
-            headers={"Content-Length": str(len(raw))}, payload=BodyStreamPayload(raw),
+            headers={"Content-Length": str(len(raw)), "Content-Type": "application/json"},
+            payload=BodyStreamPayload(raw),
         )
         req["app"] = request_app
         await api_taskrunner_execute_plan(req)
@@ -539,7 +541,8 @@ class TestAutoApproveProvenanceGating:
         raw = json.dumps({"auto_approve": True}).encode()
         req = make_mocked_request(
             "POST", "/api/taskrunner/t1/execute", app=app, match_info={"task_id": "t1"},
-            headers={"Content-Length": str(len(raw))}, payload=BodyStreamPayload(raw),
+            headers={"Content-Length": str(len(raw)), "Content-Type": "application/json"},
+            payload=BodyStreamPayload(raw),
         )
         req["app"] = ""  # dashboard context → requested trust is honored, so the gate audits
 
@@ -587,6 +590,7 @@ class TestInlineSpecCleanup:
         app["state"] = SimpleNamespace(task_runner=runner)
         req = make_mocked_request(
             "POST", "/api/taskrunner", app=app,
+            headers={"Content-Type": "application/json"},
             payload=BodyStreamPayload(json.dumps(body).encode()),
         )
         req["app"] = ""

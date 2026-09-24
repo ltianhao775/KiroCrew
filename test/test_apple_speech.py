@@ -38,10 +38,13 @@ class TestProviderRegistration:
     def test_apple_is_a_valid_provider(self):
         assert _validated_stt_provider("apple") == "apple"
 
-    def test_unknown_provider_falls_back_to_local(self):
-        """An unusable stored provider degrades to the one with no precondition, so
-        voice input keeps working instead of the load failing on it."""
-        assert _validated_stt_provider("nope") == STT_PROVIDER_LOCAL
+    def test_unknown_provider_falls_back_to_off(self):
+        """An unusable stored provider degrades to ``off``, never to a recogniser:
+        a value nobody can account for must not select the one provider that links
+        a native library into the gateway (``test_stt_provider_off`` has the
+        incident). Retired names are the exception and keep landing on ``local``."""
+        assert _validated_stt_provider("nope") == "off"
+        assert _validated_stt_provider("whisper") == STT_PROVIDER_LOCAL
 
     def test_default_provider_is_local(self):
         """Adding a provider must not move the default off the one that needs
@@ -1580,8 +1583,8 @@ class TestStreamingEndpointGate:
         assert "transcribe" in stt_stream._STREAMING_PROVIDERS
 
     def test_the_gate_offers_exactly_the_selectable_providers(self):
-        """Every provider the loader can store produces partial results, so the gate
-        and the selectable set are the same set.
+        """Every RECOGNISER the loader can store produces partial results, so the
+        gate and the selectable set are the same set once ``off`` is set aside.
 
         Pinned as an equality in both directions because each direction fails
         differently and neither is visible from the endpoint: a selectable provider
@@ -1589,10 +1592,18 @@ class TestStreamingEndpointGate:
         from, and a name in the tuple that the loader can never store (a retired
         whole-file CLI with no partial-result channel) is a live path that would hang
         a client until end of audio. Adding a provider without a partial channel has
-        to be a decision made here rather than inherited."""
+        to be a decision made here rather than inherited.
+
+        ``off`` is the one selectable value that is NOT a recogniser: it exists so
+        that "no speech" has a spelling, and the 503 it draws from this gate is the
+        intended answer. ``test_stt_provider_off`` pins that it never joins the tuple.
+        """
+        from kiro_crew.config.sections import STT_PROVIDER_OFF
         from kiro_crew.dashboard import stt_stream
 
-        assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS)
+        assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS) - {
+            STT_PROVIDER_OFF
+        }
 
 
 class TestNoBlockingCallOnEventLoop:

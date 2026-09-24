@@ -124,14 +124,13 @@ def test_only_implemented_mechanisms_are_enforced() -> None:
     assert gate.is_enforced(ACP_BACKEND_CODEX) is True
     assert gate.is_enforced(ACP_BACKEND_OPENCODE) is True
     assert gate.is_enforced(ACP_BACKEND_PI) is True
-    # deepseek is NOT enforced, and it is the case that shows enforcement following the
-    # MECHANISM rather than the harness: it has a permission setting Crew can pin and
-    # read back, and that setting governs model-initiated escalations rather than tool
-    # calls. Its sandbox decides those itself. So its routing is ``UNVERIFIED``, which
-    # is outside the enforced set by construction -- there is no observation to
-    # enforce.
-    assert gate.is_enforced(ACP_BACKEND_DEEPSEEK) is False
-    assert routing_for(ACP_BACKEND_DEEPSEEK) is Routing.UNVERIFIED
+    # deepseek is enforced through the SAME member as pi, and it is still the case
+    # that shows enforcement following the MECHANISM rather than the harness: its own
+    # permission setting governs model-initiated escalations rather than tool calls,
+    # so it is not a seed-and-verify harness. What routes it is a gate plugin Crew
+    # composes into it and reads back before the first prompt.
+    assert gate.is_enforced(ACP_BACKEND_DEEPSEEK) is True
+    assert routing_for(ACP_BACKEND_DEEPSEEK) is Routing.VERIFIED_GATE_EXTENSION
     assert gate.is_enforced(ACP_BACKEND_CLAUDE) is False
     for backend in AGENT_SPEC_BACKENDS:
         assert gate.is_enforced(backend) is False
@@ -204,6 +203,117 @@ def test_indeterminate_refuses_alongside_bypassed() -> None:
     for verdict in (gate.Verdict.BYPASSED, gate.Verdict.INDETERMINATE):
         with pytest.raises(gate.ToolGateUnroutable):
             gate.enforce_runtime_routing(ACP_BACKEND_CODEX, "reason", verdict=verdict)
+
+
+def _deepseek_marker(approval: object = None, *, include_approval: bool = True) -> dict:
+    """A valid DeepSeek marker with one caller-selected approval snapshot."""
+    marker: dict = {
+        "plugin": "kiro-crew-tool-gate",
+        "nonce": "n1",
+        "module": "/sealed/gate.mjs",
+        # The composed tool presentation and the child-env proof, both clean, so
+        # these tests judge the approval snapshot alone.
+        "tools": {"mode": "native"},
+        "child_env": {
+            "version": "0.1.5-rc.2",
+            "names": [],
+            "parent_missing": [],
+            "child_visible": [],
+            "error": None,
+        },
+    }
+    if include_approval:
+        marker["approval"] = approval
+    return marker
+
+
+_DEEPSEEK_BRIDGE = {
+    "entry": "include:acp",
+    "module": "@deepseek-ai/dsh-acp",
+    "plugin": "acp",
+}
+
+
+@pytest.mark.parametrize(
+    "approval",
+    [
+        pytest.param(None, id="null-snapshot"),
+        pytest.param([], id="non-object-snapshot"),
+        pytest.param({"answerers": [_DEEPSEEK_BRIDGE]}, id="missing-policy"),
+        pytest.param(
+            {"policy": "never", "answerers": [_DEEPSEEK_BRIDGE]},
+            id="wrong-policy",
+        ),
+        pytest.param({"policy": "ask"}, id="missing-answerers"),
+        pytest.param({"policy": "ask", "answerers": {}}, id="non-list-answerers"),
+        pytest.param({"policy": "ask", "answerers": []}, id="no-answerer"),
+        pytest.param({"policy": "ask", "answerers": [None]}, id="null-answerer"),
+        pytest.param(
+            {
+                "policy": "ask",
+                "answerers": [
+                    {
+                        "entry": None,
+                        "module": "@deepseek-ai/dsh-acp",
+                        "plugin": "acp",
+                    }
+                ],
+            },
+            id="malformed-owner-entry",
+        ),
+        pytest.param(
+            {"policy": "ask", "answerers": [_DEEPSEEK_BRIDGE, _DEEPSEEK_BRIDGE]},
+            id="duplicate-bridge",
+        ),
+        pytest.param(
+            {
+                "policy": "ask",
+                "answerers": [
+                    {
+                        "entry": "rogue",
+                        "module": "file:///operator/rogue.mjs",
+                        "plugin": "rogue",
+                    },
+                    _DEEPSEEK_BRIDGE,
+                ],
+            },
+            id="prepended-rogue-answerer",
+        ),
+        pytest.param(
+            {
+                "policy": "ask",
+                "answerers": [
+                    {
+                        "entry": "acp",
+                        "module": "file:///operator/fake-acp.mjs",
+                        "plugin": "acp",
+                    }
+                ],
+            },
+            id="wrong-owner-module",
+        ),
+    ],
+)
+def test_deepseek_marker_refuses_unowned_or_malformed_approval_routing(approval) -> None:
+    """Every non-exclusive answerer shape becomes a runtime routing refusal."""
+    marker = _deepseek_marker(approval)
+    issue = gate.gate_marker_issue(ACP_BACKEND_DEEPSEEK, marker, "/sealed/gate.mjs", "n1")
+    assert issue
+    with pytest.raises(gate.ToolGateUnroutable):
+        gate.enforce_runtime_routing(ACP_BACKEND_DEEPSEEK, issue)
+
+
+def test_deepseek_marker_refuses_a_missing_approval_routing_field() -> None:
+    """Omission fails closed separately from malformed field shapes."""
+    marker = _deepseek_marker(include_approval=False)
+    issue = gate.gate_marker_issue(ACP_BACKEND_DEEPSEEK, marker, "/sealed/gate.mjs", "n1")
+    assert "approval-routing snapshot" in issue
+
+
+def test_deepseek_marker_accepts_only_the_stock_acp_bridge() -> None:
+    """One exact bridge owner under the pinned policy is the admitted shape."""
+    marker = _deepseek_marker({"policy": "ask", "answerers": [_DEEPSEEK_BRIDGE]})
+    assert gate.gate_marker_issue(ACP_BACKEND_DEEPSEEK, marker, "/sealed/gate.mjs", "n1") == ""
 
 
 # ── The OS-boundary mask compensating for unrouted reads ─────────────────────
@@ -400,21 +510,42 @@ def test_every_session_config_harness_names_its_option() -> None:
 
 
 def test_every_enforced_harness_declares_its_own_credential() -> None:
-    """An enforced harness with no named token store would be masked out of its own auth.
+    """An enforced harness must name a readable token store OR be fed from the vault.
 
     ``adapter_hidden_credential_dirs`` denies the whole floor minus the harness's
-    own leaf, so a harness absent from that table gets its token masked and cannot
-    authenticate. Fails here rather than as an opaque auth error on first use.
+    own leaf, so a harness that authenticates from a FILE and is absent from that
+    table gets its token masked and cannot authenticate. Fails here rather than as
+    an opaque auth error on first use.
+
+    The other way to satisfy it is ``ENTITLEMENT_HOST_VAULT``: Crew hands such a
+    harness its key as an environment variable at spawn, so it needs no readable
+    file and names no leaf. The rule is therefore a disjunction, and the INVERSE
+    half matters just as much -- a host-vault harness that ALSO carved a leaf out
+    would re-open for its whole process tree (its own shell tool included) exactly
+    the file the vault route exists to keep masked, while looking like it had
+    tightened something.
     """
     from kiro_crew.acp_backends import ACP_BACKEND_ROUTING
+    from kiro_crew.agent_sdk import host_auth
 
     for backend, routing in ACP_BACKEND_ROUTING.items():
         if routing not in gate.ENFORCED_ROUTINGS:
             continue
-        assert backend in gate.ADAPTER_OWN_CREDENTIAL_LEAVES, (
+        declaration = host_auth.declaration_for(backend)
+        from_vault = declaration.entitlement_source == host_auth.ENTITLEMENT_HOST_VAULT
+        assert backend in gate.ADAPTER_OWN_CREDENTIAL_LEAVES or from_vault, (
             f"{backend!r} is enforced, so the mask denies it the whole floor; it "
-            "must name its own credential leaf or it cannot authenticate"
+            "must name its own credential leaf or declare ENTITLEMENT_HOST_VAULT, "
+            "or it cannot authenticate"
         )
+        if from_vault:
+            assert not declaration.adapter_own_leaves, (
+                f"{backend!r} is fed its key from Crew's vault AND carves "
+                f"{declaration.adapter_own_leaves!r} out of the child mask; the "
+                "carve-out re-opens for the harness's whole process tree the file "
+                "the vault route exists to keep masked"
+            )
+            assert backend not in gate.ADAPTER_OWN_CREDENTIAL_LEAVES
 
 
 def test_every_enforced_harness_reaches_the_spawn_preflight() -> None:
@@ -1072,11 +1203,19 @@ def _granted_per_backend(leaf: str, backend: str) -> bool:
     """Whether a WITHHELD leaf is handed to *backend* alone by a narrower grant.
 
     Read off the production rule rather than restated: ``adapter_hidden_credential_dirs``
-    excludes the gate-artifact leaf only for the backend whose child execs the launcher
-    there. Restating the pair here would let the test and the mask drift into agreeing
-    about different things.
+    excludes the gate-artifact leaf only for a harness whose child loads Crew's own gate
+    out of it, which is exactly the ``VERIFIED_GATE_EXTENSION`` routing. Keying on the
+    routing rather than on one id is what keeps the test and the mask from drifting into
+    agreeing about different things -- a harness that reaches that routing later is
+    granted by the rule and by this helper in the same commit, and one that does not is
+    still denied by both.
+
+    The grant stays narrow where it matters: the other enforced routings --
+    ``SESSION_CONFIG`` and ``VERIFIED_SEEDED_SETTINGS`` -- have no gate artifacts to
+    read, so every one of their children must still find this leaf masked, and the
+    assertion below pins that.
     """
-    return leaf == PI_GATE_ARTIFACT_LEAF and backend == ACP_BACKEND_PI
+    return leaf == PI_GATE_ARTIFACT_LEAF and routing_for(backend) is Routing.VERIFIED_GATE_EXTENSION
 
 
 @pytest.mark.parametrize("backend", ENFORCED_BACKENDS)
@@ -1116,8 +1255,8 @@ def test_a_withheld_leaf_leaves_the_mask_only_by_a_narrower_grant(backend, leaf)
         target = os.path.join(home, *spelling.split("/"))
         if granted:
             assert target not in masked, (
-                f"{backend} must be able to reach {target}: its child execs Crew's "
-                "launcher out of that leaf, and a masked directory is what refused "
+                f"{backend} must be able to reach {target}: its child loads Crew's own "
+                "gate out of that leaf, and a masked directory is what refused "
                 "every one of its sessions before."
             )
         elif spelling in floor:

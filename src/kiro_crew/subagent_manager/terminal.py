@@ -160,7 +160,7 @@ class TerminalCoordinator(ManagerComponent):
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> None:
+    ) -> bool:
         """Deliver ``info``'s one-shot terminal report as a single unit.
 
         This is the exact work the finalize claim guards: fire the
@@ -232,7 +232,7 @@ class TerminalCoordinator(ManagerComponent):
             },
         )
         if not self._manager._on_done:
-            return
+            return True
         if info.id in getattr(self._manager, "_teardown_cancelled_ids", ()):
             # The parent this would report to has been retired. ``_on_done``
             # resolves the parent key through the session registry and injects,
@@ -264,7 +264,7 @@ class TerminalCoordinator(ManagerComponent):
             # from depending on its age backstop in the ordinary case -- an id is retained
             # until the run's delivery is actually suppressed rather than for a fixed span.
             self._manager._teardown_cancelled_ids.discard(info.id)
-            return
+            return True
         try:
             await asyncio.wait_for(self._manager._on_done(info), timeout=_ON_DONE_TIMEOUT)
             # The outcome has REACHED the parent. Recorded before any further
@@ -335,6 +335,7 @@ class TerminalCoordinator(ManagerComponent):
                         _ws_result_path(slot_key, info.id).unlink(missing_ok=True)
                 except Exception:
                     logger.debug("Failed to clean workspace result for %s", info.id, exc_info=True)
+            return True
         except asyncio.TimeoutError:
             logger.error(
                 "%s: completion injection timed out for %s after %.0fs",
@@ -354,8 +355,10 @@ class TerminalCoordinator(ManagerComponent):
                     exc_info=True,
                 )
             self._manager.notify_injection_failed(info, reason=injection_timeout_reason)
+            return False
         except Exception:
             logger.exception("%s: announce failed for %s", source, info.id)
+            return False
 
     async def _run_terminal_report_impl(
         self,
@@ -366,7 +369,7 @@ class TerminalCoordinator(ManagerComponent):
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> None:
+    ) -> bool:
         """Spawn the shielded terminal report and block until it completes.
 
         Convenience for callers that have no cancellable ``await`` between
@@ -378,7 +381,7 @@ class TerminalCoordinator(ManagerComponent):
         await and :meth:`_await_report` after, so the report task is already
         live (and shielded) no matter where the cancellation lands.
         """
-        await self._manager._await_report(
+        return await self._manager._await_report(
             self._manager._spawn_terminal_report(
                 info,
                 source=source,
@@ -398,7 +401,7 @@ class TerminalCoordinator(ManagerComponent):
         mark_delivered_on_success: bool,
         settle_digest: bool = False,
         teardown_done: "asyncio.Event | None" = None,
-    ) -> "asyncio.Task":  # type: ignore[type-arg]
+    ) -> "asyncio.Task[bool]":
         """Launch :meth:`_report_terminal` on a strongly-referenced task.
 
         Returns immediately (no ``await``) so the caller can start the report
@@ -427,8 +430,22 @@ class TerminalCoordinator(ManagerComponent):
 
         def _forget(t: "asyncio.Task") -> None:  # type: ignore[type-arg]
             self._manager._report_tasks.discard(t)
-            self._manager._report_owners.pop(t, None)
+            owner = self._manager._report_owners.pop(t, None)
             self._manager._run_events._forget_finished_live_state(info)
+            if owner is None:
+                return
+            failed = t.cancelled()
+            if not failed:
+                try:
+                    failed = t.result() is False
+                except asyncio.CancelledError:
+                    failed = True
+                except Exception:
+                    failed = True
+            if failed:
+                self._manager._latch_report_failure(owner)
+            else:
+                self._manager._clear_report_failure(owner)
 
         task.add_done_callback(_forget)
         return task
@@ -474,6 +491,16 @@ class TerminalCoordinator(ManagerComponent):
         # woken by our own session reset skip its error synthesis and report a
         # false SUCCESS before we own the record. See `_reap_started`.
         info._reap_started = True
+        # Written next to the marker, for the run loop: the session teardown
+        # below poisons the run's stream, which raises ``AcpProcessDied`` inside
+        # ``_run`` before this method's own record is written. ``_run`` reads
+        # these to record the reap that caused the death rather than the death
+        # itself. ``_stop_origin`` is left alone when a cancel already named
+        # one ("stopped by user", a parent-end verb).
+        if not info._reap_reason:
+            info._reap_reason = reason or "reaped"
+        if not info._stop_origin:
+            info._stop_origin = f"reaped after {int(elapsed)}s ({reason or 'deadline'})"
         # A pending cancel-recovery respawn is moot — this agent is being killed.
         # Cancel it rather than letting it sit in its bounded handshake wait
         # (_RESET_TIMEOUT + 60s) only to discover `reaped` and bare-return.
@@ -519,6 +546,12 @@ class TerminalCoordinator(ManagerComponent):
                 )
         else:
             # Kill the process FIRST so the pipe unblocks, then cancel the task.
+            # This order is load-bearing for ``_run``'s reap-echo arm: the run's
+            # stream observes this teardown as ``AcpProcessDied`` before the
+            # cancel lands, and the arm reads ``_reap_started`` to record the
+            # stop instead of that death. Reordering these would not make the
+            # arm wrong, only unreachable -- the cancel's own path already
+            # records a stop -- so the arm and this order stand or fall together.
             try:
                 await asyncio.wait_for(
                     self._manager._sessions.reset(session_key), timeout=_RESET_TIMEOUT
@@ -560,6 +593,11 @@ class TerminalCoordinator(ManagerComponent):
         # first-arrival-wins on `info.done`, so it is never written twice.
         if not info.done:
             info.done = True
+            # Neutrality follows the FIRST stopper (``stop_is_neutral`` reads
+            # ``_reap_reason``): a Stop that arrived while this deadline reap was
+            # already tearing the run down does not turn its failure neutral.
+            if not info.stop_is_neutral:
+                info.user_stopped = False
             if not info.error and not info.user_stopped:
                 # A user stop is neutral — never synthesize a reap error for it.
                 if approval_parked:

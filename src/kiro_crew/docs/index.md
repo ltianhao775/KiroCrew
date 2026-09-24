@@ -42,14 +42,14 @@ index, first-time setup, and connecting messaging channels.
 | Chat Channels | DM-based chat with tool approval — [Slack](slack-integration.md), [Discord](discord-integration.md), [Telegram](telegram-integration.md), [Teams](teams-integration.md), [Webex](webex-integration.md), [WeCom](wecom-integration.md), [WeChat](weixin-integration.md), [iMessage](imessage-integration.md), [WhatsApp](whatsapp-integration.md), [Feishu](feishu-integration.md); per-channel capabilities in each guide |
 | [Agents](agents.md) | Switch between specialized agents per conversation, thread, or cron job |
 | [Crew Members](crew-members.md) | Keep named crewmates — each with its own workspace, memory, template and model — talk to each in a standing thread, and route work to one |
-| [Remote Instances](remote-instances.md) | Reach other machines running their own Kiro Crew gateway from one hub — switch panes, run a session on one, and search every connected machine's history |
+| [Remote Crew](remote-crew.md) | Reach other machines running their own Kiro Crew gateway from one hub — switch panes, run a session on one, and search every connected machine's history |
 | [Skills](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows |
 | [Steering, Prompts & Hooks](steering-and-hooks.md) | Standing markdown conventions the agent reads every session, saved prompts you call up by name, and shell commands that fire on chat lifecycle events |
 | [Dynamic Workflows](workflows.md) | Multi-phase agent orchestration authored from a plain-language goal: watch a run, restart part of it from cache, save it for reuse |
 | [Artifacts](artifacts.md) | Save, version, and revert generated UI and documents so they outlive the chat scrollback |
 | [Monitor Loops](monitor-loops.md) | Keep one session checking something on an interval — a pull request, a CI run, a deployment — until an exit condition fires |
 | [Session Ledger](session-ledger.md) | A durable per-session record of goal, phase, and next step that survives context compaction |
-| [Session Control](session-control.md) | Let one chat session open, seed, watch, stop and close another one — the 14 `kirocrew-dashboard` MCP tools, plus the sidebar folders and tags that keep them findable |
+| [Session Control](session-control.md) | Let one chat session open, fork, seed, watch, stop and close another one — the 17 `kirocrew-dashboard` MCP tools, plus the sidebar folders and tags that keep them findable |
 | [Work Ledger](work-ledger.md) | Split a goal across one session per item: a conductor dispatches workers, reads their status as data, and settles every completion claim against an acceptance condition |
 | [Browser Control](browser-control.md) | Drive a real web page from the dashboard's Browser panel: navigate, snapshot, click, type, screenshot |
 | [Computer Use](computer-use.md) | Read and drive native desktop applications through the accessibility layer; opt-in and off by default |
@@ -87,11 +87,11 @@ documented by their own in-panel help.
 | Notifications | Where a proactive message is delivered | — |
 | Shortcuts | Keyboard bindings | — |
 | Skills | Whether sessions auto-generate skills, and whether a generated one needs your approval; installed skills live under Agent Capabilities | [Skills](skills.md) |
-| Channels | Per-channel setup and access control | [Channel capabilities](channel-capabilities.md) |
+| Messaging Channels | Per-channel setup and access control | [Channel capabilities](channel-capabilities.md) |
 | Browser | Installing the browser engine and the attach token | [Browser control](browser-control.md) |
 | Computer Use | Driving native desktop apps; off by default | [Computer use](computer-use.md) |
 | Webhooks | Inbound tokens and request signing — hidden unless you enable it under Feature Previews | [Inbound webhooks](inbound-webhooks.md) |
-| Instances | Additional gateways this dashboard can reach | [Remote instances](remote-instances.md) |
+| Remote Crew | Additional gateways this dashboard can reach | [Remote crew](remote-crew.md) |
 | Privacy | What leaves the host | [Snapshot and restore](snapshot-and-restore.md) |
 | Security | The sandbox, denied commands, and the audit log | [Blocked commands](blocked-commands.md) |
 | Connections | OAuth clients and the MCP servers this install can reach | — |

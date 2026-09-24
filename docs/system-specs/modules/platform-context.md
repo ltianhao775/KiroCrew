@@ -5,7 +5,7 @@ The `kiro_crew.platform` package defines the **Composed Platform Providers
 edition and an enterprise companion without the core ever importing
 enterprise-specific code.
 
-> Authoring note: KiroCrew is the public edition of this seam. The daily
+> Authoring note: Kiro Crew is the public edition of this seam. The daily
 > de-branding content sync from the upstream authoring home strips the
 > enterprise-tinted Defaults (e.g. the internal git host, `.midway` sandbox dirs)
 > down to the public baseline; the enterprise companion re-adds them via overrides.
@@ -16,7 +16,7 @@ enterprise-specific code.
 
 The core defines a set of **extension points** — interfaces where behavior
 differs between editions — and ships a `Default*` adapter for each that
-reproduces today's KiroCrew behavior. An enterprise companion package (module
+reproduces today's Kiro Crew behavior. An enterprise companion package (module
 separate from `kiro_crew`) depends on the public wheel and supplies enterprise
 adapters for the same interfaces.
 
@@ -33,8 +33,8 @@ interface, the public edition is complete standalone.
 | `contract_version` | carrier (int) | `CONTRACT_VERSION` | must match core |
 | `profile` | carrier (str) | `"standalone"` | `"enterprise"` |
 | `cfg` | carrier (`KiroCrewConfig`) | loaded config | same |
-| `providers` | adapter | `DefaultProviderRegistry` (Kiro-CLI-ACP only) | re-registers a companion-registered backend |
-| `publish` | adapter | `DefaultPublishRegistry` (registers no provider → publish unavailable) | registers enterprise artifact/publish providers |
+| `providers` | adapter | `DefaultProviderRegistry` (the baseline in `agent_sdk/backends.py`; registration is a no-op) | registers an edition backend after the core knows and verifies its routing |
+| `publish` | adapter | `DefaultPublishRegistry` (registers the personal cloud drive under `PERSONAL_DRIVE_PROVIDER`; leaves the unnamed default unregistered) | registers enterprise artifact/publish providers |
 | `agent_runtime` | adapter | `DefaultAgentRuntime` (`run_first_run_setup` wired; `managed_mcp_servers` **RESERVED**) | extra one-time first-run provisioning |
 | `agent_executable` | adapter | `DefaultAgentExecutableResolver` (identity) | resolves an edition-managed launcher to its direct executable before core sandboxing |
 | `gateway_lifecycle` | adapter | `DefaultGatewayLifecycleProvider` (`restart_launcher()` → `None`) | stable absolute launcher for package-manager-owned gateway installs |
@@ -67,7 +67,7 @@ interface, the public edition is complete standalone.
 | `remote_provisioners` | adapter | `DefaultRemoteProvisionerProvider` (the built-in `aws_ec2` lane backed by `RealLaunchEngine`, **plus a conditional `aws_fargate` lane** backed by `FargateLaunchEngine` that is offered only when `cloud.json` carries a complete `fargate` block; id == kind by design for both) | edition-specific ways to CREATE a remote instance (a managed dev environment, a container task): descriptor-only `{id, kind, label, posix_only, step_labels, confirm_before_launch}` plus a `LaunchEngine` per id (`confirm_before_launch` carries what the operator must see and confirm before that lane may launch -- `POST /api/cloud/launch` requires `confirm_recipient` to equal it, so the requirement is derived from the row rather than hard-coded to one id, and a lane with nothing to confirm leaves it empty); the core's durable launch job still drives every launch, so cancel, rollback and orphan reaping are inherited rather than reimplemented |
 | `feature_apps` | tuple | **RESERVED** — `()`; apps register via `apps_loader` (provenance record only) | — (slot inert) |
 
-> `remote_provisioners` note — the Set-up tab under Settings → Remote Instances
+> `remote_provisioners` note — the Set-up tab under Settings → Remote Crew
 > could only ever create an EC2 instance in the user's own AWS account, because
 > `handlers_cloud._engine()` constructed `RealLaunchEngine` directly (the
 > `state.cloud_launch_engine` hook next to it is a test seam, not a contract). A
@@ -386,11 +386,14 @@ companion can pin against a frozen contract.
 
 The companion declares (in its `pyproject.toml`):
 ```toml
+[project]
+dependencies = ["kirocrew"]
+
 [project.entry-points."kirocrew.plugins"]
 enterprise = "kirocrew_enterprise.compose:build_enterprise_context"
+
 [project.scripts]
 kirocrew-enterprise = "kirocrew_enterprise.cli:main"
-dependencies = ["kirocrew"]
 ```
 The `kirocrew-enterprise` binary sets `KIROCREW_PROFILE=enterprise` and delegates to the
 core `main` — the explicit composition-root path that a security review reads.
@@ -436,7 +439,32 @@ the helpers in `kiro_crew/__init__` are private. The accepted shape parses as a
 PEP 440 release wherever the version is compared (`_is_newer` orders `0.6.0.12`
 above `0.6.0` and below `0.6.1`; `release_channel.channel` still reads
 `stable`), and `base_version` — the stable-channel display fold — preserves the
-stamped string, which is what lets the chip show it.
+stamped string, which is what lets the chip show it. The one reader that does
+NOT take the stamp's word is the bug-report resolver
+(`release_channel.provenance`, behind `kirocrew doctor --bundle` and the
+dashboard's Report-a-problem link): because this rule admits a stamp only over
+a bare base, a stamped build has by construction lost whatever prerelease
+marker the release pipeline wrote, so the stamp claims no lane there — a
+prerelease marker in the installed distribution's metadata version (which the
+stamp never rewrites) or the `channel` record decides, and with neither the
+report says `Not sure` rather than Stable. The public `version` field is the
+release the stamp is a build of (`changelog.release_of_build`); the evidence
+the resolver weighed stays in the private bundle, where `versions.txt` and
+`manifest.json` both record the raw stamp (`kirocrew_version`), the folded
+release (`release`), the distribution's metadata version
+(`distribution_version`), the proven lane (`channel`, `unknown` when none) and
+the `channel` record (`channel_record`) — the manifest spells a silent source
+as JSON `null`, the text file as `unavailable` / `absent`. `collect_bundle`
+resolves the provenance exactly ONCE, before it writes the first member, and
+keeps that snapshot on `BundleResult.provenance`: `versions.txt`, the manifest
+and the issue link are all written from it, and the terminal link `kirocrew
+doctor` prints afterwards reads the same field rather than resolving again.
+The resolver reads host state that can change mid-collection — the dashboard's
+`set_release_channel` rewrites the `channel` record on the event loop while
+the collector runs in a worker thread — so a per-member read could leave one
+bundle with a `versions.txt` and a `manifest.json` that disagree about the
+lane, beside a link that explains neither (pinned by
+`test_one_bundle_is_written_from_one_resolution`).
 
 Update lane. A distribution owns its own update path, normally the command
 provider selected by `check_command` / `apply_command` update pins, which never
@@ -465,8 +493,9 @@ Both import it before an update can retire the running package tree and call it
 off-loop before saving or draining sessions. The provider must load its own
 dependencies at composition and return cheaply without deferred imports. A
 provider error or an explicit empty, relative, missing, non-file or non-executable
-target refuses restart; only `None` takes the existing `respawn_executable()` →
-`reexec_python_module()` path, including core-managed virtual environments.
+target refuses restart; only `None` reaches the interpreter, which normally takes
+the existing `respawn_executable()` → `reexec_python_module()` path, including
+core-managed virtual environments.
 
 The core executes `[launcher, *sys.argv[1:]]` directly, without a shell or Python
 `-m` prefix, and never resolves the launcher's symlinks: dispatch may depend on
@@ -481,7 +510,65 @@ their callers. CLI service-manager restarts are independent and unchanged.
 
 Validation establishes availability at selection time, not future execution:
 an updater must keep the stable launcher usable through handoff. The core does
-not retry a failed explicit launcher with the old Python bundle.
+not retry a failed explicit launcher with the old Python bundle. When it is the
+*interpreter* an update retires, the guard below is what keeps the gateway
+serving.
+
+### The pruned-interpreter guard
+
+`resolve_restart_launcher()` returning `None` and the interpreter no longer
+existing is a real state: an `apply_command` that installs into a new versioned
+tree and prunes the old one deletes the interpreter the running gateway was
+launched from.
+
+What made that state costly was the ORDERING, not the missing file. The
+orchestrator saved, fenced, closed every session and only then raised `ENOENT`
+from `os.execv`. Admission itself does come back —
+`_finish_auto_update_apply` calls `resume_turn_admission_after_update()` — but the
+sessions `close_all()` tore down do not, and `_pending_update_respawn` is cleared
+immediately before the exec, so `_retry_pending_update_restart` can never fire.
+What survived was a gateway with no sessions, running a different version from the
+install on disk. The dashboard's own path is worse by one step: its `close_all()`
+sets the closing flag without owning the update pause, so `resume_...` returns
+early and admission stays shut as well.
+
+Both consumers therefore ask before the point of no return. The dashboard's
+`_restart_gateway` refuses with `Cannot restart: invalid Python executable path`
+while every session is still answerable. The orchestrator defers, retaining
+`_pending_update_respawn` so `_retry_pending_update_restart` completes the update
+once the install is repaired. Neither drains on the chance that a restart might
+still work.
+
+Asking early narrows that failure; it cannot remove it. The target can be
+replaced between the check and the call, and a file that is present and carries
+the exec bit can still be an image this kernel refuses — a wrong architecture, a
+truncated binary, a script whose interpreter is gone. The kernel is the authority
+on all of those and reports them as `OSError` from `execv` itself, so the exec
+site is the only place they can be answered. Both consumers answer by exiting:
+`platform_compat.exit_after_failed_restart_exec()` logs CRITICAL naming the
+target and calls `os._exit(1)`. Returning instead is what produced the original
+defect — the orchestrator's caller catches `Exception`, logs and sleeps, and the
+dashboard's path would fall through to `return True` and report a restart that
+did not happen. Exiting makes the failure visible to whatever started the
+gateway, frees the port so the operator's own relaunch can bind, and refuses to
+serve the version skew. Reopening admission is not an alternative: the closed
+sessions do not come back, and the skew would then be served. Because `os._exit`
+runs no `atexit` handler, that function repeats the two bounded best-effort
+flushes the force-exit signal handler performs — the CRITICAL line is the whole
+diagnosis and is queued, not yet on disk. Only the event log's flush is bounded there:
+the `gateway.log` tail goes through `cli.drain_log_queue_before_hard_exit()`, the shared
+async hard-exit drain for that queue, so every hard-exit path keeps one spelling and one
+ceiling for it. The event log's own ceiling is derived the way that function derives
+its own — the inner bound plus one second — rather than chosen independently.
+
+There is deliberately NO second pathname for an operator to declare as a fallback
+exec target. Validating one is not reachable. A pathname's bytes do not decide
+what the kernel execs: a `#!` line delegates to an interpreter the check never
+sees, and a header that parses can still belong to a truncated binary. The only
+way to learn the answer for certain is to exec the candidate, which means either
+running an arbitrary operator-supplied binary or booting a second gateway. So the
+recovery is repair-then-relaunch, which an operator can actually perform and the
+core can describe honestly.
 
 ## Consumption-site wiring
 

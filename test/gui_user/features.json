@@ -3,11 +3,11 @@
   "raw_record_count": 387,
   "counts": {
     "smoke": 42,
-    "nightly": 166,
+    "nightly": 167,
     "native-only": 12,
     "needs-secret": 27,
     "excluded": 22,
-    "total": 269
+    "total": 270
   },
   "priorities": {
     "P0": 10,
@@ -1978,6 +1978,39 @@
         "members-roster-filter"
       ],
       "component": "website/src/pages/members/MembersPage.tsx"
+    },
+    {
+      "id": "crewmate-reply-thread",
+      "feature": "members",
+      "title": "Reply in thread on a crewmate's bubble opens the thread panel and the bubble gains a replies footer",
+      "user_story": "As a user talking to a crewmate, I want to ask about one thing it said in a reply thread on that message, so that the follow-up stays beside the message it is about instead of pushing the crewmate's findings up the main chat.",
+      "start_url": "/settings",
+      "entry_path": "Settings > Developer > Feature Previews > enable Crew Members; Settings > Developer > Crewmates > enable Reply threads on crewmate chat messages; Rail > Crew Members > Nova Sky > send a message, get a reply > hover the reply bubble > Reply in thread > Thread panel (quoted parent, 'No replies yet') > send a reply in the panel",
+      "preconditions": {
+        "seed": "rich",
+        "members": [
+          "nova-sky"
+        ],
+        "feature_flags": [
+          "mc-preview-crew"
+        ],
+        "notes": "Threads exist only on a crewmate's chat (a member-mode slot); the fake ACP backend answers the main-chat message so a finished crewmate bubble carries the Reply in thread action, and answers the thread reply too, so the footer reads '1 reply' then '2 replies'. Replies live in the slot's .threads sidecar, never in the transcript."
+      },
+      "runnable": "nightly",
+      "estimated_steps": 8,
+      "rationale": "Hover-revealed action, a side panel opening beside the chat and a footer count under one bubble are pixel-level judgements over two model turns; the DOM tests cover the store, the renderer shape and the panel in isolation.",
+      "source": [
+        "website/src/pages/members/ThreadPanel.tsx",
+        "website/src/pages/chat/ThreadFooter.tsx",
+        "website/src/app-sdk/messageRenderers.tsx",
+        "src/kiro_crew/dashboard/chat_threads.py",
+        "docs/system-specs/modules/history.md"
+      ],
+      "priority": "P1",
+      "merged_from": [
+        "crewmate-reply-thread"
+      ],
+      "component": "website/src/pages/members/ThreadPanel.tsx"
     },
     {
       "id": "members-private-memory-keeps-thread",
@@ -5184,8 +5217,8 @@
     {
       "id": "shell-instances-tab-bar-switching",
       "feature": "instances",
-      "title": "Switch between Local and remote instance panes",
-      "user_story": "As an operator, I want a header tab strip to switch instances, so that remote dashboards are one click away.",
+      "title": "Switch between Local and remote crew panes",
+      "user_story": "As an operator, I want a header tab strip to switch crews, so that remote dashboards are one click away.",
       "start_url": "/chat",
       "entry_path": "Topbar InstanceTabBar (renders only with >=1 remote) > click tab or Cmd/Ctrl+2 > InstancesViewport shows embedded pane",
       "preconditions": {
@@ -5211,10 +5244,10 @@
     {
       "id": "settings-instances",
       "feature": "remote-instances",
-      "title": "Settings › Instances",
+      "title": "Settings › Remote Crew",
       "user_story": "As an operator, I want to register remote Kiro Crew instances and see provisioning lanes, so that I can switch crews from the header.",
       "start_url": "/settings/instances",
-      "entry_path": "Settings → Instances (/instances redirects)",
+      "entry_path": "Settings → Remote Crew (/instances redirects)",
       "preconditions": {
         "seed": "multi-workspace",
         "members": [],
@@ -5271,10 +5304,10 @@
     {
       "id": "settings-instances-remote-crew",
       "feature": "remote-instances",
-      "title": "Add a remote instance and switch panes via the header tab strip",
-      "user_story": "As an operator with several machines, I want to register remote instances and switch between them, so that I manage all crews from one window.",
+      "title": "Add a remote crew and switch panes via the header tab strip",
+      "user_story": "As an operator with several machines, I want to register remote crews and switch between them, so that I manage all crews from one window.",
       "start_url": "/settings/instances",
-      "entry_path": "Settings > Remote Instances (/instances redirects) > InstanceFormFields > save > InstanceTabBar in topbar (Cmd/Ctrl+1..9)",
+      "entry_path": "Settings > Remote Crew (/instances redirects) > InstanceFormFields > save > InstanceTabBar in topbar (Cmd/Ctrl+1..9)",
       "preconditions": {
         "seed": "multi-workspace",
         "members": [],
@@ -5304,7 +5337,7 @@
       "title": "Cloud launch",
       "user_story": "As an operator, I want to provision a remote Kiro Crew instance (EC2 by default) through a lane selector, so that I can run crews in the cloud.",
       "start_url": "/settings/instances",
-      "entry_path": "Settings → Remote Instances → Set up a new one",
+      "entry_path": "Settings → Remote Crew → Set up a new one",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -6033,7 +6066,7 @@
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "Webhooks tab only with mc-preview-webhooks=1; Instances tab hidden in embedded pane; About gets a dot when an update is available."
+        "notes": "Webhooks tab only with mc-preview-webhooks=1; Remote Crew tab hidden in embedded pane; About gets a dot when an update is available."
       },
       "runnable": "smoke",
       "estimated_steps": 3,

@@ -410,6 +410,250 @@ describe('ChatPane plan follow-ups dispatch (issue #5893)', () => {
     expect(api.planAction).toHaveBeenCalledTimes(3)
   })
 
+  /* #6056: the dispatch has to be visible. Until this landed a click on a plan
+   * chip produced no pending state and no message on failure — `onError` only
+   * reached the console — so a slow dispatch and a dead button looked the same,
+   * which is what drove users to remount the pane. */
+  it('a failed dispatch shows the error row under the chips, and the next click clears it', async () => {
+    ;(api.planAction as ReturnType<typeof vi.fn>)
+      // A DEFINITIVE 4xx, so the latch releases and the retry below really runs.
+      .mockImplementationOnce(() => Promise.reject(new ApiError(400, 'unknown action')))
+      // The retry never settles, which is what makes the cleared row observable:
+      // a second rejection would repaint it before the assertion could run.
+      .mockImplementation(() => new Promise(() => {}))
+    await renderPane('pane-plan-6056a', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { await Promise.resolve() })
+    vi.useRealTimers()
+    await waitFor(() => {
+      const row = screen.getByRole('alert')
+      expect(row).toHaveTextContent('Could not send that plan action.')
+      expect(row).toHaveTextContent('unknown action')
+    })
+    // The chip is idle again, so the retry the released latch permits is reachable.
+    expect(screen.getByRole('button', { name: 'Go' })).not.toHaveAttribute('aria-disabled')
+
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    vi.useRealTimers()
+    expect(api.planAction).toHaveBeenCalledTimes(2)
+    // No timer and no dismiss button retired it — the next click did.
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('Go and Cancel outstanding together spin BOTH chips, because the classes latch independently', async () => {
+    // Cancel is deliberately never blocked by a pending Go, so a slot can hold
+    // two latches at once. The chips have to say so: a single busy label would
+    // let the second dispatch un-spin the first chip, and an idle-looking chip
+    // over a held latch is the dead button the affordance exists to remove.
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise(() => {}))
+    await renderPane('pane-plan-6056d', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { clickOption('Cancel') })
+    vi.useRealTimers()
+    expect(api.planAction).toHaveBeenCalledTimes(2)
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toHaveAttribute('aria-disabled', 'true'))
+    expect(screen.getByRole('button', { name: 'Go' }).querySelector('.animate-spin')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('button', { name: 'Cancel' }).querySelector('.animate-spin')).toBeTruthy()
+    // Go All shares Go's latch but was never dispatched, so it only dims. The
+    // pane's chips carry a Send-now segment, so the dim lands on the split
+    // wrapper (the flex item) rather than on the label button.
+    // Refused by Go's shared latch: dimmed and announced unavailable, never disabled.
+    expect(screen.getByRole('button', { name: 'Go All' })).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('button', { name: 'Go All' })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Go All' }).parentElement?.className).toContain('opacity-70')
+  })
+
+  it('a REMOUNTED pane on a latched slot still spins the chip, because the latch is shared not copied', async () => {
+    // The grid unmounts and remounts a pane on split/close, and the unified view
+    // holds its own instance of the same hook on the same slot. The latch lives
+    // in a module map they all share, so a fresh instance that started from its
+    // own empty copy would draw an idle chip while the map still refused the
+    // click — the exact dead button, reintroduced in a narrower window.
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.resolve({ ok: true }))
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue({ messages: PLAN_MESSAGES, running: false, has_more: false, total: PLAN_MESSAGES.length })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const store = makeStore('pane-plan-6056e', { mode: 'orchestrator' })
+    const ui = (
+      <Provider store={store}>
+        <QueryClientProvider client={qc}>
+          <ThemeProvider>
+            <MemoryRouter>
+              <ChatPane slotKey="pane-plan-6056e" />
+            </MemoryRouter>
+          </ThemeProvider>
+        </QueryClientProvider>
+      </Provider>
+    )
+    const first = render(ui)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { await Promise.resolve() })
+    vi.useRealTimers()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toHaveAttribute('aria-disabled', 'true'))
+    first.unmount()
+
+    // Same query client and store: warm cache, the same stale row, so the latch
+    // is still held and the remounted pane must still show it held.
+    render(ui)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toHaveAttribute('aria-disabled', 'true'))
+    expect(screen.getByRole('button', { name: 'Go' }).querySelector('.animate-spin')).toBeTruthy()
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    vi.useRealTimers()
+    expect(api.planAction).toHaveBeenCalledTimes(1)  // still latched — dropped
+  })
+
+  it('a stalled dispatch rejecting late never overwrites a NEWER row\'s failure', async () => {
+    // `onError` is options-level and fires for a superseded mutation. Gating only
+    // the DISPLAY is not enough: an unconditional write lets the stale rejection
+    // clobber the current row's record, and the read gate then hides the
+    // replacement too, so a real error the user needed silently disappears.
+    let stall: ((e: unknown) => void) | null = null
+    ;(api.planAction as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => new Promise((_r, rej) => { stall = rej }))
+      .mockImplementation(() => Promise.reject(new ApiError(400, 'second row failed')))
+    const store = await renderPane('pane-plan-6056h', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+
+    // R1: dispatch and stall.
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    vi.useRealTimers()
+
+    // R2 arrives, freeing the latch, and its own dispatch fails for real.
+    await act(async () => {
+      store.dispatch(appendSlotMessage({
+        slot: 'pane-plan-6056h',
+        message: { role: 'assistant', content: ASSISTANT_WITH_PLAN, ts: '2026-08-25T00:00:15Z' },
+      }))
+    })
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { await Promise.resolve() })
+    vi.useRealTimers()
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('second row failed'))
+
+    // Now R1 finally rejects. R2's message must survive it.
+    await act(async () => { stall?.(new ApiError(400, 'first row failed')); await Promise.resolve() })
+    expect(screen.getByRole('alert')).toHaveTextContent('second row failed')
+  })
+
+  it('a LATE rejection landing after the row advanced never shows, even though its slot matches', async () => {
+    // The reversed ordering of the superseded-row case, and the one scoping the
+    // slot alone does not cover: the acknowledgement clear has already run, so a
+    // rejection that resolves AFTER it writes its record unopposed. Only gating
+    // the exposed value on the ROW as well as the slot keeps it off screen.
+    let reject: ((e: unknown) => void) | null = null
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(
+      () => new Promise((_res, rej) => { reject = rej }),
+    )
+    const store = await renderPane('pane-plan-6056g', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    vi.useRealTimers()
+    expect(api.planAction).toHaveBeenCalledTimes(1)
+
+    // The next plan row arrives FIRST, so the acknowledgement clear runs now.
+    await act(async () => {
+      store.dispatch(appendSlotMessage({
+        slot: 'pane-plan-6056g',
+        message: { role: 'assistant', content: ASSISTANT_WITH_PLAN, ts: '2026-08-25T00:00:13Z' },
+      }))
+    })
+    // ...and only THEN does the old dispatch reject. Same slot, superseded row.
+    await act(async () => { reject?.(new ApiError(400, 'unknown action')); await Promise.resolve() })
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('a failure is retired when the row it belongs to is superseded, not left under the next stage', async () => {
+    // An ambiguous 5xx keeps the latch, so the plan can still advance server-side.
+    // When the acknowledgement row arrives the latch frees and the chips un-spin —
+    // and the error row has to go with them, or it sits under the NEXT stage's
+    // chips claiming that stage failed.
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.reject(new ApiError(500, 'internal error')))
+    const store = await renderPane('pane-plan-6056f', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { await Promise.resolve() })
+    vi.useRealTimers()
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('internal error'))
+
+    // The plan advances: a different options-bearing row arrives.
+    await act(async () => {
+      store.dispatch(appendSlotMessage({
+        slot: 'pane-plan-6056f',
+        message: { role: 'assistant', content: ASSISTANT_WITH_PLAN, ts: '2026-08-25T00:00:11Z' },
+      }))
+    })
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  })
+
+  it('a REFUSED click keeps the error row, because nothing replaced the explanation', async () => {
+    // The 5xx keeps the latch, so the next click on the same class is dropped:
+    // no request goes out and the failure is still the only account of why the
+    // chip is doing nothing. Retiring the row on the way IN left a wedged latch
+    // with no message at all.
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.reject(new ApiError(500, 'internal error')))
+    await renderPane('pane-plan-6056c', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { await Promise.resolve() })
+    vi.useRealTimers()
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('internal error'))
+
+    // Go All shares the Go latch, so this click is refused outright.
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go All') })
+    vi.useRealTimers()
+    expect(api.planAction).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('alert')).toHaveTextContent('internal error')
+  })
+
+  it('a chip stays spinning through the silent window after a SUCCESSFUL dispatch, until the transcript acknowledges', async () => {
+    // The state the request alone cannot express: the response has landed and
+    // the latch still holds, so a re-click is being refused. `isPending` would
+    // have gone false here and left the chip looking idle while it was not.
+    ;(api.planAction as ReturnType<typeof vi.fn>).mockImplementation(() => Promise.resolve({ ok: true }))
+    const store = await renderPane('pane-plan-6056b', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    await act(async () => { await Promise.resolve() })
+    vi.useRealTimers()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toHaveAttribute('aria-disabled', 'true'))
+    expect(screen.getByRole('button', { name: 'Go' }).querySelector('.animate-spin')).toBeTruthy()
+    // A sibling is dimmed but still live, so Cancel is reachable all through it.
+    expect(screen.getByRole('button', { name: 'Cancel' })).not.toHaveAttribute('aria-disabled')
+
+    // The acknowledgement: a different options-bearing row arrives.
+    await act(async () => {
+      store.dispatch(appendSlotMessage({
+        slot: 'pane-plan-6056b',
+        message: { role: 'assistant', content: ASSISTANT_WITH_PLAN, ts: '2026-08-25T00:00:09Z' },
+      }))
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).not.toHaveAttribute('aria-disabled'))
+  })
+
   it('a 5xx failure KEEPS the latch — the server may have committed and lost the response', async () => {
     // The transport-ambiguity gap: the plan-action handler can raise after
     // `queue_append` has already landed, so a 500 does not prove the action

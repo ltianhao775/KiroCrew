@@ -19,10 +19,10 @@ import re
 import shutil
 import sys
 import zipfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
 
 from kiro_crew import platform_compat
@@ -57,9 +57,12 @@ from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, lookup_cron_folde
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.env import emit_env
 from kiro_crew.executors import maintenance_executor
+from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
+from kiro_crew.history import ConversationLog
 from kiro_crew.platform.governance import may_skip_gate_now, strip_ungoverned_auto_approve
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.session_map import SUPPRESS_REPLAY_FLAG, SessionMap
 from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 #: Absolute path of the stdlib-only launch shim, for interpreters whose
@@ -556,7 +559,10 @@ def _pin_host_cli_command(app_name: str, cfg: dict[str, Any]) -> dict[str, Any]:
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{pkg_parent}{os.pathsep}{existing}" if existing else pkg_parent
     env.setdefault("KIROCREW_HOME", str(app_dir(app_name).parent.parent))
+    # ``-P``: the MCP host spawns this server with a cwd Kiro Crew does not
+    # choose; keeping it off sys.path is the same guarantee the launchers give.
     argv = platform_compat.isolated_python_argv(
+        "-P",
         "-m",
         "kiro_crew",
         *list(cfg.get("args") or []),
@@ -1879,18 +1885,78 @@ def _mcp_lock(*, exclusive: bool = True, target: Optional[Path] = None) -> Itera
     WHICH file's sidecar to lock (default: KiroCrew's own agent config); pass the
     legacy shared ``mcp.json`` so its read-modify-write serializes against any
     other writer of THAT file, which sits under a different sidecar.
+
+    Both failure modes are REPORTED here before they propagate, mirroring
+    :func:`kiro_crew.agent.agents_spec_lock` — this sidecar's neighbour in
+    ``~/.kiro/agents`` — because the callers that catch this treat it as
+    best-effort work at a level no operator reads:
+    :func:`registered_app_mcp_servers` returns ``{}`` on ANY exception and logs
+    nothing at all, and the boot path reaches here through
+    ``agent._install_worker_agent``, whose failure is caught at
+    ``logger.debug``. Without a report at a visible level a gateway that skipped
+    its agent-config write reads in the log exactly like one that completed it,
+    which is the silence reported in GH-11474. An unwritable lock path (a
+    read-only ``~/.kiro/agents`` mount) refuses when the sidecar is opened,
+    BEFORE any lock is attempted; ``platform_compat.file_lock`` bounds the
+    acquire itself, so neither failure mode can present as a hang.
     """
     base = target if target is not None else _mcp_json_path()
     lock_path = base.with_suffix(".lock")
-    base.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.touch(exist_ok=True)
-    # "r+" (not "r"): Windows msvcrt.locking requires write access on the fd —
-    # a read-only handle fails with EACCES and platform_compat.file_lock
-    # swallows it (best-effort), silently degrading this to a no-op and letting
-    # concurrent writers race the atomic mcp.json rename.
-    with open(lock_path, "r+") as lf:
-        with platform_compat.file_lock(lf.fileno(), exclusive=exclusive):
-            yield
+    with ExitStack() as stack:
+        try:
+            base.parent.mkdir(parents=True, exist_ok=True)
+            # ONE create-or-open syscall instead of touch() + open("r+"): it
+            # never truncates, it keeps the fd WRITABLE — Windows
+            # msvcrt.locking fails EACCES on a read-only handle, which
+            # file_lock would swallow, silently degrading this to a no-op and
+            # letting concurrent writers race the atomic mcp.json rename — and
+            # it leaves the unwritable-path refusal ONE place to be reported
+            # from rather than two. See platform_compat.open_lock_file.
+            fd = stack.enter_context(platform_compat.open_lock_file(lock_path))
+        except OSError as exc:
+            # Naming the path AND the errno is the point: "Read-only file
+            # system" on this specific path is what tells the operator what to
+            # change, and it is not something retrying can recover.
+            #
+            # The KIRO_HOME remedy is true only for the DEFAULT sidecar. An
+            # explicit ``target`` -- the legacy shared ``mcp.json`` -- resolves
+            # from a fixed ``Path.home()`` that ignores KIRO_HOME, so moving it
+            # cannot move that lock, and printing the remedy there would send an
+            # operator to a setting that changes nothing. Naming the config the
+            # lock guards is what stays true for both.
+            remedy = (
+                " Point KIRO_HOME at a writable directory if the filesystem is read-only."
+                if target is None
+                else ""
+            )
+            logger.warning(
+                "cannot open the mcp config lock %s (%s) -- writes to %s cannot be "
+                "serialized, so this update is being skipped.%s",
+                lock_path,
+                exc.strerror or exc,
+                base,
+                remedy,
+            )
+            raise
+        # ``enter_context`` rather than a ``with`` around the yield, so the
+        # ``except`` below covers the ACQUIRE ALONE. A caller-body OSError (an
+        # atomic mcp.json write hitting ENOSPC, a legacy scrub hitting EACCES)
+        # reaches the same handler if the yield sits inside it, and would then
+        # be logged as a lock problem — sending an operator after a stuck holder
+        # while the real fault is the disk or the permission.
+        try:
+            stack.enter_context(platform_compat.file_lock(fd, exclusive=exclusive))
+        except OSError as exc:
+            # A stuck holder calls for a DIFFERENT operator action (find the
+            # process still holding it) than an unwritable path, so this must
+            # not carry the same remedy as above. No BlockingIOError case: this
+            # acquire is always a WAITING one, so a refusal here is the bounded
+            # ceiling and never a caller's own "do not wait" choice. A future
+            # caller that wants ``wait=False`` has to separate the two, the way
+            # ``agent.agents_spec_lock`` does.
+            logger.warning("agent-config lock %s: %s", lock_path, exc)
+            raise
+        yield
 
 
 def _read_mcp_json_unlocked(*, strict: bool = False) -> dict[str, Any]:
@@ -3310,10 +3376,195 @@ def reconcile_enabled_app_resources() -> dict[str, int]:
     return counts
 
 
+def app_conversation_keys(app_name: str, *, mapped_keys: Iterable[str] | None = None) -> list[str]:
+    """Session keys that still hold a resume pointer and belong to *app_name*.
+
+    A slot key an app chooses is often DETERMINISTIC — one slot per object it tracks,
+    named after that object — so the next slot created under that name is the same
+    key, and ``session.py``'s ``resume_sid = self._session_map.get(key)`` hands it the
+    previous conversation. That is correct while the app is installed: it is how a
+    long-lived per-object conversation keeps what it has learned about that object.
+    It stops being correct once the app is gone: reinstall it, open the same object,
+    and the first turn resumes a conversation from the previous installation — a
+    transcript from code that is gone.
+
+    Ownership is read from the record that already outlives the tab: every save
+    writes ``app`` into the conversation's metadata line, and closing a tab is a
+    save. Live ``_ChatSlot._app`` cannot answer here (the CLI path has no gateway,
+    and a closed slot is gone from a running one), and ``open_slots.json`` cannot
+    either — it tracks tabs to REOPEN, so a closed slot leaves it while the resume
+    pointer deliberately stays. A closed app slot is the mainline state before an
+    uninstall, so sourcing ownership from open tabs would miss the common case.
+
+    Scoped to keys that still have a sid, which makes this index exactly as wide as
+    the problem: a pointer exists only if a conversation was started, and starting
+    one writes the metadata line this reads.
+
+    **Which keys to look at is the caller's answer, not this function's, whenever
+    the caller owns a live map.** A detached ``SessionMap`` reads the file, and the
+    file lags a running gateway's map by whatever that map has not flushed, so a
+    detached enumeration can omit a key whose pointer already exists — and the
+    in-gateway caller then clears through the live map, leaving the pointer it
+    could not see behind for a reinstall to resume. So that caller passes
+    *mapped_keys* from its own manager (``mapped_session_keys() | session_keys()``,
+    the second covering an allocation still in flight), and the detached read is
+    reserved for the CLI path, which holds the gateway lock and therefore knows no
+    live map exists. Reading detached is sound only because nothing here writes —
+    the class's rule 3 forbids a detached WRITE.
+
+    Returns keys sorted for stable logs. Never raises: an uninstall the user asked
+    for does not fail over bookkeeping.
+    """
+    if not app_name:
+        return []
+    try:
+        log = ConversationLog()
+        candidates = SessionMap().mapped_sids_by_key() if mapped_keys is None else set(mapped_keys)
+        owned: list[str] = []
+        unreadable: list[str] = []
+        for key in candidates:
+            meta, readable = log.get_metadata_status(key)
+            if meta.get("app") == app_name:
+                owned.append(key)
+            elif not readable:
+                # A record that could not be READ is not a record that says "not this
+                # app", and the two are the same value here — ``{}``. Reported rather
+                # than guessed either way: claiming it would sweep up a conversation
+                # this app may not own, which is worse than the pointer it leaves, and
+                # dropping it in silence hides the one case where the answer is
+                # unknown. Not raised, because an uninstall the user asked for does
+                # not fail over bookkeeping.
+                unreadable.append(key)
+        if unreadable:
+            logger.warning(
+                "could not read the ownership record of %d conversation(s) while "
+                "resolving %r's keys, so their resume pointers are left in place: %s",
+                len(unreadable),
+                app_name,
+                ", ".join(sorted(unreadable)[:10]),
+            )
+        return sorted(owned)
+    except Exception:  # noqa: BLE001 — bookkeeping must not fail an uninstall
+        logger.warning("resolving %r's conversation keys failed", app_name, exc_info=True)
+        return []
+
+
+@dataclass(frozen=True)
+class SessionPointerCleanup:
+    """What a CLI-path pointer clear actually did.
+
+    ``dropped == 0`` alone cannot be reported to an operator: it is "this app owned
+    nothing", "a gateway owns the map, so nothing was attempted", and "the write
+    itself failed", and those need different messages — the first is complete, the
+    other two leave a pointer a reinstall will resume. ``declined`` and ``failed``
+    are what separate them.
+
+    ``failed`` covers the case the clear could not PERSIST: the sid clear and the
+    suppression flag are both mutations of a file that has to be written, so an
+    ENOSPC or a permission error leaves the pointer on disk while the count says
+    nothing was owned. Reported rather than raised — the uninstall itself already
+    succeeded, and bookkeeping must not fail it — but not reported as clean either.
+    """
+
+    dropped: int = 0
+    declined: bool = False
+    failed: bool = False
+
+
+def discard_app_session_pointers(app_name: str) -> SessionPointerCleanup:
+    """Drop the resume pointer of every conversation this app owned. CLI PATH ONLY.
+
+    Called by the UNINSTALL paths only, and deliberately NOT from
+    :func:`deregister_app`: that runs on **disable** too (the CLI's disable action,
+    the disable route, and the enable/update reconcile), and disable is how an app
+    is routinely restarted — App Store Sync is a disable/enable pair. Clearing
+    pointers there would discard the accumulated context of every long-lived
+    conversation the app owns, on every sync.
+
+    ``clear_sid``, not ``delete``: the entry also carries the Slack thread/channel
+    linkage and the reverse index built from it, so dropping the whole row would
+    silently unlink a mirrored session. The cleared value is stashed as
+    ``discarded_sid``, so this is diagnosable and reversible by hand — the native
+    conversation itself is untouched on disk.
+
+    **Holds the gateway lock across the whole scan and write, and that is the
+    mechanism, not a courtesy.** This writes through a throwaway ``SessionMap``,
+    which is only sound when no other instance holds the file: a running gateway
+    keeps a long-lived map whose ``_data`` loaded at startup and whose every write
+    rewrites the whole file from that snapshot, so two writers do not merge — the
+    loser's rows vanish. Writing anyway would both fail to drop the pointer (the
+    live map's next write restores it) and drop whatever that map recorded since
+    this process read, costing an unrelated session its sid or its channel link.
+    Merely *asking* whether a gateway is up cannot establish that: a gateway
+    starting between the question and the write lands in exactly the case the
+    question was meant to exclude. Taking the same lock the gateway takes makes the
+    exclusion real in both directions — while we hold it no gateway can start, and
+    if one is already up we cannot take it and decline instead. Doing nothing is
+    the pre-existing behaviour; corrupting a stranger's session is not.
+
+    The cost is stated rather than hidden: a gateway attempting to start inside this
+    window is refused as it would be by any other holder. The window is one scan
+    plus one write, and the alternative is losing another session's row.
+
+    The in-gateway route does not come through here at all — it clears through the
+    live map, inside the app lifecycle lock.
+
+    Returns what it did, not just how much: a declined clear leaves a pointer behind
+    and the caller has to be able to say so.
+    """
+    try:
+        with GatewayLock(config_dir()):
+            keys = app_conversation_keys(app_name)
+            if not keys:
+                return SessionPointerCleanup()
+            smap = SessionMap()
+            # ``clear_sid`` reports whether it dropped anything, so the count is
+            # conversations orphaned by THIS uninstall rather than keys looked at.
+            # The suppression flag goes on every owned key regardless: dropping the
+            # sid stops the NATIVE resume only, and the transcript stays on disk, so
+            # without it the next installation's first turn under this key gets the
+            # removed app's history injected as replay. A key whose pointer was
+            # already gone still has a transcript, so it still needs the flag.
+            cleared = 0
+            for key in keys:
+                if smap.clear_sid(key):
+                    cleared += 1
+                smap.set_flag(key, SUPPRESS_REPLAY_FLAG, True)
+            # Durable BEFORE the lock is released. Off-loop writes are inline today,
+            # so this is belt and braces — but the ordering is the invariant, not a
+            # property inherited from being off the loop, which a later refactor
+            # could change without noticing this depends on it.
+            smap.flush()
+    except GatewayLockError:
+        logger.info(
+            "Left %s's conversation pointers in place: a gateway owns session_map.json "
+            "and a second writer would drop rows it has not flushed yet",
+            app_name,
+        )
+        return SessionPointerCleanup(declined=True)
+    except Exception:  # noqa: BLE001 — bookkeeping must not fail an uninstall
+        logger.warning("session pointer cleanup for %r failed", app_name, exc_info=True)
+        # ``failed``, never the default: the scan and the write are both in this
+        # block, so an ENOSPC or permission error on ``flush`` lands here with the
+        # pointer still on disk. Returning the default would tell the caller the app
+        # owned nothing, and the caller prints a success tick on that.
+        return SessionPointerCleanup(failed=True)
+    if cleared:
+        logger.info(
+            "Dropped %d resume pointer(s) for %s so a reinstall starts fresh",
+            cleared,
+            app_name,
+        )
+    return SessionPointerCleanup(dropped=cleared)
+
+
 def deregister_app(app_name: str) -> RegistrationResult:
     """Deregister all resources for an app.
 
     Removes symlinks and cron manifests.  Does not remove the app directory.
+
+    Does NOT touch session resume pointers — see
+    :func:`discard_app_session_pointers` for why that belongs to uninstall alone.
     """
     result = RegistrationResult()
 

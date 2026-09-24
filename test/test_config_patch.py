@@ -133,6 +133,36 @@ class TestRoleModels:
         assert data["agent"]["approval_mode"] == "auto"
 
     @pytest.mark.asyncio
+    async def test_a_write_the_publish_floor_refuses_is_a_coded_400_not_a_500(
+        self, tmp_config, monkeypatch
+    ) -> None:
+        """``ConfigWriteRefused`` is a ``ValueError``, but it is the operator's input
+        being declined, not a server failure: it must be answered as a coded 400
+        carrying the floor's one-line instruction, before the generic ``ValueError``
+        arm that reports a malformed section as a 500. The field is not editable
+        through this surface today, so the refusal is raised the way the floor
+        raises it rather than provoked through the body."""
+        from kiro_crew.config import loader as loader_mod
+        from kiro_crew.config.loader import ConfigWriteRefused
+
+        message = (
+            "agent.deepseek_env entry 'DEEPSEEK_API_KEY' holds a literal value, so the "
+            "config write was refused."
+        )
+
+        def refuse(*_args, **_kwargs):
+            raise ConfigWriteRefused(message)
+
+        monkeypatch.setattr(loader_mod, "update_config_locked", refuse)
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "agent.role_models.subagent", "auto")
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "config_write_refused"
+            assert body["error"] == message
+        assert json.loads(tmp_config.read_text(encoding="utf-8")) == _seed_config()
+
+    @pytest.mark.asyncio
     async def test_role_model_auto_allowed(self, tmp_config) -> None:
         async with TestClient(TestServer(_make_app())) as c:
             resp = await _patch(c, "agent.role_models.subagent", "auto")

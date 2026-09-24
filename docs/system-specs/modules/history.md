@@ -99,7 +99,7 @@ Per-thread JSONL files at `~/.kiro/crew/sessions/{safe_key}.jsonl`. First line i
   through the `/api/session/archive` endpoints. Rotating a session the dashboard
   still displays therefore removes the head of that conversation from the chat,
   which is why the save path does not do it.
-- **Cache-fill staleness guard** — mtime-keyed memos cannot trust "same mtime == same content": housekeeping rewrites (compaction / rotation / metadata edits / `mark_consolidated`) restore the pre-write mtime via `_restore_mtime`, so a fill spanning one would park pre-rewrite data under an mtime the file still has — undetectably, for the life of the process. Two mechanisms close the fill window, by cache: `_meta_cache` and `_recent_cache` publish through a per-key invalidation **generation** (`_invalidate_cache` bumps the counter BEFORE dropping entries; each fill snapshots it before its `stat` and re-checks it around the publish via `_publish_if_current`, discarding the fill if it moved — lock-free on read paths reachable on the event loop, a discarded fill costs one re-read), while `_folded_cache`/`_snippet_cache` serialize the whole stat → read → store under `_file_lock` (`_folded_content`), and `_msg_cache` uses that same double-checked miss-only locking whose unlocked on-loop fallback publishes under the generation plus a cross-process flock-hold witness (`_read_messages`, below). The generation table is process-wide (class-level, keyed by transcript dir + sanitized stem — see `_read_messages` below for why instance scope is not enough), and generations, invalidation, and the pops all cover every cache-key spelling of one session — logical key, sanitized `path.stem`, and the canonical/legacy Slack aliases in both directions (`_cache_key_identities`) — because `list_sessions` keys its fills by stem while most writers invalidate under the logical key. `_meta_cache`, `_folded_cache`, and `_snippet_cache` entries ALSO record the generation they were filled under and a warm hit requires both the mtime and the generation to match, with the store routed through `_publish_if_current`: the fold's `_file_lock` is process-wide and path-keyed, so it orders fills against every in-process writer regardless of instance — but `_invalidate_cache`'s pops reach only the writer's own instance's caches, so an entry already sitting warm in ANOTHER instance survives a preserved-mtime rewrite, and the generation clause on the hit (backed by the process-wide table) is what unhits it. The store-side guard is generation-stamp hygiene — the lock already covers the fill window in-process; unlike `_read_messages`' flock-hold witness, the search memos have no cross-process witness, so a preserved-mtime rewrite from a different PROCESS remains a known residual gap for them.
+- **Cache-fill staleness guard** — transcript memos use a cache identity of `(st_mtime_ns, st_ctime_ns, st_ino)`, rather than mtime alone. That makes the normal atomic rewrite visible even when housekeeping restores its pre-write mtime via `_restore_mtime`; the replacement inode or changed ctime forces a miss. A per-key invalidation **generation** still closes in-process fill races: `_invalidate_cache` bumps it BEFORE dropping entries, and each fill snapshots it before `stat` then re-checks it around publish via `_publish_if_current`, discarding a fill if it moved. `_meta_cache`, `_recent_cache`, `_folded_cache`, `_snippet_cache`, and `_msg_cache` record both identity and generation; `_folded_cache`/`_snippet_cache` serialize stat → read → store under `_file_lock`, while `_msg_cache`'s unlocked on-loop fallback additionally needs a cross-process flock-hold witness. The generation table is process-wide (class-level, keyed by transcript directory + sanitized stem), and invalidation covers each spelling of one session — logical key, sanitized `path.stem`, and canonical/legacy Slack aliases in both directions (`_cache_key_identities`).
 - `recent(key)` — last 20 messages for context injection
 - `recent_with_provenance(key)` — entries with source citations
 - `list_sessions()` — lists all sessions with title (first user message or LLM-generated). Sort key uses ISO `created` string consistently (defaults to ISO from `st_mtime` if no metadata `created` field, ensuring string-only comparisons). Each returned session's meta dict also carries `folder_id` when present in the persisted metadata line, so sessions can be grouped by the folder they were filed in.
@@ -115,7 +115,7 @@ Per-thread JSONL files at `~/.kiro/crew/sessions/{safe_key}.jsonl`. First line i
 - `read_file_change_messages(key)` — a lightweight Artifacts projection that streams one transcript as bytes, skips lines without the serialized `"file_changes"` key before JSON parsing, and retains only `ts` plus `meta.file_changes` in its own bounded, file-stamped cache. It never warms `_msg_cache`, so scanning the session-document firehose cannot retain the full parsed transcript corpus.
 - Forge references (pull requests, merge requests, issues) are a query dimension of their own, because one item has several written spellings and a transcript carries whichever one its author used. A term naming an item — `#4411`, `PR #4411`, `pr 4411`, `pull request 4411`, `pr4411`, `pull/4411`, a full PR/MR URL, `owner/repo#4411` — becomes ONE required needle carrying every spelling of that item (`SearchNeedle.alts`, counted by the shared `count_needle`), so any spelling finds every spelling. The words that introduce the number are dropped from the gate: they are not part of the reference, and requiring the literal "pr" would disqualify a transcript that names the item only by URL. Spellings are `digit_bounded` on both sides, so `#4411` matches neither `#44110` nor the run id `1544110293`. The TYPED sigil decides the family, never a word before it: `mr#12` is read as `#12`, because letting the word win produced a reference none of whose spellings was the string the user typed. Coverage of every accepted shape is pinned by a property test that drives each one against a transcript quoting it verbatim, rather than by inspection of the spelling list. GitHub's pull/issue sequence is shared (`#4411` ≡ `/pull/4411` ≡ `/issues/4411`) while GitLab numbers merge requests separately, so `!12` and `#12` stay distinct families and never match each other; bare `merge` is not a GitLab word (GitLab is `MR 12` / `merge request 12` / `!12`). Plain digits remain one of the spellings exactly when the QUERY typed no sigil (`issue 42`, `PR 4411`, `pr4411`): such a query previously gated on the digits, so dropping them would HIDE the transcript that says "we hit issue 42 in prod", and keeping them makes the recall of the literal AND it replaces hold with ONE intended exception — a session whose only claim to the old match was the digits sitting inside a longer number, which is what the boundary exists to exclude. The LEFT edge of that boundary applies only to a spelling that starts with a digit: for a delimited spelling the character before it says nothing about the number's length, and demanding a non-digit there would refuse `#4411` inside `owner/repo2#4411` — a repo whose name ends in a digit, matched against the very reference the query named. Only a lead-in run that actually NAMES a type turns a following number into a reference: `pr 4411`, `issue 42`, `pull request 4411` and `merge request 12` (the two-word GitLab form) do; `requests 12` and `merge 1234` do NOT and stay literal terms, since dropping such a word from the gate would trade a real term for every session mentioning that number. A query that DID type a sigil never gated on bare digits, so it keeps them out and stays precise (a standalone "12" is ordinary prose). A BARE number with no naming word is not a reference at all: it keeps its plain substring needle — numeric content search (ports, error codes, run ids) is unchanged — and gains the spellings as scoring-only needles at `_FORGE_REF_WEIGHT`, so the session that references the pull request outranks one that merely contains those digits. Those ranking needles are NOT adjacency evidence (`SearchNeedle.adjacency`, which only CJK bigrams set), or they would arm the adjacency floor and turn a ranking hint into a hidden gate. Two limitations are accepted rather than special-cased, both needing a query nobody writes and both only widening the result set: a chain-only word wedged between the type word and the number (`issue merge 42`) is swallowed, and because the gate is keyed by term text a query repeating a suffix word as its own term (`pull the pull request 12`) loses that term. Closing either means keying the gate by token position instead of by text. Expansions per query are capped at `_SEARCH_MAX_FORGE_REFS`, each costing one scan per spelling per scanned session (up to eight for a named reference, up to thirteen for a bare number's both-families ranking needle, plus up to eight more for a registered provider's own prefixed id — see below); a token past the cap degrades to a plain needle.
 - A REGISTERED source provider contributes its OWN id spellings through the same machinery, so an edition whose reviews are written `REV-987654321` is searchable without any provider vocabulary in core. The seam is one optional plugin hook, `search_ref(token) -> (canonical, alts) | None` on `SourceProviderPlugin`, discovered with `getattr` exactly like `path_markers()`; `source_search_ref()` fans out across the registered plugins (asking each registered plugin until one answers, then handing that answer through unjudged — shape is the normalizer's job, and skipping a malformed answer would only serve the same two-registrant case the merge below is declined for), and `register_source_provider()` publishes that collector DOWNWARD into `history_search.register_search_ref_resolver` at registration time — never from a route handler, because `parse_search_query` is also reached from paths that serve no HTTP (the Discord title-only resume gate, the `kirocrew memory search` CLI) and a process that never ran a route would otherwise answer the same query differently. One slot holds the resolver, not a list: the per-plugin fan-out already lives in the collector. The FIRST plugin to recognize a token WINS, for every token shape: a prefixed id names ONE item, so merging would conflate distinct items, and a cross-plugin merge for a bare number would exist only to serve two registrants holding a real item at the same number — which this repo, registering no provider at all, cannot produce. Cost stays bounded in ONE place: `_MAX_SEARCH_REF_SPELLINGS` (8, sized to the sibling per-plugin `_MAX_PLUGIN_PATH_MARKERS` because it bounds the same kind of thing — what ONE plugin hands core for one lookup) bounds the single answer that arrives, with no collector-side ceiling to drift from it. A bare number is NOT a provider token at all: a provider's ids are prefixed, so a run of digits names nothing it owns and the resolver is not consulted for one. `_provider_search_ref` is the single normalizer — it casefolds every spelling (the query is casefolded before parsing and `count_needle` requires already-folded needles, so a capitalized spelling produces a needle that matches NOTHING, silently), de-duplicates, drops empties, applies the fan-in ceiling, and DROPS an answer none of whose spellings carries the typed token, since such an answer describes some other item and would otherwise rank a query on text it never named. Every way a resolver can fail is contained and costs no more than a debug log — carrying a traceback where an exception was raised, and the offending value where a shape was merely wrong, so none of them is silent: raising when called, returning a malformed answer, and raising while its `alts` are READ — the hook promises a `Sequence`, which cannot do that, but a resolver ignoring the contract can, so the read sits inside the same boundary and the answer is dropped WHOLE rather than half-read, since an exception there would otherwise escape the parse as a 500 on every search. A provider is consulted only for a token no built-in shape recognized (built-ins always win), contributes SPELLINGS ONLY and never lead-in vocabulary (the words a provider would want — "review", "cr" — are common English, so admitting them would trade a real search term for every session mentioning that number), and can never gate a BARE all-digit token, which it is never even asked about — so no number of registered providers can spend the `_SEARCH_MAX_FORGE_REFS` budget on one numeric token. The purity contract — pure, allocation-cheap, no I/O — is documented and not enforced: a resolver is consulted for every term of every query and the parse runs at least twice per search, so a blocking resolver becomes per-keystroke latency in the search box.
-- `_read_messages` — mtime-guarded message cache with the same double-checked, miss-only locking `_folded_content` uses for this identical race. A warm hit is served lock-free; only a MISS takes the session's in-process writer lock (`_file_lock`) and re-checks mtime + cache under it, so a cache fill cannot publish a pre-rewrite parse after an mtime-restoring rewrite (`_restore_mtime`) invalidated the cache. ON the event loop the lock is acquired non-blockingly and a busy lock falls back to an unlocked fill, so an on-loop read never stalls behind a writer holding the RLock across its cross-process flock wait (`_FLOCK_ACQUIRE_TIMEOUT_S`). An unlocked fill publishes through two witnesses, one per writer class: a per-key invalidation **generation** covering local writers (`_invalidate_cache` bumps the counter BEFORE dropping entries; the fill snapshots it before its stat and publishes only while it is unmoved, re-checked after the store), and a cross-process **flock-hold witness** covering external processes (`_flock_hold_witness`: publish only while this process provably held the sidecar flock for the whole fill window — an external writer's invalidation bumps a table in its own process, invisible here, so the flock is what excludes it; the witness carries a release epoch so a broken-and-reacquired hold never passes as continuous). A fill that races no rewrite is kept instead of re-parsed on the next read; one that cannot prove its window clean is discarded. Every published entry also records the generation it was stored under, and a warm HIT requires both the mtime and the generation to match: `_invalidate_cache`'s pops reach only its own instance's caches, so the process-wide bump is what unhits an entry when the rewrite was performed through a different `ConversationLog` instance. The generation guards `_msg_cache` specifically — the derived `_meta_cache`/`_recent_cache`/`_folded_cache`/`_snippet_cache` memos keep mtime-plus-instance-local-pop guards, so the cross-instance preserved-mtime case is a knowingly accepted residual gap for those (they back bounded views and search memos, not the authoritative transcript) — and lives in a process-wide class-level table keyed by `(transcript dir, sanitized filename stem)` — the same scope as the per-path lock table, because the writer forcing a reader onto the unlocked fill may be a different `ConversationLog` instance — with the legacy/canonical Slack spellings closed over bidirectionally (`_cache_key_identities`), because one session is reachable under both its logical key and its sanitized `path.stem` spelling and the writer and reader do not always use the same one.
+-- `_read_messages` — identity-guarded message cache with the same double-checked, miss-only locking `_folded_content` uses for this identical race. A warm hit is served lock-free; only a MISS takes the session's in-process writer lock (`_file_lock`) and re-checks identity + cache under it. The identity `(st_mtime_ns, st_ctime_ns, st_ino)` changes on the normal atomic rewrite even when housekeeping restores the previous mtime, so a stale cache entry cannot remain current. ON the event loop the lock is acquired non-blockingly and a busy lock falls back to an unlocked fill, so an on-loop read never stalls behind a writer holding the RLock across its cross-process flock wait (`_FLOCK_ACQUIRE_TIMEOUT_S`). An unlocked fill publishes through two witnesses: a per-key invalidation **generation** covering local writers and a cross-process **flock-hold witness** covering external processes (`_flock_hold_witness`: publish only while this process provably held the sidecar flock for the whole fill window). A fill that cannot prove its window clean is discarded. Every transcript memo (`_msg_cache`, `_meta_cache`, `_recent_cache`, `_folded_cache`, and `_snippet_cache`) records identity and generation; a warm hit requires both, so a write through another `ConversationLog` instance also invalidates it through the process-wide generation table keyed by `(transcript dir, sanitized filename stem)`, with canonical and legacy Slack spellings closed over bidirectionally (`_cache_key_identities`).
 - `delete_session(key)` — permanently removes a session JSONL file. Dashboard
   deletion may tear down the exact live slot and idle SessionManager generation
   captured before unlink, but it preserves chat pins, work ledgers, and
@@ -774,7 +774,8 @@ Do not reintroduce a `memory_mode` condition here without first changing what
 
 ## HistoryConsolidator (`history_consolidation.py`, re-exported by `history.py`)
 
-Background task that fires when unconsolidated count ≥ 10 messages. Uses the
+Background task that fires once a session's message count reaches
+`_CONSOLIDATION_THRESHOLD` (30) messages past its last consolidation offset. Uses the
 persistent background ACP session (kiro-cli long-running session, same as
 cron/heartbeat/lesson extraction) to extract:
 - `history_entry` → appended to today's daily history file
@@ -922,7 +923,251 @@ inner JSONL fallback; only an absent replay requests fallback construction.
 3. Context ≥ configured threshold (`session.autocompact_pct`, default 70%) → compaction via kiro-cli `/compact` (fire-and-forget)
 4. Session expires (30min idle) → provider killed
 5. User returns → new session with history re-injected
-6. After 10+ messages → background consolidation → structured memory updated
+6. After the message count crosses `_CONSOLIDATION_THRESHOLD` (30) past the last offset → background consolidation → structured memory updated
+
+## Reply Threads on Crewmate Chat Messages (`dashboard/chat_threads.py`)
+
+A **thread** is the set of replies attached to ONE message of a crewmate's chat --
+a member-mode slot (`slot.mode == members.DM_SLOT_MODE`) -- addressed by that
+message's durable `meta.mid`. "Thread" is only ever this reply thread; the main
+conversation is the chat. Any message, the user's or the crewmate's, can carry
+one.
+
+**Flag.** The feature ships behind `dashboard.crewmate_threads` (`config/sections.py`,
+default `False`; editable from the dashboard, `handlers/core.py` `_EDITABLE_CONFIG`,
+and read live -- the config watcher's snapshot, else a load off the loop -- so a
+toggle takes effect on the next request without a restart). Off, the three routes
+below answer `404 {"error": "not found", "code": "slot_not_found"}` -- the same
+body the app-isolation refusal sends, so a caller cannot tell "threads are off"
+from "no such slot" -- before any read or write; nothing is stored, no turn runs,
+and `ws.broadcast_thread_reply` sends no `chat.thread_reply` frame (also for a
+turn that was already running when the flag went off, whose stored reply is
+served again once it is back on). The stored sidecar is untouched by the flag
+either way: turning threads off hides them, it does not delete them.
+
+**Storage.** Replies live in a sidecar beside the slot's transcript,
+`ConversationLog.threads_sidecar_path(key)` =
+`<sessions dir>/.threads/<safe key>.json`, keyed by the slot's transcript key
+(`chat_utils.slot_history_key`). Shape: `{"version": 1, "threads": {<mid>:
+[{"id", "role": "user"|"assistant", "content", "ts"}, ...]}}`. It is a third
+sidecar next to `.summaries` and `.intents`, and its own file for the reason
+each of those is: it has its own writer (a reply landing) and no mtime contract
+with the transcript -- a reply must survive every later append to the main chat,
+so nothing about the session file's signature ever invalidates it. Replies
+never enter `slot.messages` or the JSONL, so the transcript read paths, the
+frozen-prefix save model and consolidation are untouched. The store is owned by
+`ConversationLog.read_threads` / `append_thread_reply`: the read-modify-write
+runs under the transcript's own `_locked(key)` -- the lock `delete_session`
+unlinks the sidecar under -- and REFUSES (`"missing"`) when no transcript
+exists, for the reason `set_cached_intent_summary` gives: a turn holds no lock
+while its model call is in flight, and an unconditional write landing after a
+delete would recreate the sidecar and resurrect a chat the user was told is
+gone. The same rule makes a chat younger than its first flush answer 409
+`transcript_missing` ("try again in a moment"). A reply is also admitted against
+ONE transcript: the handler captures the metadata line's `created_at`
+(`thread_transcript_identity`) BEFORE the parent lookup -- so the identity is
+never younger than the rows the parent was found in -- and both appends carry
+it (`expected_created_at`); a chat deleted and recreated under its
+deterministic key anywhere after that capture answers `"replaced"` (409
+`transcript_replaced` / a plain failure frame) instead of receiving the old
+chat's reply -- the same identity `chat_persistence` uses to tell "deleted and
+recreated" apart. Under the same lock the store also reads the chained
+transcript and refuses unless a row carries the parent's `meta.mid`
+(`"unflushed"`, 409 `transcript_missing` -- "try again in a moment"): a thread
+is durable only through the row it hangs off, so a parent that exists only in
+the slot's memory window is not admitted until the slot has flushed it, or a
+crash before the flush would leave the replies unreachable. For a pre-field
+transcript with no `created_at` that same check is what tells a replacement
+apart (a replacement never carries the old chat's message ids). Writes are
+`atomic_write`. A
+sidecar whose bytes are not a thread map raises `ThreadStoreUnreadable` and is
+NEVER overwritten (the three routes answer 503 `threads_unavailable`; a turn
+publishes a plain failure frame); rows of the wrong shape drop one by one, and
+a retained row is reduced to the reply schema (`id`, `role`, `content`, `ts`,
+strings) -- the file sits beside the transcript under the data home, so a field
+an agent put there never reaches the dashboard through the detail response,
+whose `_redacted_reply` likewise emits only those four fields. One
+thread holds at most 500 replies (`thread_full`), one chat's sidecar at most
+5 000 across every thread (`threads_full` -- the whole-file bound, since the
+panel reads the file whole), and the crewmate's stored reply is clipped at
+64 000 characters with a `[reply clipped]` marker (the streamed frames carried
+the whole text). The reader holds the same line whatever the file says
+(`THREAD_REPLY_CONTENT_MAX_CHARS`, `THREAD_MID_RE`,
+`THREADS_MAX_REPLIES_PER_THREAD`, `THREADS_MAX_REPLIES_PER_SIDECAR`, the one
+spelling the writer's caps and the routes' `_valid_mid` import): the file is opened once without
+following a link, sized on that descriptor and read to the ceiling
+(`THREADS_SIDECAR_MAX_BYTES`, 64 MiB; a link, a non-regular file or more
+bytes is `ThreadStoreUnreadable`, and the writer answers `threads_full` at the
+same ceiling so a sidecar it wrote is never past it), a row's `id`, `role` and
+`ts` must be in the writer's own shape (uuid hex, one of the two speakers,
+ISO-8601) or the row is dropped -- so `content` is the only field that can
+carry prose, and it is redacted at the boundary -- the content is cut at the
+writer's bound, a thread keeps its newest 500 rows (a key left with none is
+not a thread), the map stops at 5 000 rows, and a key that is not a minted row id (`m-` + 16 hex, `mint_row_mid`) is
+not a thread, since the summary route hands keys to the dashboard as they are.
+The write side holds the same line: the `.threads` directory must be a real
+directory (a link there is refused before anything is created under it) and on
+POSIX the leaf is replaced relative to its pinned descriptor
+(`atomic_write_at`), so no write of this store lands outside the session
+directory. A sidecar written by another hand under the data home cannot grow
+the gateway's memory past a legitimate one, nor reach the dashboard through a
+metadata field or a key, nor redirect a write. Session Storage
+(`session_storage.py`) counts the sidecar in the session's size and moves,
+restores and purges it with the transcript (`_unit_paths`, `_canonical_origin`
+accept `crew/.threads/<stem>.json`; the location is the one spelling
+`history.threads_sidecar_for_stem` gives). Because the sidecar is written under
+the transcript's lock, restore publishes it (relative to the pinned `.threads`
+descriptor, so a link swapped in after preflight is refused, not followed) and
+rolls it back under that same lock, beside the transcript, never as a pre-lock file -- a reply a recreated
+chat committed between publish and a lost-race rollback would otherwise ride
+the sidecar back to trash -- and a link where `.threads` should be stops the
+scan and leaves the batch staged. `delete_session`
+takes the sidecar with the transcript all-or-nothing, the way it takes the attachments directory (moved aside in one
+rename before the transcript goes, moved back if the unlink fails, purged only
+afterwards; the moves are relative to the pinned `.threads` descriptor on
+POSIX, and a link where `.threads` should be refuses the delete outright) -- replies are primary content, so a delete that reported success
+while the sidecar stayed behind would be a lie; the summary caches keep their
+best-effort unlink. **Threads do not travel**: a fork, a
+transfer and an export copy the transcript and leave the sidecar behind. That is
+a decision, not an omission -- replies are primary data that cannot regenerate,
+unlike the summary caches, and the fork/transfer/export paths carry a
+transcript's rows, not its sidecars; a copied chat starts with no threads, and
+the original keeps its own. Carrying them is a later, separate change. Assistant prose
+is re-redacted at every output boundary (`_redacted_reply`), as pins re-redact
+their previews.
+
+**API.** All three answer 404 `slot_not_found` for a missing slot or a foreign
+app caller (anti-enumeration, App Kit §5.2) and 409 `not_crewmate_chat` for a
+slot that is not a crewmate's chat.
+
+- `GET /api/chat/threads?slot=<key>` -- `{"threads": {<mid>: {"count",
+  "last_reply_ts", "participants": [roles, first-appearance order]}}}`, the
+  footer data under a bubble. A separate read, deliberately NOT folded into
+  `GET /api/chat/slots/{slot}`: the transcript read path stays unchanged and the
+  payload is small enough to fetch beside it.
+- `GET /api/chat/threads/{mid}?slot=<key>` -- `{"parent": {mid, role, content,
+  ts}, "replies": [...], "in_flight": bool}`. 404 `parent_not_found` when the
+  mid is no longer in the chat (the frozen disk prefix plus the memory window,
+  after `chat_handlers._reconcile_slot_window` -- the same reconciliation the
+  detail and resume handlers run, not a copy of it). Reading finds a parent the
+  window holds; writing a reply to it additionally needs the row on disk.
+- `POST /api/chat/threads/{mid}/reply` `{slot_key, text, reply_id?}` -- stores
+  the user's reply, broadcasts it, starts the crewmate's turn and answers
+  **202** `{reply, run_id}` at once. `reply_id` (32 hex, minted by the panel
+  per send and reused for a retry of the same text) makes the send idempotent:
+  a re-send of an id the thread already holds -- the 202 lost on the wire --
+  answers 202 `{reply, duplicate: true}` with the stored row: `run_id: ""` while
+  its turn runs or once it is answered, or -- stored as the last row with no
+  turn active (the turn failed, a restart took it) -- a fresh `run_id` for the
+  turn now run for the stored reply, without storing or broadcasting it again;
+  the store's own `duplicate` outcome under the lock guards the race; 400 `invalid_reply_id` for any other
+  shape. 400 `empty_reply`, 400 `invalid_text` (a lone
+  surrogate JSON admits and UTF-8 cannot carry -- a validation answer, never a
+  500), 413 `reply_too_long` (32 KiB),
+  409 `thread_turn_in_flight` while the crewmate is still replying in THAT
+  thread (a reply landing mid-turn would be answered by nothing; the panel
+  disables its send meanwhile), 409 `thread_full`, 409 `threads_full`, 409
+  `transcript_missing` (no transcript yet, or the parent row not flushed yet),
+  409 `transcript_replaced`,
+  503 `threads_unavailable` (no conversation log, an unreadable sidecar, a
+  lock timeout, or an `OSError` out of the sidecar write). The store write is shielded from
+  handler cancellation (a gateway shutdown mid-request): the worker's commit is
+  drained, and a reply that committed gets a terminal `assistant` row saying it
+  was stored but not answered, so a reopened thread never shows a question
+  with no answer. The user's reply is
+  admitted one seat BELOW each cap (499 / 4 999): it is stored only while the
+  crewmate's answer to it still fits, so the answer -- written under the full
+  caps -- is never the reply that finds the thread full after a whole turn ran. The in-flight reservation is taken with no await between the
+  check and the mark -- BEFORE the store write suspends -- so two replies racing
+  through it (a double-click) run one turn; one `finally` releases it on every
+  path that does not hand it to the turn -- each refusal, and an error the
+  store write raises that no outcome names (an `OSError` from the sidecar
+  write), so no failure leaves the thread refusing replies until restart. The
+  `thread_full` / `threads_full` texts each end in the next step ("Ask in the
+  main chat instead." / "Start a new chat to keep discussing.").
+
+**The crewmate's turn.** `_run_thread_turn` is the side turn's shape
+([side](side.md)) without its steer/queue ledger: resolve the slot's agent
+through `resolve_agent_bindings`, run in the thread's own isolated session
+`thread:<slot>:<mid>` (a `_STATELESS_PREFIXES` member, so it never resumes
+across restarts -- see [session](session.md); `sel._infer_source` classifies it
+as the dashboard surface and `messaging.link._TELEMETRY_LOCAL_PREFIXES` labels
+it `thread`), and stream through `stream_and_collect`. The tool
+posture is the side chat's, for the side chat's reason -- the thread panel has
+no approval card to fall back to: on a harness in `ACP_BACKENDS_SIDE_READONLY`
+the turn runs the derived `<agent>--readonly` spec under `READ_ONLY`; elsewhere
+`REJECT_ALL`. Actions go through the main chat, and the boundary prompt says so.
+The envelope (`build_thread_message`) is always sent whole (the
+instructions, up to 6 chat messages before the parent as background, the parent
+itself, the thread so far as its newest 40 replies plus a count of the earlier
+ones, the boundary, the reply): a thread turn never reuses
+a session -- the one it acquires is released and destroyed in its `finally`, so
+every reply cold-starts under the agent, project and derived spec resolved that
+turn (`resolve_agent_bindings(..., validate_memory_files=False)`, as the main
+chat's resolvers: the validation opens the member's SQLite database
+synchronously on the loop), and a slot whose project or agent changed between two replies is never
+served by a session bound to the old ones. The parent lookup reads the
+transcript by `api_chat_slot_detail`'s rule -- `_reconcile_slot_window` first,
+then disk prefix plus window -- so a parent only disk holds is found. The crewmate's memory is not injected into a thread turn (not done;
+the crewmate's agent spec is). The answer is redacted, clipped, appended to the sidecar as
+an `assistant` reply and broadcast; an empty answer becomes the same visible
+read-only boundary line the side chat shows. A refused read-only spec is audited as a
+denied SEL API access (`operation=thread_reply`, `source=read_only_spec`),
+like the app-isolation refusal. A turn cancelled mid-stream (a gateway
+restart) stores the redacted partial answer under
+`[reply interrupted: Kiro Crew stopped before it finished]` -- or the
+"stored but not answered" row when nothing streamed -- before the
+cancellation propagates, since the panel drops its live row on reconnect; the
+final store write is shielded and drained, so a cancel that lands while the
+whole answer commits writes no interruption row beside it. The audit of a
+refused read-only spec is best-effort: an audit subsystem that raises does not
+cost the panel its terminal frame. A
+reply the store refuses (the
+thread filled up, or the chat was deleted, while the model was writing) is
+published as the failure it is -- a `final` + `is_error` frame with no `reply`
+record -- never as a reply. A signed-out harness is recognised by its error's
+class name (the ACP type lives behind the agent-SDK import boundary) and
+answered with `host_auth.signed_out_message`, latching the readiness service
+signed-out as the main chat does.
+
+**Dashboard.** Only a crewmate's chat (the Members page) offers threads: it
+hands `ChatPane` a `threads` hook set (`app-sdk/messageRenderers.ThreadHooks`:
+`summaryOf(mid)`, `onOpen(mid)`, the crewmate's name), which the assistant and
+user rows read off `MessageRenderContext.threads`; every other surface has none
+and draws neither footer nor action. The page reads the flag through
+`hooks/useCrewmateThreadsFlag` (the shared `['kirocrewConfig']` query): `on`
+only once a successful read said `true`; a read that FAILED is its own state,
+said beside the chat through `ErrorNotice` with a Retry while the last known
+value stands -- never rendered as the flag being off, which would make an
+enabled feature vanish under a config blip. A bubble whose `mid` has replies gets a
+`ThreadFooter` under it (faces of who took part, "N replies" in accent, "Last
+reply 2h ago" muted); every bubble's hover action row gets "Reply in thread"
+(`MessageSquare`), the user's row included. Either opens the thread in the
+right side panel: `pages/members/ThreadPanel` covers the panel's tabs while it
+is on screen (slides in; `prefers-reduced-motion` fades) and hands them back on
+close, so the main chat stays visible beside it. The panel shows the parent
+quoted as one bubble, a hairline reply count, the replies as small bubbles on
+the main chat's run and corner rule (`components/chat/crewmateBubbles.ts`:
+the crewmate's consecutive replies group on the left, the user's right-aligned
+bubbles are always singles), a typing row while the crewmate replies (an ordinary item, never a
+notice) and a one-line "Reply…" composer with the real `SendBtn`, disabled
+while a reply is in flight. Stored replies and the per-slot summary are React
+Query reads (`api/threads.ts`); the reply in progress streams through
+`state/threadLiveStore` from `chat.thread_reply` frames, and a stored frame
+(the user's reply, the crewmate's `final`) invalidates both queries. Failures
+render through `ErrorNotice` in the panel with one plain sentence picked by the
+backend `code`; a failed send keeps the draft.
+
+**Wire.** `ws.broadcast_thread_reply` emits owner-only `chat.thread_reply`
+frames `{slot, mid, run_id, role, content, ts, final?, is_error?, reply?}`: the
+user's reply once, the crewmate's reply as streamed deltas grouped by `run_id`
+and a terminal `final` frame carrying the stored `reply` record. A frame with a
+`slot` field is a tier-1 slot-scoped WS event. Failure arms (the signed-out
+harness, `ReadOnlySpecError`, an unreadable sidecar, prompt-busy, anything else)
+always send a plain-language `final` + `is_error` frame, so the panel never waits
+on a reply that will not come; none of those is persisted. Only a failure a retry
+can cure says "Try again": a refused spec points at the main chat, an unreadable
+sidecar says the reply was not kept.
 
 ## Inline Image Attachments (`chat_attachments.py`)
 

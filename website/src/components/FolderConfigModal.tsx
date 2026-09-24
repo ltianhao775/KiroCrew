@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { Zap, FolderOpen, ChevronRight, Check } from 'lucide-react'
+import { Zap, FolderOpen, ChevronRight, Check, Plus, X } from 'lucide-react'
 import Modal from './Modal'
 import ErrorNotice from './ErrorNotice'
 import { Input, Btn } from './ui'
@@ -10,12 +10,12 @@ import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { ApiError } from '../api/apiError'
 import { parseErrorCode } from '../utils/errorReport'
-import { resolveFolderAgent, resolveFolderProjectDir } from '../utils/folderAgent'
+import { resolveFolderAgent, resolveFolderProjectDir, resolveFolderSteeringDirs } from '../utils/folderAgent'
 import { ChatFolder, ChatTag } from '../types'
 import { i18nT } from '../i18n/t'
 
 /** The folder fields this modal owns. */
-export type FolderConfigField = 'name' | 'color' | 'icon' | 'projectDir' | 'defaultAgent' | 'tags'
+export type FolderConfigField = 'name' | 'color' | 'icon' | 'projectDir' | 'defaultAgent' | 'tags' | 'steeringDirs'
 
 export interface FolderConfigDraft {
   name: string
@@ -33,6 +33,9 @@ export interface FolderConfigDraft {
   defaultAgent: string
   /** Tag ids the folder carries; copied onto new chats filed into it. */
   tags: string[]
+  /** Extra steering directories loaded for every chat in this folder's subtree
+   *  (accumulative with ancestors, resolved server-side from folder_id). */
+  steeringDirs: string[]
   /** Fields the USER actually edited, measured against what the modal opened
    *  with. The caller must build its PATCH from this rather than diffing the
    *  draft against live cache: a field another client changed while the modal
@@ -84,7 +87,7 @@ function ancestorChain(folders: ChatFolder[], id: string | undefined): ChatFolde
   return out
 }
 
-const EMPTY: FolderConfigDraft = { name: '', color: '', icon: '', regenerateIcon: false, projectDir: '', defaultAgent: '', tags: [], touched: [] }
+const EMPTY: FolderConfigDraft = { name: '', color: '', icon: '', regenerateIcon: false, projectDir: '', defaultAgent: '', tags: [], steeringDirs: [], touched: [] }
 
 /** Set-equality on two tag-id lists (order-insensitive): the picker toggles
  *  membership, so "changed?" is about which ids are present, not their order. */
@@ -92,6 +95,13 @@ function sameTags(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false
   const s = new Set(a)
   return b.every(id => s.has(id))
+}
+
+/** Order-SENSITIVE equality on two directory lists: steering dirs are an
+ *  ordered list the user builds row by row (order can matter to a steering
+ *  loader), so a reorder IS a change — unlike the order-insensitive tag set. */
+function sameDirs(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((d, i) => d === b[i])
 }
 
 /**
@@ -112,6 +122,11 @@ export default function FolderConfigModal({
 }: Props) {
   const [draft, setDraft] = useState<FolderConfigDraft>(EMPTY)
   const [pickerOpen, setPickerOpen] = useState(false)
+  // Which field the shared ProjectPicker is currently feeding: 'project'
+  // REPLACES the scalar project_dir; 'steering' PUSHES the picked path into the
+  // steering-dirs array. One picker instance serves both — routing by target
+  // keeps folder-directory picking identical to every other project picker.
+  const [pickerTarget, setPickerTarget] = useState<'project' | 'steering'>('project')
   // The backend rejects a free-typed project_dir (not absolute / not an existing
   // directory / sensitive path) with a 400. Submit used to be fire-and-forget,
   // so a rejection closed the modal and threw the whole draft away with no
@@ -127,6 +142,7 @@ export default function FolderConfigModal({
   // "has the user actually typed something worth protecting?".
   const seedRef = useRef<FolderConfigDraft>(EMPTY)
   const browseRef = useRef<HTMLButtonElement>(null)
+  const steeringBrowseRef = useRef<HTMLButtonElement>(null)
   const nameRef = useRef<HTMLInputElement>(null)
   // A folder name is prime IME territory (the sidebar's inline input it replaces
   // guarded this too). Without the guard, the Enter that COMMITS a Chinese /
@@ -173,12 +189,14 @@ export default function FolderConfigModal({
         projectDir: f.project_dir ?? '',
         defaultAgent: f.default_agent ?? '',
         tags: Array.isArray(f.tags) ? (known ? f.tags.filter(t => vocab.has(t)) : [...f.tags]) : [],
+        steeringDirs: Array.isArray(f.steering_dirs) ? [...f.steering_dirs] : [],
         touched: [],
       }
       : EMPTY
     setDraft(seeded)
     seedRef.current = seeded
     setPickerOpen(false)
+    setPickerTarget('project')
     setSaving(false); setSaveErr(''); setIconErr(false)
   }, [open, mode, seedKey])
 
@@ -218,6 +236,20 @@ export default function FolderConfigModal({
       ? resolveFolderAgent(folders, from, globalDefaultAgent || '')
       : globalDefaultAgent || undefined
   }, [folders, mode, folder?.parent_id, parentId, globalDefaultAgent])
+
+  // Steering dirs accumulate up the chain, so the ANCESTORS' dirs are in effect
+  // for this folder in addition to its own — shown read-only below the editable
+  // list so the user sees the full effective set. Resolved from the parent chain
+  // only (this folder's own dirs are the editable rows), and filtered by this
+  // folder's principal the way the backend delivery gate filters: an ancestor
+  // owned by ANOTHER principal never reaches this folder's chats, so it is not
+  // listed as inherited. A folder being created from this dashboard is the
+  // person's (no owner_app), so its principal is the empty string.
+  const inheritedSteeringDirs = useMemo(() => {
+    const from = mode === 'edit' ? folder?.parent_id : parentId
+    const principal = (mode === 'edit' ? folder?.owner_app : '') || ''
+    return from ? resolveFolderSteeringDirs(folders, from, principal) : []
+  }, [folders, mode, folder?.parent_id, folder?.owner_app, parentId])
 
   const trimmedName = draft.name.trim()
   const canSubmit = trimmedName.length > 0
@@ -262,6 +294,7 @@ export default function FolderConfigModal({
     if (draft.projectDir !== seeded.projectDir) edited.push('projectDir')
     if (draft.defaultAgent !== seeded.defaultAgent) edited.push('defaultAgent')
     if (tagsEdited) edited.push('tags')
+    if (!sameDirs(draft.steeringDirs, seeded.steeringDirs)) edited.push('steeringDirs')
     setSaving(true); setSaveErr(''); setIconErr(false)
     try {
       await onSubmit({ ...draft, name: trimmedName, touched: edited })
@@ -295,6 +328,7 @@ export default function FolderConfigModal({
   if (draft.projectDir !== seed.projectDir) touched.push('projectDir')
   if (draft.defaultAgent !== seed.defaultAgent) touched.push('defaultAgent')
   if (!sameTags(draft.tags, seed.tags)) touched.push('tags')
+  if (!sameDirs(draft.steeringDirs, seed.steeringDirs)) touched.push('steeringDirs')
   const isDirty = touched.length > 0
 
   return (
@@ -569,7 +603,7 @@ export default function FolderConfigModal({
                 {...ime.bindComposition()}
                 onKeyDown={e => { if (e.key === 'Enter' && ime.claimEnter(e)) submit() }}
               />
-              <Btn ref={browseRef} data-testid="folder-config-browse" onClick={() => setPickerOpen(true)}>
+              <Btn ref={browseRef} data-testid="folder-config-browse" onClick={() => { setPickerTarget('project'); setPickerOpen(true) }}>
                 <FolderOpen size={13} /> {i18nT('components.folderConfigModal.browse')}
               </Btn>
             </div>
@@ -578,6 +612,55 @@ export default function FolderConfigModal({
             ) : (
               <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.project_dir_hint')}</span>
             )}
+          </div>
+
+          {/* Extra steering directories — an ordered list of directory rows the
+           *  user builds with the SAME ProjectPicker the project-dir field uses
+           *  (routed through pickerTarget='steering'). Ancestor dirs accumulate
+           *  and are shown read-only below, so the user sees the full effective
+           *  set without being able to edit a parent's contribution here. */}
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.steering_dirs')}</span>
+            {draft.steeringDirs.length > 0 && (
+              <div data-testid="folder-config-steering-dirs" className="flex flex-col gap-1.5">
+                {draft.steeringDirs.map((dir, i) => (
+                  <div
+                    key={`${dir}-${i}`}
+                    data-testid={`folder-config-steering-dir-${i}`}
+                    className="flex items-center gap-2 bg-bg-elevated border border-border rounded-lg px-2.5 py-1.5"
+                  >
+                    <FolderOpen size={12} className="text-accent shrink-0" />
+                    <span className="flex-1 min-w-0 font-mono text-[12px] text-text truncate" title={dir}>{dir}</span>
+                    <button
+                      type="button"
+                      data-testid={`folder-config-steering-dir-remove-${i}`}
+                      aria-label={i18nT('components.folderConfigModal.steering_dir_remove', { path: dir })}
+                      onClick={() => setDraft(d => ({ ...d, steeringDirs: d.steeringDirs.filter((_, j) => j !== i) }))}
+                      className="shrink-0 p-0.5 text-muted hover:text-danger rounded hover:bg-bg-hover cursor-pointer bg-transparent border-none"
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div>
+              <Btn ref={steeringBrowseRef} data-testid="folder-config-steering-add" onClick={() => { setPickerTarget('steering'); setPickerOpen(true) }}>
+                <Plus size={13} /> {i18nT('components.folderConfigModal.steering_dir_add')}
+              </Btn>
+            </div>
+            {inheritedSteeringDirs.length > 0 && (
+              <div data-testid="folder-config-steering-inherited" className="flex flex-col gap-1">
+                <span className="text-[11px] font-semibold text-muted-strong">{i18nT('components.folderConfigModal.steering_dirs_inherited')}</span>
+                {inheritedSteeringDirs.map((dir, i) => (
+                  <div key={`inh-${dir}-${i}`} className="flex items-center gap-2 opacity-60 px-2.5 py-1">
+                    <FolderOpen size={12} className="text-muted shrink-0" />
+                    <span className="flex-1 min-w-0 font-mono text-[12px] text-muted truncate" title={dir}>{dir}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.steering_dirs_hint')}</span>
           </div>
 
           {/* Default agent. SimpleSelect renders a <button>, not a <select>, so
@@ -634,8 +717,15 @@ export default function FolderConfigModal({
         <ProjectPicker
           open={true}
           onOpenChange={o => { if (!o) setPickerOpen(false) }}
-          anchorRef={browseRef}
-          onSelect={path => { setDraft(d => ({ ...d, projectDir: path })); setPickerOpen(false) }}
+          anchorRef={pickerTarget === 'steering' ? steeringBrowseRef : browseRef}
+          onSelect={path => {
+            setDraft(d => pickerTarget === 'steering'
+              // Append to the ordered list, ignoring a path already present so a
+              // double-pick cannot duplicate a row.
+              ? (d.steeringDirs.includes(path) ? d : { ...d, steeringDirs: [...d.steeringDirs, path] })
+              : { ...d, projectDir: path })
+            setPickerOpen(false)
+          }}
         />
       )}
     </>

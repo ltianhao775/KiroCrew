@@ -1646,6 +1646,93 @@ class TestRestoredEntriesCarryNoAdmissionSnapshot:
         assert newly_held_constraints(now, restored[0].get("meta")) == ["linked"]
 
 
+class TestRestoredEntriesCarryNoSenderStamp:
+    """A restored entry names no sender, so the drop notice has nowhere to go.
+
+    The stamp differs from the two keys above in what it DOES: those are read,
+    this one names a write target. The drop resolves the recipient of its notice
+    from the stamp alone and appends the entry's own text there, so a stamp
+    carried back off the metadata line would write attacker-chosen text into a
+    session the editor does not own. Stripping costs one notice and keeps the
+    delivery.
+    """
+
+    def test_the_sender_stamp_is_stripped_on_restore(self) -> None:
+        from kiro_crew.dashboard.session_control import SEND_ORIGIN_META_KEY
+
+        restored = sanitize_restored_queue(
+            [
+                {
+                    "id": "q1",
+                    "content": "write this into the victim transcript",
+                    "meta": {
+                        SEND_ORIGIN_META_KEY: {"slot": "victim-slot", "tab": "forged-tab"},
+                        "sendId": "s-1",
+                    },
+                }
+            ]
+        )
+        assert SEND_ORIGIN_META_KEY not in restored[0]["meta"]
+        assert restored[0]["meta"] == {"sendId": "s-1"}
+
+    def test_a_forged_stamp_resolves_to_no_recipient(self) -> None:
+        # The end of the chain the strip breaks: with the key carried, this reads
+        # "victim-slot" and the drop appends the entry's text there. The forged
+        # tab is included because an editor can write both fields, so the strip
+        # -- not the identity check -- is what has to stop this one.
+        from kiro_crew.dashboard.session_control import (
+            SEND_ORIGIN_META_KEY,
+            send_origin_slot,
+            send_origin_tab,
+        )
+
+        restored = sanitize_restored_queue(
+            [
+                {
+                    "id": "q1",
+                    "content": "hi",
+                    "meta": {SEND_ORIGIN_META_KEY: {"slot": "victim-slot", "tab": "forged-tab"}},
+                }
+            ]
+        )
+        assert send_origin_slot(restored[0].get("meta")) == ""
+        assert send_origin_tab(restored[0].get("meta")) == ""
+
+    def test_the_stamp_does_not_survive_the_real_round_trip(self, tmp_path) -> None:
+        from kiro_crew.dashboard.session_control import SEND_ORIGIN_META_KEY
+
+        state = _make_state(tmp_path)
+        slot = _busy_slot(state)
+        slot.queue_append(
+            "hi", meta={SEND_ORIGIN_META_KEY: {"slot": "victim-slot", "tab": "forged-tab"}}
+        )
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+
+        assert restored is not None
+        assert restored._queue[0]["content"] == "hi"
+        assert SEND_ORIGIN_META_KEY not in restored._queue[0].get("meta", {})
+
+    def test_an_in_process_stamp_still_reads(self, tmp_path) -> None:
+        # The strip bounds the RESTORE path only: a stamp this process admitted
+        # is what the notice is for, so removing it everywhere would delete the
+        # feature rather than bound it.
+        from kiro_crew.dashboard.session_control import (
+            send_origin_meta,
+            send_origin_slot,
+            send_origin_tab,
+        )
+
+        state = _make_state(tmp_path)
+        sender = state.get_or_create_slot("sender-slot")
+        stamp = send_origin_meta(state, "sender-slot")
+
+        assert send_origin_slot(stamp) == "sender-slot"
+        assert send_origin_tab(stamp) == sender._tab_id
+
+
 class TestAStaleQueueSnapshotIsNotCommitted:
     """A writer holding an older queue value must not put it back on disk.
 

@@ -848,9 +848,25 @@ class CoercedValue:
     """
 
     dotted_key: str
-    resolves_to: str
+    #: What the loader replaces the stored value WITH, given that value. A
+    #: callable rather than one string because the answer can depend on the value
+    #: (a retired speech provider becomes ``local``, an unknown one ``off``), and
+    #: ``--adopt`` must materialize exactly that answer rather than delete the key:
+    #: deletion resolves to the section DEFAULT, which is not always what the
+    #: stored value resolved to, and an adoption that changes the effective
+    #: setting is the one thing the command promises never to do.
+    resolves_to: Callable[[object], str]
+    #: Section default for the key, so an adoption whose resolution IS the default
+    #: can delete the key (an absent key resolves to it) rather than write it.
+    default: str
     reason: str
     is_coerced: Callable[[object], bool]
+
+    def adopted_value(self, stored: object) -> str | None:
+        """What ``--adopt`` should leave in the file for *stored*: a value to
+        write, or ``None`` to delete the key because the default already answers."""
+        resolved = self.resolves_to(stored)
+        return None if resolved == self.default else resolved
 
 
 def _stt_provider_is_coerced(value: object) -> bool:
@@ -866,13 +882,29 @@ def _stt_provider_is_coerced(value: object) -> bool:
     return stt_provider_is_coerced(value)
 
 
+def _stt_provider_resolution(value: object) -> str:
+    """What the loader runs for a stored ``stt.provider`` of *value*.
+
+    The loader's own rule, not a restatement of it: a retired name resolves to
+    ``local`` and anything else to ``off``, and ``--adopt`` writes whichever the
+    loader would have chosen so the effective provider does not move. The pure
+    resolver, not the validating wrapper: adoption is a decision about the value,
+    not a load, so the load-time notice is not wanted here.
+    """
+    from kiro_crew.config import sections  # circular import
+
+    return sections.stt_provider_resolution(value)
+
+
 #: Stored values the loader coerces. One entry today; append as retirements land.
 COERCED_VALUES: tuple[CoercedValue, ...] = (
     CoercedValue(
         dotted_key="stt.provider",
-        resolves_to="local",
+        resolves_to=_stt_provider_resolution,
+        default="local",
         reason=(
-            "names a retired or unknown speech provider, so voice input already runs " "on 'local'"
+            "names a retired speech provider (voice input runs on 'local') or an "
+            "unknown one (no recogniser runs, as if it were 'off')"
         ),
         is_coerced=_stt_provider_is_coerced,
     ),
@@ -895,11 +927,36 @@ def coerced_value_drift(base_data: dict) -> list[tuple[CoercedValue, object]]:
 
 def coercion_summary(entry: CoercedValue, stored: object) -> str:
     """One line describing a coerced stored value and the only useful answer to it."""
+    resolved = entry.resolves_to(stored)
     return (
         f"{entry.dotted_key} is stored as {stored!r}, which {entry.reason}. "
-        f"The stored value cannot take effect, so removing it changes nothing except "
-        f"that Kiro Crew stops saying so on every load."
+        f"The stored value cannot take effect; it runs as {resolved!r}, and adopting "
+        f"writes that so the setting stops changing under a warning on every load."
     )
+
+
+def adopt_coerced_keys(base_data: dict, entries: list[tuple[CoercedValue, object]]) -> list[str]:
+    """Materialize each coerced key as what it resolves to, in place; return them.
+
+    A resolution equal to the section default is written as the ABSENCE of the key
+    (an absent key resolves to the default); any other resolution is written as the
+    value itself. Either way the loader runs the same provider before and after,
+    which is what makes adoption safe to offer for a value the operator may not
+    understand. Mutates the dict the CALLER read under its own lock.
+    """
+    adopted: list[str] = []
+    for entry, stored in entries:
+        section, field = _split_dotted(entry.dotted_key)
+        section_data = base_data.get(section)
+        if not isinstance(section_data, dict) or field not in section_data:
+            continue
+        replacement = entry.adopted_value(stored)
+        if replacement is None:
+            del section_data[field]
+        else:
+            section_data[field] = replacement
+        adopted.append(entry.dotted_key)
+    return adopted
 
 
 def drop_drifted_keys(base_data: dict, dotted_keys: list[str]) -> list[str]:

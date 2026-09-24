@@ -1534,6 +1534,70 @@ class TestHandleInteractionGuards:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# the claimed region always answers the wire and releases the waiter
+# ──────────────────────────────────────────────────────────────────────
+class TestHandleInteractionClaimedRegion:
+    """A raise between the claim (``_pending_approvals.pop``) and ``set_result``
+    must still answer the wire and release the waiter.
+
+    ``_request_approval``'s timeout arm that lost its claim awaits
+    ``pending.future`` unbounded, justified by "every way the click can end
+    resolves this future". These tests pin that invariant for the synchronous
+    bookkeeping between the claim and the resolution (trust bookkeeping, audit,
+    stats), not just the two wire calls the old per-arm handlers covered.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_raise_inside_the_claimed_region_answers_wire_and_waiter(
+        self, owner, sessions, monkeypatch
+    ):
+        provider = MagicMock()
+        provider.approve_tool = AsyncMock()
+        provider.reject_tool = AsyncMock()
+        pending = h._PendingApproval(provider, "r1", "sess-9")
+        h._pending_approvals["C1:m1"] = pending
+
+        def _boom(*a, **k):
+            raise RuntimeError("trust bookkeeping failed")
+
+        monkeypatch.setattr(h, "add_trusted_session", _boom)
+        with pytest.raises(RuntimeError, match="trust bookkeeping failed"):
+            await h.handle_interaction("C1", "m1", h._ACTION_TRUST, "U1", sessions=sessions)
+        # The waiter is released with the real (rejected) outcome...
+        assert pending.future.done()
+        assert pending.future.result() == h._OUTCOME_REJECTED
+        # ...and the wire is answered, so the ACP request is not stranded.
+        provider.reject_tool.assert_awaited_once_with("r1")
+        provider.approve_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reject_orphaned_tool_swallows_audit_failure(self, owner, monkeypatch):
+        provider = MagicMock()
+        provider.reject_tool = AsyncMock()
+        monkeypatch.setattr(h, "sel", MagicMock(side_effect=RuntimeError("audit failed")))
+
+        assert await h._reject_orphaned_tool(provider, "r1") is True
+
+        provider.reject_tool.assert_awaited_once_with("r1")
+
+    @pytest.mark.asyncio
+    async def test_an_approve_wire_failure_still_rejects_and_releases(self, owner, monkeypatch):
+        provider = MagicMock()
+        provider.approve_tool = AsyncMock(side_effect=RuntimeError("pipe closed"))
+        provider.reject_tool = AsyncMock()
+        pending = h._PendingApproval(provider, "r1", "t1")
+        h._pending_approvals["C1:m1"] = pending
+        monkeypatch.setattr(h, "sel", MagicMock(side_effect=RuntimeError("audit failed")))
+
+        with pytest.raises(RuntimeError, match="pipe closed"):
+            await h.handle_interaction("C1", "m1", h._ACTION_APPROVE, "U1")
+
+        assert pending.future.done()
+        assert pending.future.result() == h._OUTCOME_REJECTED
+        provider.reject_tool.assert_awaited_once_with("r1")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # linked (dashboard-owned) approvals
 # ──────────────────────────────────────────────────────────────────────
 class TestLinkedApprovals:
@@ -1728,6 +1792,10 @@ class TestRequestApproval:
         # timeout=0 makes wait_for fail its first check — deterministic, no sleep.
         monkeypatch.setattr(h, "_APPROVAL_TIMEOUT", 0)
         provider = MagicMock()
+        # Keep this test on the no-steer baseline; the steer arms are owned by
+        # TestApprovalTimeoutInbandNotice (a bare MagicMock auto-attribute would
+        # be truthy and route through the steer-failure path instead).
+        provider.supports_steer = False
         provider.reject_tool = AsyncMock()
         outcome = await h._request_approval(slack, provider, "C1", "t1", _perm_event())
         assert outcome == h._OUTCOME_REJECTED
@@ -1742,9 +1810,198 @@ class TestRequestApproval:
             slack_client, "delete_message", AsyncMock(side_effect=RuntimeError("too old"))
         )
         provider = MagicMock()
+        provider.supports_steer = False
         provider.reject_tool = AsyncMock()
         await h._request_approval(slack_client, provider, "C1", "t1", _perm_event())
         assert "🚫 Rejected" in _texts(slack_client)
+
+
+class _SteerRecordingProvider:
+    """Fake provider recording the order of steer() and reject_tool() calls."""
+
+    def __init__(self, *, supports_steer: bool = True, steer_exc: BaseException | None = None):
+        self.supports_steer = supports_steer
+        self.calls: list[tuple[str, str]] = []
+        self._steer_exc = steer_exc
+        self.pending_during_steer: dict[str, object] = {}
+
+    async def steer(self, message: str) -> bool:
+        # The decision must already be claimed when the steer runs: a pending
+        # entry left registered here would let a concurrent Slack click answer
+        # the same permission request a second time.
+        self.pending_during_steer = dict(h._pending_approvals)
+        self.calls.append(("steer", message))
+        if self._steer_exc is not None:
+            raise self._steer_exc
+        return True
+
+    async def reject_tool(self, request_id) -> None:
+        # Suspend once before recording, like a real pipe write: a scheduled-
+        # but-never-stepped reject task then fails the assertion instead of
+        # passing on scheduling alone.
+        await asyncio.sleep(0)
+        self.calls.append(("reject_tool", str(request_id)))
+
+
+class TestApprovalTimeoutInbandNotice:
+    """An expired Slack approval prompt must correct the model's attribution.
+
+    Mirrors the dashboard-side ordering contract pinned in
+    test_refusal_inband_notice.py: the notice is steered while the permission
+    request is still unanswered (queued, not dropped), and the reject follows
+    unconditionally.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_steers_cause_notice_before_reject(self, slack, monkeypatch):
+        monkeypatch.setattr(h, "_APPROVAL_TIMEOUT", 0)
+        provider = _SteerRecordingProvider()
+        outcome = await h._request_approval(slack, provider, "C1", "t1", _perm_event())
+        assert outcome == h._OUTCOME_REJECTED
+        assert [c[0] for c in provider.calls] == ["steer", "reject_tool"]
+        notice = provider.calls[0][1]
+        # The pending entry was claimed before the steer awaited, so a click
+        # landing mid-steer cannot double-answer the permission request.
+        assert provider.pending_during_steer == {}
+        # The approval-timeout cause wording, not the generic policy one.
+        assert "expired unanswered" in notice
+        assert "Slack approval prompt went unanswered" in notice
+        assert provider.calls[1][1] == "r1"
+        assert not h._pending_approvals
+
+    @pytest.mark.asyncio
+    async def test_reject_still_sent_when_steer_raises(self, slack, monkeypatch):
+        monkeypatch.setattr(h, "_APPROVAL_TIMEOUT", 0)
+        provider = _SteerRecordingProvider(steer_exc=RuntimeError("wire down"))
+        outcome = await h._request_approval(slack, provider, "C1", "t1", _perm_event())
+        assert outcome == h._OUTCOME_REJECTED
+        assert ("reject_tool", "r1") in provider.calls
+
+    @pytest.mark.asyncio
+    async def test_reject_still_sent_when_steer_times_out(self, slack, monkeypatch):
+        monkeypatch.setattr(h, "_APPROVAL_TIMEOUT", 0)
+        # A steer that hangs forever: only the wait_for bound can get past it,
+        # so this pins the bound itself, not merely the swallow.
+        monkeypatch.setattr(h, "_STEER_NOTICE_BOUND_SECS", 0.05)
+        provider = _SteerRecordingProvider()
+
+        async def _hanging_steer(message: str) -> bool:
+            provider.calls.append(("steer", message))
+            await asyncio.Event().wait()
+            return True  # pragma: no cover - unreachable
+
+        provider.steer = _hanging_steer  # type: ignore[method-assign]
+        outcome = await asyncio.wait_for(
+            h._request_approval(slack, provider, "C1", "t1", _perm_event()), timeout=2.0
+        )
+        assert outcome == h._OUTCOME_REJECTED
+        assert ("reject_tool", "r1") in provider.calls
+
+    @pytest.mark.asyncio
+    async def test_no_steer_when_a_click_already_claimed_the_entry(self, slack, monkeypatch):
+        """A click that won the claim is answering the request itself: steering
+        "expired unanswered" then would be false. The reject still goes out as
+        the wire safety net."""
+        monkeypatch.setattr(h, "_APPROVAL_TIMEOUT", 0)
+        provider = _SteerRecordingProvider()
+
+        async def _post(channel, blocks, text, thread_ts=None, **kw):
+            ts = "9002.0"
+
+            def _click() -> None:
+                # Simulate a click claiming the entry between registration and
+                # the timeout arm, then delivering its decision, as
+                # handle_interaction does after its wire answer.
+                pending = h._pending_approvals.pop(f"{channel}:{ts}", None)
+                if pending is not None and not pending.future.done():
+                    pending.future.set_result(h._OUTCOME_APPROVED)
+
+            asyncio.get_running_loop().call_soon(_click)
+            return ts
+
+        slack.post_blocks = _post
+        outcome = await h._request_approval(slack, provider, "C1", "t1", _perm_event())
+        # The claim winner answers the wire; the loser stays entirely off it —
+        # a second answer would land in the ACP client's cancelled-outcome
+        # fallback and cancel the whole turn. And the returned outcome is the
+        # CLICK's real decision, delivered through the shielded future.
+        assert outcome == h._OUTCOME_APPROVED
+        assert provider.calls == []
+
+    @pytest.mark.asyncio
+    async def test_lost_claim_waits_for_the_click_to_resolve_and_reports_it(
+        self, slack, monkeypatch
+    ):
+        """A click that claimed the entry but is slow to finish its wire write
+        (a backpressured stdin) owns the answer: the timeout arm keeps
+        awaiting the click-owned future -- no bound, no fabricated rejection --
+        and reports the click's real decision once it lands, without ever
+        touching the wire itself."""
+        monkeypatch.setattr(h, "_APPROVAL_TIMEOUT", 0)
+        provider = _SteerRecordingProvider()
+        claimed: list[h._PendingApproval] = []
+
+        async def _post(channel, blocks, text, thread_ts=None, **kw):
+            ts = "9003.0"
+
+            def _claim() -> None:
+                pending = h._pending_approvals.pop(f"{channel}:{ts}", None)
+                if pending is not None:
+                    claimed.append(pending)
+
+            asyncio.get_running_loop().call_soon(_claim)
+            return ts
+
+        slack.post_blocks = _post
+        task = asyncio.create_task(h._request_approval(slack, provider, "C1", "t1", _perm_event()))
+        # Long enough that a timer-based fallback would have fired: the click is
+        # still "writing", and the arm is still waiting on it.
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        assert provider.calls == []
+        # The click finishes its answer -- Approve -- and resolves the waiter.
+        assert claimed and not claimed[0].future.done()
+        claimed[0].future.set_result(h._OUTCOME_APPROVED)
+        outcome = await asyncio.wait_for(task, timeout=2.0)
+        assert outcome == h._OUTCOME_APPROVED
+        # The click's approve is the only answer this request ever gets.
+        assert provider.calls == []
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_steer_still_answers_the_wire(self, slack, monkeypatch):
+        """A REAL task cancel while parked in the steer: the shielded orphan
+        reject must still reach the wire before the cancellation re-raises."""
+        monkeypatch.setattr(h, "_APPROVAL_TIMEOUT", 0)
+        provider = _SteerRecordingProvider()
+        steer_parked = asyncio.Event()
+
+        async def _hanging_steer(message: str) -> bool:
+            provider.calls.append(("steer", message))
+            steer_parked.set()
+            await asyncio.Event().wait()
+            return True  # pragma: no cover - unreachable
+
+        provider.steer = _hanging_steer  # type: ignore[method-assign]
+        task = asyncio.create_task(h._request_approval(slack, provider, "C1", "t1", _perm_event()))
+        await asyncio.wait_for(steer_parked.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        assert ("reject_tool", "r1") in provider.calls
+        assert not h._pending_approvals
+
+    def test_steer_bound_mirrors_the_dashboard_runner(self):
+        from kiro_crew.dashboard import chat_runner
+
+        assert h._STEER_NOTICE_BOUND_SECS == chat_runner._STEER_NOTICE_BOUND_SECS
+
+    @pytest.mark.asyncio
+    async def test_no_steer_attempted_when_unsupported(self, slack, monkeypatch):
+        monkeypatch.setattr(h, "_APPROVAL_TIMEOUT", 0)
+        provider = _SteerRecordingProvider(supports_steer=False)
+        outcome = await h._request_approval(slack, provider, "C1", "t1", _perm_event())
+        assert outcome == h._OUTCOME_REJECTED
+        assert [c[0] for c in provider.calls] == ["reject_tool"]
 
 
 # ──────────────────────────────────────────────────────────────────────

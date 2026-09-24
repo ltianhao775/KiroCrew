@@ -204,7 +204,7 @@ from every backup while a restore writes a copy nothing reads. A NAMED store's i
 does live beside its own markdown, which is what makes the index per-store and puts
 it behind the `memory_stores/` fence. The snapshot `memory` component and
 `portability`'s export both carry the whole `memory_stores/` tree (see
-[Named stores ride the backup paths](#named-stores-ride-the-backup-paths)), so a
+[Named stores and backup paths](#named-stores-and-backup-paths)), so a
 named store's index rides beside its markdown; `scripts/sync-to-remote.sh` still
 names only the root paths.
 
@@ -266,6 +266,20 @@ SQLite checks each day's byte length before returning its body to Python. A day
 larger than 8 MiB is refused without truncating or deleting it; editable-history
 GET and PUT retain the existing `store_unavailable` (503) error response.
 Ordinary V2 message context does not scan learned history.
+
+Whether a group is in scope is the intersection of the caller-passed
+`context_groups` (subagent narrowing) with the operator's config toggles —
+`memory.inject_memory` / `memory.inject_lessons`, with
+`memory.persistence_enabled` as the global switch — computed inside
+`build_session_context()` so every surface (dashboard, channels, cron,
+heartbeat, task runner, eval, subagents) obeys the config without passing
+anything. The member-essentials builder and the post-compaction re-injection in
+`build_message()` route through the same intersection, because each restores a
+block the session-start build gates: reading the caller scope alone there would
+hand back withheld memory for the rest of the session. The `[CONTEXT SCOPE]`
+withheld-groups block stays keyed to the caller-passed value only: "your parent
+withheld" describes per-spawn narrowing, not the operator's standing config
+choice.
 
 `MemoryStore.get_context()` retains `history_cap=25_000` as its default for
 programmatic readers. V1 `ContextBuilder` calls it with the scaled history cap
@@ -367,7 +381,7 @@ canonical execution context before its first await and refuses incognito or
 temporary sessions before reading their transcripts. V2 uses that context's exact
 member store and commits learned records, history and the retry receipt in one
 SQLite transaction. V1 retains `context.store_of_session(log, key)` and its
-Markdown and lesson fallback behavior. See [The write path](#the-write-path).
+Markdown and lesson fallback behavior. See [Memory across surfaces and channels](#memory-across-surfaces-and-channels).
 
 Neither path owns a timer. The prefs path is checked inline on every
 `maybe_consolidate()`; the history path is driven entirely by the heartbeat
@@ -1841,7 +1855,7 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - **Non-blocking model load**: the GGUF load runs on a background daemon thread (`_kick_background_load()`, thread name `kc-embed-load`) — `embed()`/`embed_batch()` NEVER block on the load. When the model isn't in memory yet, the call kicks the background load and returns `None` immediately; memory degrades to keyword search until the load lands. The gateway/dashboard event loop is never stalled by embedding work. `wait_ready(timeout)` exists for sync contexts (tests, one-shot CLI flows) that legitimately want to block — never call it from an event-loop thread
 - The underlying `Llama` object is NOT thread-safe — inference on a loaded model is serialized behind a lock (tens of ms per short text)
 - `get_shared_embedder()` — process-wide singleton (~700MB RSS when loaded), shared by vector memory AND the knowledge library; `close()` unloads the model to free RSS
-- **Bounded llama.cpp scratch memory**: the accepted context and logical batch remain 2,048 tokens, while the physical decode micro-batch (`n_ubatch`) is 512. llama.cpp splits a long input across those physical batches before applying last-token pooling, so the complete context still contributes to one vector. Against the shipped Qwen model, a maximum 6,000-character input produced byte-identical 1,024-dimensional vectors at 512 and 2,048 (`cosine=1.0`, max absolute difference `0.0`); 512 reduced Linux peak/resident RSS by approximately 419 MiB for that pass. Do not lower `n_ctx` or `n_batch` as a memory shortcut: either would reduce the semantic input the model can accept.
+- **Metadata-sized llama.cpp context and bounded scratch memory**: before constructing the native context, a custom GGUF reads `general.architecture`, `<architecture>.attention.causal` and `<architecture>.context_length` from its KV header. The file's `pooling_type` key is not read: every model, custom encoders included, is loaded with last-token pooling passed explicitly, the pooling every earlier release produced, so this metadata never changes stored vectors (honouring a declared `pooling_type` is tracked separately). Measured with the vendored runtime on two BERT-family f16 GGUFs (`all-MiniLM-L6-v2`, trained for mean pooling, and `bge-small-en-v1.5`, trained for cls pooling): under last-token pooling two paraphrase pairs scored cosine 0.745 and 0.791 against 0.112 for an unrelated pair (MiniLM) and 0.765 and 0.787 against 0.382 (bge), the same ordering mean pooling gave (0.638 and 0.612 against 0.005; 0.752 and 0.793 against 0.328), and over twelve sentences from six paraphrase pairs each sentence's nearest neighbour was its paraphrase 12/12 times under both poolings on both models. A model is non-causal when its GGUF declares `<architecture>.attention.causal = false` (the boolean llama.cpp reads into `hparams.causal_attn` for every architecture, `llama-embed` included; absent, the runtime defaults to causal) or when its architecture is one the vendored llama.cpp runs without a KV cache (`_ENCODER_ARCHITECTURES`, a verbatim mirror of the `res = nullptr` cases of `llama_model::create_memory` plus `t5encoder`). That mirror is checked mechanically: `test/test_encoder_architecture_mirror.py` opens every vendored `libllama` binary and requires each listed name as a NUL-terminated string, so a runtime bump that removes or renames a cache-less architecture fails the test unless the name is the suffix of another listed name (`bert` inside `modern-bert`: GNU ld tail-merges such strings, so only the terminating NUL can be required and the longer name still satisfies the check); an architecture the bump adds is invisible to it, so the bump procedure in `_vendor/README.md` re-reads the `res = nullptr` cases by hand and confirms suffix names there. The accepted context and logical batch remain 2,048 tokens for every decoder model, which also retains a physical decode micro-batch (`n_ubatch`) of 512; non-causal models use one physical micro-batch the size of their whole context because llama.cpp aborts when their token count exceeds `n_ubatch` — cache-less architectures in `encode()` (`encoder requires n_ubatch >= n_tokens`) and declared-non-causal cached models in `decode()` (`non-causal attention requires n_ubatch >= n_tokens`). The 512 micro-batch is kept for custom decoders on measurement, and it is the only reason the cache-less architecture set exists (giving every custom file `n_ubatch = n_batch` would need no list): with the vendored runtime, four compute threads and a 2,048/2,048 window, the shipped Qwen3-Embedding-0.6B Q8_0 file standing in for a custom decoder, one 5,000-character embedding (936 tokens) took the process's peak resident memory (Linux `VmHWM`) from 1,826 MiB at `n_ubatch` 512 to 2,098 MiB at 2,048, 272 MiB more (two runs each, within 0.5 MiB), and an input filling the whole 2,048-token batch took it from 2,493 MiB to 3,502 MiB, 1,009 MiB more; constructing the context alone showed no difference (0.2 MiB) because the reserved compute arena is not resident until the first graph runs. The same comparison on the `gpt2` Q8_0 file cost 37 MiB at 2,048/2,048 (655 tokens) and 98 MiB between `n_ubatch` 512 and 1,024 at its clamped 1,024 window (935 tokens). That cost, paid by every process holding a custom decoder embedder, outweighs maintaining the mirrored list, which the binary pin and the bump procedure keep honest. For every custom GGUF the context and logical batch are additionally clamped to the trained position count the file declares in `<architecture>.context_length` (llama.cpp's `n_ctx_train`): a model with learned absolute positions — encoder families, but causal `gpt2` and `starcoder` as well — indexes a position table of that many rows, and a token past it aborts the process in ggml's `get_rows` (`GGML_ASSERT(i01 >= 0 && i01 < ne01)`) whatever the model's causality, so `n_ctx` and `n_batch` are set to `min(2048, context_length)` (2,048 when the key is absent), a non-causal model's `n_ubatch` equals that count and a decoder's stays 512 bounded by it, and a longer input is truncated to its first `n_batch` tokens by the vendored binding's `create_embedding()` → `embed(truncate=True)` path, a default `test_vendored_embed_truncates_to_the_logical_batch_by_default` pins. The truncation is stated as one WARNING when the model loads, naming the file and the count, never per embed call; a GGUF whose KV header cannot be read is loaded with the decoder sizes after one WARNING naming the file. Because the header is read before the native constructor opens the same path again, the loader stamps the file (device, inode, size, mtime, ctime) before the header read and re-checks the stamp once the constructor returns: a file replaced in between is closed unpublished after one WARNING and the load is retried after the failure cooldown, so a context sized from a previous header never serves. Measured with the vendored runtime on a 5,000-character input: `bge-small-en-v1.5` (`bert`, `context_length` 512, 895 tokens) aborted with that assertion at a 2,048/2,048/2,048 sizing and returns a 384-dimensional vector at 512/512/512; `gpt2` Q8_0 (causal, `context_length` 1,024) aborted with the same assertion at 2,048/2,048/512 and returns a 768-dimensional vector at 1,024/1,024/512; `nomic-embed-text-v1.5` Q2_K (`nomic-bert`, `context_length` 2,048) keeps 2,048/2,048/2,048 and its 768-dimensional vector. The shipped Qwen model declares 32,768 positions, so it keeps 2,048/2,048/512 and produces byte-identical vectors: a 6,000-character input gave the same 1,024-dimensional vectors at a 512 and a 2,048 micro-batch (`cosine=1.0`, max absolute difference `0.0`) while 512 reduced Linux peak/resident RSS by approximately 419 MiB for that pass. Do not lower `n_ctx` or `n_batch` below the policy-selected window as a memory shortcut: either would reduce the semantic input the model can accept.
 - Per-platform native libs live in `_vendor/llama_cpp_libs/{linux_x86_64,linux_aarch64,macos_arm64,macos_x86_64,win_amd64}`, selected at import time via `LLAMA_CPP_LIB_PATH` (upstream-supported override; an operator-set value wins, enabling e.g. a GPU build). Before loading the bundled Linux x86_64 runtime, `_load_llama_class()` intersects the `flags` reported for every visible processor in `/proc/cpuinfo` and requires the baseline compiled into the shipped upstream wheel (AVX, AVX2, BMI2, F16C, FMA, SSE3, SSSE3). A missing or unreadable feature list refuses the native runtime before it can raise an uncatchable SIGILL; memory stays available through keyword search. The gate does not apply to an operator-set `LLAMA_CPP_LIB_PATH`, because that directory may contain a lower-baseline build. Unsupported platforms, incompatible bundled CPUs, and import failures all degrade to keyword-only memory search. See `_vendor/README.md`
 - **The shipped closure is declared, not inferred.** `_REQUIRED_VENDORED_LIBS` names the exact files each platform must carry, and `verify_vendored_libs(root=None)` returns `{platform: [missing…]}` (empty when complete) against a source tree, an unpacked sdist, or an installed wheel. `_load_llama_class()` consults it before importing, so an incomplete install is reported as a **packaging defect naming the absent files** rather than surfacing as ctypes' `Shared library with base name 'llama' not found` — which reads as an unsupported architecture and misdirected the real-world diagnosis of this bug. `kirocrew doctor` prints the same detail. The check is **skipped when `LLAMA_CPP_LIB_PATH` is set**: the libs then load from the operator's directory, so the bundled tree's contents no longer determine whether the runtime works, and refusing on them would disable the documented override for exactly the users an incomplete wheel stranded (the warning names the env var as a remedy for that reason). Each packaging lane selects these files by a different mechanism (MANIFEST.in for the sdist, `package_data` for the wheel — which the desktop bundle inherits, since it pip-installs the project into its bundled interpreter), so each is guarded independently in `test/test_vendored_llama_payload.py`, and both `build.yml` (every PR) and `build-wheel.yml` (release/nightly) re-check the built wheel **and** sdist against the same declaration via the shared `scripts/verify_vendored_payload.py` (one script for both lanes, so they cannot drift into a gate that stops guarding without failing) — the sdist explicitly, because `python -m build --wheel` never evaluates `MANIFEST.in` and so cannot see an sdist regression at all. Linux ships no BLAS backend by design: upstream publishes none in its Linux CPU wheels (macOS gets `libggml-blas` only via the system Accelerate framework), and the Linux `libggml-cpu` carries the optimized GEMM kernels instead
 - **The artifact verifier needs only the Python standard library.** `scripts/verify_vendored_payload.py` reads `_LIBS_DIR_NAME` and `_REQUIRED_VENDORED_LIBS` from the source with `ast.parse` and `ast.literal_eval`. It never imports the embedding runtime or its config dependencies. Both constants must stay literal top-level assignments; a missing or computed declaration fails the gate. Tests run the real script with `python -I -S`, checking complete archives and missing members in the wheel, sdist, or both.
@@ -1851,12 +1865,15 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 
 **Shared embedding budget.** Native inference has one shared worker and model.
 The normal interactive default is four native threads, capped at one core below
-the host's CPU count and never below one thread, so the event loop keeps a core
+the count of CPUs the process may run on, which a CPU-set restriction
+(`--cpuset-cpus`, `taskset`) narrows below the host's core count, and never below
+one thread, so the event loop keeps a core
 wherever there is one to spare; background bulk work defaults to one. A normal-thread value equal to that four-thread default reads as
 the default policy rather than as operator intent, because a whole-document config
 save materializes it. Any other explicit normal or bulk thread setting is honored
-within the available CPU count and the existing configuration range of 1–256; a
-bulk value of 0 inherits the ordinary thread setting. At most eight pending native
+within the CPUs the process may run on, inside the existing configuration range
+of 1–256; a bulk value
+of 0 inherits the ordinary thread setting. At most eight pending native
 jobs are retained, with
 two slots reserved for interactive queries; overflow returns `None`, leaving
 unembedded writes eligible for ordinary backfill. Native batch calls contain
@@ -2141,11 +2158,11 @@ alignment requires readiness.
 - On failure: status resets to `idle` with error message, frontend shows error + Retry button
 - Prevents concurrent setup attempts (409 if already in progress)
 - `can_retry` flag in status response for frontend retry button
-- `GET /api/memory/embedding-status` — `enabled` is always `true`; `provider` reports the legacy `"ollama"` token (the shipped frontend hard-checks `provider === "ollama"` — kept until the frontend companion change lands); `setup_step` maps the manager's steps to the legacy vocabulary the shipped polling loop terminates on (`ready`→`done`, `failed`→`error`, `downloading`/`verifying`/`waiting_retry`→`downloading`); the raw step and attempt are additionally exposed as `download_step` + `download_attempt` for newer frontends; `server_healthy` requires a present or loaded model and no custom-model validation error; `setup_warning` exposes inherited legacy-vector identity until explicit model apply; `model_id` + `model_dim` disclose the embedding model producing vectors (read live from the shared embedder — e.g. `qwen3-embedding:0.6b` / `1024`) so the Memory tab can show which model runs locally
+- `GET /api/memory/embedding-status` — `enabled` is always `true`; `provider` reports the legacy `"ollama"` token for older frontend compatibility; `setup_step` maps the manager's steps to the legacy vocabulary the shipped polling loop terminates on (`ready`→`done`, `failed`→`error`, `downloading`/`verifying`/`waiting_retry`→`downloading`); the raw step and attempt are additionally exposed as `download_step` + `download_attempt` for newer frontends; `server_healthy` requires a present or loaded model and no custom-model validation error; `setup_warning` exposes inherited legacy-vector identity until explicit model apply; `model_id` + `model_dim` disclose the embedding model producing vectors (read live from the shared embedder — e.g. `qwen3-embedding:0.6b` / `1024`) so the Memory tab can show which model runs locally
 - `POST /api/memory/embedding-model` — changes the local embedding model at runtime. Two modes, and note which one is the default: `{"path": "...", "validate_only": true}` validates only (returns `size_bytes` without touching the live backend), while **omitting `validate_only` performs the swap** — there is no `apply` flag, so a caller that sends only `path` applies the model. An empty `path` reverts to the bundled model. Refuses with 403 on a restricted session (SEL-audited), 409 while a re-embed is already running (single-flight), and 409 `env_override_active` when `KIROCREW_EMBED_MODEL_PATH` is set, because the env var wins at load and persisting a config path under it would store a path/dim pair the process never uses
 - **Apply ordering**: build the gated candidate, install it while retiring the outgoing model, advance the store generation, wait for readiness (600s bound), persist the verified model configuration, retarget and reconcile stores, verify every recorded signature, activate, then backfill. Configuration-write failure preserves stored vectors. Alignment failure conditionally restores the prior model settings before resetting the candidate and restoring widths; rollback failure leaves the candidate gated with an actionable error. Unrelated configuration fields are not rolled back.
 - `GET /api/memory/embedding-status` additionally returns a `reembed` snapshot (`step`: `idle`/`applying`/`running`/`done`/`failed`, plus `done`/`total`/`error`) so the dashboard can render background re-embed progress; the card polls only while that step is busy
-- `POST /api/memory/disable-embeddings` — **gone**: embeddings are always-on. Kept as a graceful HTTP 410 stub (not a 404) because the shipped frontend still renders a Disable button; remove together with the frontend button
+- `POST /api/memory/disable-embeddings` — **gone**: embeddings are always-on. Kept as a graceful HTTP 410 compatibility stub (not a 404) for older clients; the current frontend does not call it
 
 ### Model Security & Policy
 
@@ -2243,7 +2260,7 @@ before reading transcript bodies, opening learned memory or billing a model.
 | GET | `/api/memory/embedding-status` | Embedding health + download progress. `enabled` always true; `setup_step` in legacy vocabulary (done/error/idle/downloading); raw `download_step` (idle/downloading/verifying/waiting_retry/ready/failed) + `download_attempt` + `bytes_downloaded`/`bytes_total`; `model_id` + `model_dim` disclose the embedding model + vector dimension; `reembed` reports background re-embed progress (`step` idle/applying/running/done/failed + `done`/`total`/`error`) |
 | POST | `/api/memory/enable-embeddings` | Non-blocking: kicks/adopts the background model download and returns `{"ok": true, "status": "downloading"}` when the model is absent; wires embeddings + updates config when present. The persisted `memory.embedding_dim` is the width of the **live** backend (`get_shared_embedder().dim`), never a literal — a width that cannot be read, or is not positive, is a 500 `embedding_dim_unreadable` that persists nothing, because `_load_model` refuses a model whose `n_embd` disagrees with the stored width and a wrong value leaves that model unloadable on every later restart |
 | POST | `/api/memory/embedding-model` | Change the embedding model. `{"path", "validate_only": true}` validates only; **omitting `validate_only` applies** (no `apply` flag exists). Empty path reverts to bundled. 403 restricted session, 409 while re-embedding, 409 `env_override_active` under `KIROCREW_EMBED_MODEL_PATH` |
-| POST | `/api/memory/disable-embeddings` | HTTP 410 stub — embeddings are always-on; kept only until the frontend removes its Disable button |
+| POST | `/api/memory/disable-embeddings` | HTTP 410 compatibility stub for older clients — embeddings are always-on; the current frontend does not call it |
 | POST | `/api/memory/migrate` | Migrate markdown → structured memory (gated) |
 | POST | `/api/memory/import` | Import from JSON export (gated) |
 | POST | `/api/memory/promote` | Promote repeated episodic patterns to semantic facts, tombstoning the rows folded in (gated) |
@@ -2466,7 +2483,7 @@ the unconditional gate is the stronger check layered in front of it.
 
 ### CLI
 
-`kirocrew memory {list,search,show,stats,audit,export,migrate,import,carve}` — manage memory from the command line:
+The canonical command and flag inventory is in the [CLI spec](cli.md#member-memory-commands); this section records the memory-side behavior behind those commands:
 - `carve --store <name>` — filter or count one store's rows by their carve facets; see [Who reads a facet](#who-reads-a-facet). Dispatched before the shared vector store is opened, because it opens the store NAMED on the command line rather than the default one
 - `show [preferences|projects|history]` — read the markdown layer through `MemoryStore` (all three targets when none given); `--format md|json` (json entries carry `path`, `updated_at` mtime in UTC ISO-8601, `content`), `--since YYYY-MM-DD` filters history days. Missing/empty files print as empty rather than erroring
 - `search <query>` — searches BOTH memories and labels each section: the vector store's episodic recall, then keyword hits from the markdown layer's FTS5 index (`MemoryStore.search`, over `preferences.md` / `projects.md` / every `history/*.md`). `--layer vector|history|all` (default `all`); `--layer vector` reproduces the previous vector-only output exactly, and `--layer history` skips constructing the vector store entirely, the same way `show` does. The two indexes answer different questions — "where did I write this word" versus "what does this mean like" — so they are reported separately rather than merged into one ranking. `search_episodic` text-searches whenever `query_embedding` is None and does not auto-embed, so the vector section embeds the query in-process, blocking once on the model load (`_SEARCH_MODEL_LOAD_TIMEOUT_SECS`, 120 s) — a one-shot read cannot lean on the gateway's boot re-embed sweep the way a WRITE can. It degrades to keyword matching, naming the reason on **stderr** (stdout shape is unchanged), when the model is not downloaded (a one-shot CLI never kicks the download), when the store's vectors were produced by a different model, or when the model fails to load; and when the semantic pass returns nothing it retries the keyword leg once before reporting "No episodic memories found.", because the vector legs score only rows with a non-NULL embedding and deferred/imported/re-embed-pending rows are keyword-searchable only until the gateway's sweep reaches them
@@ -2779,7 +2796,7 @@ remain durable.
 
 **V1 migration**: `migrate_from_markdown()` reads `lessons.jsonl` and writes each entry as `lesson.*` semantic key with `source=migration, confidence=0.9`. User-explicit lessons (confidence 1.0) can't be overwritten by migration. V2 refuses this importer.
 
-Categories: `tool`, `preference`, `knowledge`. Startup injects lessons as TWO blocks with TWO separate, window-INDEPENDENT budgets, split on an authored `applies` field rather than on anything a reader could infer. `applies: "always"` is a standing rule and renders in `[Learned corrections]` under the `lessons` budget (22.6% of the 33,000 base); `applies: "on_topic"` is a past finding and renders in `[Learned experience]` under the separate, smaller `lesson_experience` budget (5%). The write surfaces that state it today are the `learn_add` MCP tool (whose schema carries the enum and whose description tells the model to decide from what the user said, not from wording), `POST /api/lessons`, and the CLI reaching that route; consolidation states none, so its extracted rows stay unstated and take the rule tier. A row with NO `applies` value — every lesson written before the field existed, and any unrecognized stored value — reads as **unstated** and is served in the rule block, because demoting a real standing rule is the costlier mistake. Within the rule block, authored `always` rows are ordered AHEAD of unstated rows: ranked together on recency or relevance, a crowd of untagged rows displaces exactly the rules the user was most explicit about. The two budgets are separate rather than one shared allowance so a user with many findings cannot crowd out their own rules and vice versa; they are not added into a larger total, and a wider model window does not enlarge either one. The model-safe protected ceiling, `max(3 * 33,000, floor(model_window_tokens * 4.0 * 0.125))` characters, still bounds the two blocks TOGETHER, with one deliberate exception: a block's MANDATORY frame — its label plus the omission notice — is rendered even when the remaining ceiling is too small to hold it, so the two blocks can exceed the ceiling by those frames. That is the same trade as the preferences exception below: a silently absent block is indistinguishable from "this user has no rules", and the frame is a bounded constant while the entries it announces are not. The rule block is served first so a finding yields to a rule rather than the two sharing a shortfall. V2 keeps its essential-delivery and scope gates. **A findings tier is WITHHELD when the request matches none of it.** Ordering alone left a bare greeting spending the entire findings allowance on the newest rows, which are unrelated to the request by construction; `on_topic` means "worth having when the task touches it", so a request that touches none of them gets none of them. The test is the SAME tokenization each store's own ranking sorts with — `any_request_overlap` (unstemmed) for JSONL, `VectorMemoryStore._any_lesson_overlap` (stemmed, the keyword half of `_rank_lessons`) for the vector store — because ordering and admission must read one signal or a tier is suppressed for a match its own ranking found; the vector store stems, so it matches strictly more and must not borrow the unstemmed answer. This costs no recall that filler provided: newest-first never rescued a near-miss either, since it surfaces the newest rows rather than the closest. It applies to findings ONLY — a standing rule, and an untagged row served as one, arrives whatever the message is about. Two boundaries: a request is needed for the test to mean anything, so a caller that supplies NO `query_text` keeps the previous behaviour and stays byte-identical, and a tier with no findings at all renders nothing rather than an empty block. `render_withheld_tier` renders the frame with a notice naming the withheld total, stating that this is not a budget limit, and pointing at `memory_recall`/`learn_list` — a silently absent block reads as "this user has no findings", which is the reading that stops anyone from going to look, and the notice is also what lets the NEXT turn act on findings the greeting turn did not carry. Measured on a 10,000-finding store: a greeting's findings tier costs 298 characters with 0 findings injected instead of filling the 1,650-character allowance, while a matching request still receives 6.
+Categories: `tool`, `preference`, `knowledge`. Startup injects lessons as TWO blocks with TWO separate, window-INDEPENDENT budgets, split on an authored `applies` field rather than on anything a reader could infer. `applies: "always"` is a standing rule and renders in `[Learned corrections]` under the `lessons` budget (22.6% of the 33,000 base); `applies: "on_topic"` is a past finding and renders in `[Learned experience]` under the separate, smaller `lesson_experience` budget (5%). The startup rule tier is bounded by a window-INDEPENDENT allowance, `caps.lessons_startup` (`_LESSONS_STARTUP_CAP` = 37,000 characters), passed as the four startup renderers' `directive_budget`. That allowance is `min`'d only against the model-safe ceiling each store hands its directive tier — the vector store's `hard_cap` and the JSONL store's `cap`, which the JSONL renderers pass that same ceiling into (about 500,000 characters at the 1M reference window, and smaller on a smaller model) — so 37,000 binds the rule block on both paths whenever the ceiling exceeds it. (The two stores name that outer bound differently: `get_lessons_context`'s `hard_cap` and `get_context`'s `cap` are the same role, the ceiling the authored tier is taken smaller than, not the ordinary `caps.lessons` budget.) The allowance is deliberately NOT a share of the 33,000 base: standing rules are not discretionary background, and pinning the base to its smallest-window value (`#11996`) had shrunk the derived `lessons` cap about fivefold, so binding the authored tier to it dropped nearly every standing rule from startup. 37,000 restores the allowance a 1M-window session shipped with before that base change (165,000 × 0.226 = 37,290); it does not scale with the model window. The write surfaces that state it today are the `learn_add` MCP tool (whose schema carries the enum and whose description tells the model to decide from what the user said, not from wording), `POST /api/lessons`, the CLI reaching that route, and history consolidation, whose extraction prompt carries the same instruction per extracted item (both read it from `LESSON_APPLIES_INSTRUCTION` in `lesson_validation.py`, so they cannot drift apart) and which forwards the normalized tier on all three of its write paths: `_save_lessons` to `write_lesson(applies=...)` and to `Lesson(applies=...)`, and the member-store path `VectorMemoryStore.apply_consolidation`, which builds the lesson value itself. The task runner's own lesson extraction (`source="task_runner"`) and the CLI's direct `write_lesson` still state none; those rows stay unstated. Consolidation is the highest-volume lesson writer, so it is exactly the surface that must state a tier or the budget split protects nothing. Its value is untrusted model output: an omitted or blank tier lands the row unstated (the supported choice), and a misspelled one is logged at warning and the row is still written UNSTATED rather than dropped -- a real correction should not be lost over a one-word slip, and unstated is the direction whose mistake costs least. A row with NO `applies` value — every lesson written before the field existed, and any unrecognized stored value — reads as **unstated** and is served in the rule block, because demoting a real standing rule is the costlier mistake. Within the rule block, authored `always` rows are ordered AHEAD of unstated rows: ranked together on recency or relevance, a crowd of untagged rows displaces exactly the rules the user was most explicit about. The two budgets are separate rather than one shared allowance so a user with many findings cannot crowd out their own rules and vice versa; they are not added into a larger total, and a wider model window does not enlarge either one. The model-safe protected ceiling, `max(3 * 33,000, floor(model_window_tokens * 4.0 * 0.125))` characters, still bounds the two blocks TOGETHER, with one deliberate exception: a block's MANDATORY frame — its label plus the omission notice — is rendered even when the remaining ceiling is too small to hold it, so the two blocks can exceed the ceiling by those frames. That is the same trade as the preferences exception below: a silently absent block is indistinguishable from "this user has no rules", and the frame is a bounded constant while the entries it announces are not. The rule block is served first so a finding yields to a rule rather than the two sharing a shortfall. V2 keeps its essential-delivery and scope gates. **A findings tier is WITHHELD when the request matches none of it.** Ordering alone left a bare greeting spending the entire findings allowance on the newest rows, which are unrelated to the request by construction; `on_topic` means "worth having when the task touches it", so a request that touches none of them gets none of them. The test is the SAME tokenization each store's own ranking sorts with — `any_request_overlap` (unstemmed) for JSONL, `VectorMemoryStore._any_lesson_overlap` (stemmed, the keyword half of `_rank_lessons`) for the vector store — because ordering and admission must read one signal or a tier is suppressed for a match its own ranking found; the vector store stems, so it matches strictly more and must not borrow the unstemmed answer. This costs no recall that filler provided: newest-first never rescued a near-miss either, since it surfaces the newest rows rather than the closest. It applies to findings ONLY — a standing rule, and an untagged row served as one, arrives whatever the message is about. Two boundaries: a request is needed for the test to mean anything, so a caller that supplies NO `query_text` keeps the previous behaviour and stays byte-identical, and a tier with no findings at all renders nothing rather than an empty block. `render_withheld_tier` renders the frame with a notice naming the withheld total, stating that this is not a budget limit, and pointing at `memory_recall`/`learn_list` — a silently absent block reads as "this user has no findings", which is the reading that stops anyone from going to look, and the notice is also what lets the NEXT turn act on findings the greeting turn did not carry. Measured on a 10,000-finding store: a greeting's findings tier costs 298 characters with 0 findings injected instead of filling the 1,650-character allowance, while a matching request still receives 6.
 
 **Startup selection is not re-run per turn, and the withheld notice is what carries the gap.** A session that opens with a greeting and then states its real task on the next turn keeps the greeting turn's lesson selection: the warm path does not reselect. That predates the budgets, and no per-turn retrieval trigger is added here — one would need its own trigger condition, its own budget, and its own coverage across resume, fork and compaction, which is a second mechanism rather than a bound on this one. What the budgets change is that the gap is now VISIBLE where it was not: the greeting turn renders the withheld notice naming the total and the tool, so the follow-up turn is looking at an explicit pointer instead of at filler that silently displaced the finding it needed. Closing it properly is deliberately left to a change that owns the retrieval trigger.
 
@@ -3679,6 +3696,16 @@ exclude). To keep it off the per-message filesystem/config hot path:
   explicitly injected config honours that config rather than resolving a cap the
   injected document never carried (the absent-key default is 0, which would
   suppress every skill);
+- that cap is read BEFORE the scan, and a cap of 0 (the shipped default) skips
+  the scan entirely: the message is not tokenized, no visible-skill walk,
+  frontmatter read, `repo_scope` fence check or trigger score runs, and no
+  `skill_trigger` audit row is written -- a `!` veto at cap 0 excludes nothing
+  that could have been injected, so it is not a permission DENY. The matcher's
+  own per-message cost at cap 0 is the one snapshot read. `select` is still
+  called at cap 0, but the selection point owns its own zero-cap refusal and
+  answers `None` there (see [decisions.md](decisions.md)), which keeps the empty
+  match and writes no row. Only a `select` that returns a pick or `[]` at cap 0
+  is injected and audited as a selection;
 - `extra_paths` is re-resolved by `reconfigure(cfg)` on a config write, running
   the SAME screening as construction — expanduser, resolve, `is_sensitive_path`
   reject, existence check — and failing closed per entry, so a root added by hand
@@ -4149,20 +4176,30 @@ security decision or the copied content.
 
 **Skill browse containment** (`_resolve_skill_root`, `read_skill_file` in `handlers/_shared.py`): the tree (`/api/skills/{name}/-/tree`) and file (`/api/skills/{name}/-/file`) endpoints serve any directory the resolver returns, so the resolver is the containment boundary. A candidate's *parent* must resolve at or under its own root (that is what rejects a symlinked intermediate directory), and so must the RESOLVED candidate itself — with two exceptions, both in `_leaf_is_contained`: `LEAF_SYMLINK_PREFIX` = `kiro-user/`, where an edition may install `~/.kiro/skills/<name>` as a link into its own tree; and a leaf whose resolved target is a directory an app DECLARES as a skill, because `apps.bridges._register_skills` symlinks each declared skill into the kirocrew skills root (flat AND `skills/<app>/` namespaced) with the target in the app's own tree — without that the browse side would be stricter than the loader and list skills in `GET /api/skills` that 404 when opened. The admissible set is the manifest's own `skills` entries, read through `bridges._registration_source` (the immutable package copy for a shipped builtin), NOT the app's root: an app tree also holds that app's data, tokens and rendered configs, and a link planted at `<root>/x -> <app>/data` must not serve them. The `package/` branch returns before that shared block, so it applies the same containment itself against the resolved `_edition_package_roots()` set — an edition packager can plant an escaping link in its own root like any other, and `package/` carries no allowance. Checking the parent alone for every prefix was a whole-filesystem read primitive: `<project>/.kiro/skills/x -> /etc` resolved to `/etc` and the endpoints enumerated up to `SKILL_TREE_MAX_ENTRIES` names and returned up to `SKILL_FILE_MAX_BYTES` per file from it, and `is_sensitive_path` is no backstop there (it is a `$HOME`-anchored credential denylist, not a containment check). A deliberate cross-checkout leaf link (`<project>/.kiro/skills/x -> ~/dotfiles/skills/x`) is indistinguishable from the exfiltration shape and is refused with it; the sanctioned way to browse a skill tree that lives elsewhere is `skills.extra_paths`, which makes that location a root of its own. `enumerate_skill_catalog`/`_collect_skills_under` carry the same per-prefix policy, because a key enumeration offers must be one the resolver accepts. File bytes then come from `hooks.safe_read_file_bytes_nolink(within_root=…)`, so containment holds on the opened descriptor rather than on a path resolved earlier: re-opening by name left a check-to-use window (an ancestor swapped for a symlink after the check) and no hardlink guard — `resolve()` does not follow a hardlink, so a link to a file outside the root passed the path check and was served. The root is passed as `within_root_is_canonical=True`, because it is already resolved: re-`realpath`ing it at read time would let the skill directory replaced by a link redefine the root it is being contained to. `list_skill_tree` walks by name, so a root replaced after admission is enumerated as whatever its name then denotes — filenames only, and the same exposure the rest of the by-name filesystem surface carries; holding the root across a traversal needs the walk itself to be descriptor-relative, which is a separate change. Every descriptor-level refusal answers one message (`access denied`, 403) rather than naming which guard fired. Refusals are already SEL-audited by the endpoints (`api_skill_tree` / `api_skill_file` outcomes), and the read is NOT trust-gated by design — reading a `SKILL.md` is how an operator decides whether to grant project-skill trust (#4777).
 
+**Pending-review endpoints** (`dashboard/routes/skills.py` → `handlers/prompts.py`): GET `/api/skills/-/pending` (list), GET `/api/skills/-/pending/{slug}` (detail), POST `/api/skills/-/pending/{slug}/approve`, POST `/api/skills/-/pending/{slug}/dismiss`, POST `/api/skills/-/pending/-/dismiss-all`. Approve routes on the candidate's `kind` to `approve_pending_skill_checked` / `approve_pending_update_checked`, which raise `PendingApprovalRefused(reason)` instead of returning `None` (the unsuffixed `approve_pending_skill` / `approve_pending_update` wrappers still return `None` on refusal, but no production caller reads that contract any more — only tests do, and their deletion is tracked in #11089), and the handler maps the reason to a coded refusal so the Skills tab can say WHY the click did nothing. The routing itself is guarded at the CONSUMPTION point, not only in the handler: a raising detail read drops `kind` to `None` and the handler defaults to the new-skill path, so `approve_pending_skill_checked` re-reads the candidate's `.meta.json` itself and refuses `kind == "update"` with `kind_mismatch` (a 409 through the generic coded fallback) — promoting an update fresh would create `auto/<candidate-slug>` while its live target stays unchanged, and `not_found` would trigger the dashboard's approved-or-dismissed-elsewhere recovery copy for a candidate that is still pending:
+
+| Status | `code` | `PendingApprovalRefused.reason` | Meaning to a client |
+|--------|--------|--------------------------------|---------------------|
+| 404 | `pending_skill_not_found` | `not_found` | No candidate at that slug (unsafe slug or no `SKILL.md`). The row is gone; refetch the list. |
+| 409 | `live_skill_exists` | `live_exists` | A live `auto/<slug>` already holds the name (new-candidate path only). |
+| 422 | `script_validation_failed` | `script_validation_failed` | Body adds `report`: the `validate_scripts` `{filename: [finding, ...]}` map, redaction-scrubbed by `_redact_validation_report` (every filename and finding string through `redact_exfiltration_urls` + `redact_credentials`, redacted BEFORE shortening so a cut cannot leave a credential fragment the scrubber no longer recognises) and BOUNDED at retention: at most `_PENDING_SCRIPT_MAX_ENTRIES` filename entries, `_VALIDATION_REPORT_MAX_FINDINGS` findings each, `_VALIDATION_REPORT_MAX_STRING_CHARS` characters per string. Anything dropped — including entries whose redacted names collide — is counted once under a `<truncated>` key, so a shortened report never reads as a complete one. Raised on the raw scripts, or on the re-validation after in-place redaction. |
+| 409 | `pending_approval_refused` | any other | Body adds `reason`: `target_missing` or `stale_base` (update candidates), `invalid_layout`, `redaction_failed`, or `promotion_failed`. |
+
+Success is 200 `{"approved": "<auto/name>"}`; a malformed slug is still an uncoded 400 `invalid slug`, and a non-refusal exception an uncoded 500 `internal error`. Before this contract every refusal collapsed into one uncoded 409 (`not found, a live skill already exists, or script validation failed`). **Dismiss has no 409**: 200 `{"dismissed": slug}`, uncoded 400 `invalid slug`, 404 `pending_skill_not_found` (the same code as approve's not-found, so the dashboard's refetch-and-explain recovery keys on one code), uncoded 500. **Dismiss-all** has no 409 either: it REQUIRES a JSON object body with a non-empty `slugs` string array — 400 `invalid_body`, `invalid_slugs` or `slugs_required` otherwise — and answers 200 `{"dismissed_count": n}` or 500 `internal_error`. The detail 404 (`not found`, uncoded) also covers a candidate `get_pending_skill` refuses to read because it contains a symlink. The `script_validation` verdict the list and detail payloads may carry, and the SEL outcomes of a refused approval, are specified under Auto Skill Creation → Pending review contract.
+
 **LLM tool mechanisms:**
-- MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
-  - `kirocrew-cron`: cron scheduling
-  - `kirocrew-core`: spawn, learn, task tools
+- MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**. The complete managed-server inventory, emission gates and per-agent opt-in sets are canonical in [MCP architecture](../../architecture/mcp.md#managed-servers).
 - Skills are for on-demand knowledge only (not for CLI command wrappers — use MCP tools instead)
 
 ## MCP Discovery (`mcp_discovery.py`)
 
-Auto-sync at startup + on-demand discovery from dashboard. Default servers: `kirocrew-cron`, `kirocrew-core`.
+Auto-sync runs at startup and on demand from the dashboard. The authoritative managed-server inventory and its always-on, gated and opt-in rules are in [MCP architecture](../../architecture/mcp.md#managed-servers).
 
 **Server sources** (merged by `list_servers()`):
 1. `agents/defaults.json` → `mcpServers` (default: none beyond the managed servers)
 2. `~/.kiro/agents/kirocrew.json` → `mcpServers` (installed config, merged)
 3. `~/.kiro/settings/mcp.json` and `~/.kiro/crew/mcp.json` (scanned at startup and on-demand)
+4. Edition-contributed provider-global scopes from `extra_mcp_scopes()` (the public edition contributes none)
 
 **Startup behavior**: gateway calls `_init_mcp_discovery()` which runs `discover_servers_to_sync()` + `sync_to_agent_config()` to auto-add new servers from mcp.json, then logs all configured servers. Discovery/sync failures are caught independently so `list_servers()` always runs. Additionally, `server.py` fires `_bg_mcp_probe()` as a background task at startup to populate the probe cache.
 
@@ -4179,7 +4216,7 @@ Auto-sync at startup + on-demand discovery from dashboard. Default servers: `kir
 - On Windows the keys are `normcase`+`normpath` folded (paths are case-insensitive and accept either separator), and a trailing `PATHEXT` suffix is stripped from the **rooted side only** — `shutil.which("npx")` returns `...\npx.CMD`, which would otherwise read as divergent from `npx` on every cycle and re-sync + reset every session at each startup. Stripping both sides would wrongly collapse distinct executables (`foo.bat` vs `foo.cmd`).
 - A leading separator with no drive letter (`/usr/bin/srv`) counts as rooted on Windows even though `ntpath.isabs` rejects it, so an `mcp.json` authored on macOS/Linux is read identically on every host.
 
-**Probing**: spawns each MCP server, sends JSON-RPC `initialize` + `tools/list` handshake, reports status + tool names. **Both calls must succeed for `ok`** — an initialize that answers and a tools/list that does not is a server no session can get a tool out of, so it reports as an error rather than certifying an unusable server. Each result carries `probedAt` (wall-clock) and `probeMode` (`handshake`, or `declared` for a managed server served from its in-process declaration) so the UI can say when and how the status was established. 30-second timeout, 1MB stdout buffer (an MCP server's responses exceed the default 64KB). Cleanup via `finally` block (no zombie processes). Results cached in `handlers.py` with 10-min TTL; GET `/api/mcp/probe` returns cached results non-blocking, POST `/api/mcp/probe` forces a fresh probe and updates cache.
+**Probing**: external servers are spawned and must complete both JSON-RPC `initialize` and `tools/list`; managed servers may instead use their in-process declaration. An initialize that answers without a successful tool list is an error, not a usable server. Each result carries `probedAt` (wall-clock) and `probeMode` (`handshake` or `declared`) so the UI can say when and how the status was established. The handshake timeout defaults to 15 seconds and is configurable through `dashboard.mcp_probe_timeout_secs` from 5 to 120 seconds. The stdout buffer is 1 MiB (responses can exceed the default 64 KiB), and subprocess cleanup runs in `finally`. Results are cached in `handlers.py` for 10 minutes; GET `/api/mcp/probe` returns cached results non-blocking, while POST `/api/mcp/probe` forces a fresh probe and updates the cache.
 
 **MCP temp**: the probe and runtime apply one rule through `sandbox.classify_declared_temp_env`. The probe, `gatewayd._spawn`, and `spawn_backend` run that rule off the event loop before honouring a spec-declared `TMPDIR`/`TMP`/`TEMP` (matched case-insensitively). A cleared declaration is re-emitted under canonical uppercase keys with ambient siblings dropped. A refused declaration is dropped as a whole, the managed temp takes over, and one WARNING names each refused key, its path and the cause. `sealed` means the path lies inside `<data home>/run`; the classifier checks the original `realpath`, the lexical spelling, and `(st_dev, st_ino)` identity against the sealed parent. `unclassifiable` means the canonical form cannot be established, or the declaration is relative. Relative values are refused because the daemon would classify them against its cwd while the backend child resolves them against `work_dir`, so one classification cannot describe both paths. A classifier exception refuses every declared key under `check-failed` and names the exception. If managed allocation fails after a refusal, no refused temp value reaches the child. On `win32`, `classify_declared_temp_path` returns `None` without resolving the path because Kiro Crew has no native Windows sandbox backend and nothing seals `run/` there. The probe's managed directory lives under `<data home>/run/mcp-tmp/probe-<id>/tmp`, is carved out of the sandbox seal, and is exported on all three canonical keys. This rule prevents the known sealed-parent conflict. It does not certify that every arbitrarily declared temp directory exists or is writable.
 
@@ -4221,7 +4258,7 @@ data-home file, Kiro global settings, bundled/project/installed agent config,
 managed servers, and edition-contributed server/scope files. An exact or
 alias-equivalent foreign name is rejected, so a disabled import cannot shadow
 an enabled global or installed server. Existing server definitions win on
-collision, and KiroCrew-managed servers (including `kirocrew-core` and
+collision, and Kiro Crew-managed servers (including `kirocrew-core` and
 `kirocrew-cron`) are protected from replacement, deletion, or shadowing by an
 imported definition. Malformed effective-source JSON or non-object
 `mcpServers` values contribute no names and cannot abort an import. Repeated
@@ -4245,7 +4282,9 @@ session ends → HistoryConsolidator (3h idle path)
             → LLM consolidation prompt gains new_skill / refined_skill keys
             → result piped through redact_credentials + redact_exfiltration_urls
             → SkillsLoader.find_similar() dedup check
-            → SkillsLoader.create_auto_skill() writes SKILL.md under auto/<slug>/
+            → default or script-bearing path: stage_skill_candidate() writes auto/.pending/<slug>/
+            → owner approval promotes the candidate to auto/<slug>/
+            → approval_required=false: prose-only candidates may publish directly
             → SEL audit event emitted
 ```
 
@@ -4297,6 +4336,16 @@ reuse_count: 0                          # omitted when zero
 5. **Namespace lock** — `update_auto_skill()` refuses to touch any skill whose name doesn't start with `auto/`, preventing the refine path from ever clobbering hand-authored skills.
 6. **SEL audit** — every create/refine/dedup-rejection emits `tool_name=auto_skill_create` or `auto_skill_refine` to the security event log with session key + skill name metadata.
 
+### Pending review contract (`list_pending_skills`, `get_pending_skill`, `_pending_scripts_verdict`, `approve_pending_*_checked`)
+
+The HTTP statuses and `code` values of the pending endpoints are tabulated under Skills → Dashboard endpoints above; this section fixes what the payloads MEAN.
+
+**`script_validation` is a poll-time PREDICTION, not the verdict on the click.** Every entry of GET `/api/skills/-/pending` and the GET `/api/skills/-/pending/{slug}` detail MAY carry `script_validation: {"ok": bool, "report": {filename: [finding, ...]}}`, computed per candidate by `_pending_scripts_verdict` on every dashboard poll, `report` scrubbed and bounded by `_redact_validation_report` like the approve refusal's (same entry, finding and string caps, same `<truncated>` accounting — `_PENDING_SCRIPT_MAX_ENTRIES` is the ONE named budget the verdict walk and the report both spend, so the two cannot drift apart). It exists so the card can badge a candidate approve is going to refuse WITHOUT the user expanding the row. It fails closed on everything approve refuses: the top-level layout precheck (`_candidate_layout_findings_at`, reading the same `_ALLOWED_CANDIDATE_TOP` set as approve's `_candidate_layout_ok` — a symlinked or non-regular `SKILL.md` / `.meta.json`, a stray top-level entry, more than 16 top-level names) is reported under the `<candidate>` key; a `scripts` entry that is not a real directory, a symlink under it, a script over `MAX_SCRIPT_BYTES` (flagged from its size, its bytes never read), an unreadable or non-UTF-8 script, an entry swapped between stat and open, and an unexpected walk error (`verdict unavailable: unexpected walk error`) are all findings. Small decodable scripts get the real `validate_scripts` run twice — raw, then on in-memory redacted copies — mirroring approve's two-stage check; nothing on disk is touched. The candidate root is resolved exactly ONCE per verdict: a single `pinned_fs.open_dir_pinned` call pins it, the layout scan reads through that retained descriptor, and `scripts` is opened relative to it (`dir_fd`) with an inode identity check against the layout scan's stat — so a candidate root swapped between steps, whether for a symlink or for a different real directory renamed over it, cannot redirect any part of the verdict; everything below `scripts` is likewise stat-ed, opened and read descriptor-relative.
+
+**When the field is OMITTED.** The field is ABSENT, not `ok: false`, whenever `_pending_scripts_verdict` returns `None` — the honest answer is "no verdict". Three paths do that: (1) a platform without descriptor-relative opens (`pinned_fs.supports_pinned_walk()` false), for EVERY candidate, before any by-name layout scan — a link/junction check followed by a by-name scan races with replacement of the candidate root, so even a layout REFUSAL can expose the target's filenames; (2) a platform with pinned opens but without descriptor-relative tree walks (`pinned_fs.supports_pinned_tree_walk()` false), for a candidate whose pinned layout precheck is clean and that has a real `scripts/` directory; (3) a walk-budget breach — more than `_PENDING_SCRIPT_MAX_ENTRIES` entries (files and directories together), a tree deeper than 8 levels, or more than `_PENDING_SCRIPT_MAX_ENTRIES` × `MAX_SCRIPT_BYTES` aggregate bytes — because the walk stops there while approve's `_collect_scripts` is unbudgeted, so `ok: false` would promise a refusal that never comes. **On Windows the pre-click "fails validation" badge disappears entirely, because no trustworthy verdict can be computed without descriptor-relative opens.** **One verdict, two surfaces.** `approve_pending_skill_checked` / `approve_pending_update_checked` CONSULT the same `_pending_scripts_verdict` the badge serves, immediately after their layout guard: a computable `ok: false` verdict refuses the click with `script_validation_failed` carrying that verdict's own scrubbed report, so the badge and the click cannot disagree on any candidate the badge judged — the badge's word is a refusal by construction, not by parallel re-derivation. When the verdict is `None` (either omission platform, or a budget breach), the click path's own machinery — the layout guard, `validate_scripts` on the collected files, redaction and re-validation — decides alone, exactly as before; it also re-runs in full after a passing consult, because the files on disk at click time are what go live. A client MUST treat a missing `script_validation` as unknown — render no badge, let the 422 `report` speak — and never as an all-clear.
+
+**SEL outcome of a refused approval.** `api_skill_pending_approve` writes one `log_tool_invocation` (`agent="api"`, `source="dashboard"`, `tool_kind="skill"`) per request: `ok` with `{slug, name}` on promotion; `not_found` with `{slug, reason: "not_found"}` when the candidate does not exist; `rejected` with `{slug, reason}` for every other `PendingApprovalRefused` (`live_exists`, `kind_mismatch`, `script_validation_failed`, `target_missing`, `stale_base`, `invalid_layout`, `redaction_failed`, `promotion_failed`) and for a malformed slug (`reason: "invalid_slug"`); `error` for an unexpected exception. Previously every refusal was logged as `not_found`, so the audit trail could not tell a missing candidate from a rejected script. Refusals are audited at the handler only; the `*_checked` promotions emit their existing success-side audit.
+
 ### Refinement (`skills.auto_refine_on_deviation`)
 
 Opt-in secondary flag, gated by `auto_create_from_sessions`. When on, the consolidation prompt also asks for a `refined_skill` object. LLM judges whether a previously-loaded `auto/...` skill's procedure was improved during the session; if so, returns an updated body. No explicit tool-sequence tracking — the LLM reads both the loaded skill content (from session context) and the actual transcript and makes the call. Same safety rails apply; refine always writes to the same `auto/<slug>/SKILL.md`, never to a new file.
@@ -4329,7 +4378,7 @@ No new command. Users interact via the existing skill management surface:
 - Off by default (opt-in). Enable: `kirocrew config set skills.auto_create_from_sessions true` (or dashboard Settings → Skills); auto-approve prose-only: `kirocrew config set skills.approval_required false`
 - Review pending candidates: dashboard Skills → Pending review, or `GET /api/skills/-/pending`
 - List auto skills: filter `kirocrew` skill listings to those under `auto/`, or use `SkillsLoader.list_auto_skills()` in code
-- Remove unwanted auto skill: `rm -rf ~/.kiro/crew/skills/auto/<slug>` (or dashboard skill delete when UI lands)
+- Remove unwanted auto skill: use the dashboard Skills delete action
 - Audit trail: `kirocrew security events -n 20 | grep auto_skill`
 
 ## Hooks (`hooks.py`)
@@ -4446,6 +4495,231 @@ sibling `emit_internal_read_audit(read_id)` — same audit + fail-closed contrac
 `_AUDIT_ONLY_READ_IDS` registry. Adding an allowlist entry is a security-review event; the bytes
 never reach an LLM/agent surface.
 
+### `SessionLaneChanged` — board-lane transitions (`_fire_session_lane_changed`)
+
+**Status: this section specifies a PENDING implementation, not the tree as it
+stands.** `SessionLaneChanged` is not a live hook event yet: `HOOK_EVENTS`,
+`ALLOWED_HOOK_EVENTS` and `_VALID_HOOK_EVENTS` carry exactly the five
+turn-lifecycle events, and none of the symbols named below exist in `src/`. Read
+every present-tense sentence here as the contract the implementation must meet.
+Until it lands, `handlers/hooks.py` and the Hooks page behave as the rest of this
+module already describes.
+
+The implementation is PR #7669, and this section stands or falls with it: it is
+owned by that PR, is asserted against the code by a spec-pinning test that ships
+there, and **must be deleted if #7669 is withdrawn** rather than left describing
+code that never arrived. The RFC amendment in
+`docs/request-for-change/rfc-session-tag-change-event.md` records which writers
+emit and which remain silent; that document, not this section, is where the
+firing coverage is stated.
+
+Fires when a chat session's **status** tags change through a session-level tag
+transition, so an automation can react to a board lane transition as it happens
+rather than on a timer.
+
+**What it buys, stated exactly: latency, not the removal of reconciliation.**
+Reaction is no longer bounded by a poll interval, and the delta is computed once
+here instead of by every consumer. It does NOT retire the polling loop for a
+subscriber that needs certainty: the RFC states the v1 delivery bar this event
+ships under, and it does not promise every arrival, so such a subscriber still
+re-reads the board. A subscriber that can
+tolerate a missed transition can drop its timer; one doing irreversible work
+cannot, and gains only latency.
+
+**What counts as a status tag, stated once.** `_is_status_tag` is
+`bool(isinstance(tag, dict) and tag.get("status"))` — plain truthiness — and every reader asks
+it: the drop path's mutual-exclusion strip, the delete path, the auto-tagger, and this event's
+dispatch filter. One rule rather than two, and deliberately the rule the board ALREADY uses:
+the tag manager's lightning toggle reads `!!t.status`, and `GET /api/chat/tags` serves the
+field as stored. So any value Python calls truthy is a lane, including a hand-edited
+`"status": "false"` (a non-empty string), and only an absent field, `false`, `0` or `""` is
+not. A stricter predicate would read better in isolation and would RECLASSIFY such a tag from
+a lane to an ordinary one — silently un-stripping it on the drop path, where the board still
+draws it as a column — so the narrowing is left to whatever change owns board behaviour. This
+one adds an event.
+
+**Why the name is LANE-scoped, not tag-general.** The event name is the one part of
+this surface that can never be corrected: once a hook subscribes, renaming is a
+breaking change for that hook, and unlike a payload key there is no additive way to
+migrate it. The firing contract is status-tags-only, so a tag-general name would
+promise more than the event delivers — and it would make the obvious future
+widening (fire on ALL tag changes) a BREAKING change rather than an additive one:
+every no-matcher subscriber would silently begin receiving auto-tag noise from
+`maybe_auto_tag`, which writes non-status tags routinely. Under a lane-scoped name
+that widening is a NEW event (`SessionTagsChanged`, still unused) beside this one,
+and existing subscribers are untouched. The name was deliberately narrowed before
+merge for exactly that reason; widening the contract later must add an event rather
+than redefine this one.
+
+**This section is the event's compatibility surface.** The payload keys and the matcher token grammar are what a registered hook binds to, so changing either
+breaks existing hooks — they are documented here rather than left to be inferred
+from the first subscriber.
+
+**It ships with ZERO registered subscribers, and that is the cheapest moment it
+will ever have.** The event name, the four payload keys and the token grammar are a
+one-way door: every one of them becomes a compatibility obligation the instant a
+hook binds to it, and today nothing does, so the surface is still free to change.
+That is inherent to adding any hook event rather than a defect of this one — but it
+is the reason the contract is written down BEFORE a subscriber exists rather than
+after, and the reason the name was narrowed pre-merge. Reviewers judging this
+surface should treat now as the last point at which a correction is free; the
+status-only scoping is what keeps the expected future widening additive.
+
+**Payload (stdin JSON).** All three keys are stamped unconditionally, so a hook that
+always reads one never `KeyError`s on an addition-only or removal-only change:
+
+| key | meaning |
+|-----------|--------------------------------------------------|
+| `slot` | the session key whose tags changed |
+| `added` | **status** tag ids added by this transition |
+| `removed` | **status** tag ids removed by this transition |
+
+`added` and `removed` are **status-only**, not the raw set difference. A single tag
+edit can bundle a lane change with a plain-label change, and emitting the whole
+delta would put `added:<label>` in the matcher context — letting a hook match a
+non-status tag, which contradicts the status-only firing contract above. There is no
+`tags` key: a subscriber needing the session's full current state re-reads the live
+store, because dispatch is off the request path and the board can move again first.
+
+Filtering the delta cannot make it empty. The fire gate compares the status-only
+sets, so a dispatch happens only when they differ — the symmetric difference then
+holds at least one id. This is load-bearing rather than incidental: `fire` consults
+a matcher only when the context is non-empty, so an empty delta would skip matcher
+filtering and run EVERY hook registered for the event, the opposite of the intent.
+
+The **delta** is the point: with `tags` alone every consumer would have to persist
+its own prior snapshot to answer "was Done just added?", which moves the diffing
+into every subscriber instead of doing it once here.
+
+**Matcher grammar** (built by the module-private `_session_lane_matcher_context`,
+which lives beside `HOOK_EVENT_SESSION_LANE_CHANGED` because the GRAMMAR is the
+event's contract, not the writer's; the builder has no caller outside `hooks.py`,
+since the fire derives the context itself). Tokens are **direction-tagged** and carry the tag **id only**:
+
+```
+added:<id>;  removed:<id>;
+```
+
+Direction is in the grammar because the motivating case is "a session **entered**
+Done"; an untagged context cannot express it, since an `<id>` matcher would fire on
+leaving the lane too.
+
+**A bare lane id matches NOTHING.** The default matcher mode is `glob` and
+matching is **whole-string** `fnmatch`, so a selector must carry wildcards:
+
+| intent            | `glob` selector   | `contains` selector |
+|-------------------|-------------------|---------------------|
+| entered a lane    | `*added:<id>;*`   | `added:<id>;`       |
+| left a lane       | `*removed:<id>;*` | `removed:<id>;`     |
+| any movement      | `*:<id>;*`        | `:<id>;`            |
+
+**Both bounds of the id are load-bearing, not decoration.** Matching is `fnmatch`
+against the whole context, so a selector must pin the id at each end or it matches a
+DIFFERENT lane and the hook that runs belongs to someone else — for a close-out hook,
+an irreversible action on the wrong session.
+
+- The trailing `;` stops a selector for a short id also matching every longer id it
+  **prefixes**: without it `*added:abc*` fires on `added:abcdef;`.
+- The leading `:` stops it matching an id it is a **suffix** of: `*abc;*` fires on
+  `added:xabc;`, because that token ends with the same `abc;`. The direction-tagged
+  rows get this bound for free from `added:`/`removed:`, which is why only the
+  direction-free row has to spell the `:` out.
+
+Neither bound is forgeable: `:` and `;` are both outside the id allowlist
+(`_TOKEN_ALLOWED = re.compile(r"\A[a-z0-9_.-]+\Z")`), so no id can contain either. Two
+generated ids are the same length `uuid4().hex[:12]` and can neither prefix nor suffix each
+other, but `tags.json` is
+hand-editable and legacy artifacts exist — the same path the token validator guards.
+
+**Why the validator is an allowlist and not a separator screen.** `:` and `;` are
+rejected inside an id so it cannot forge its own bounds, but refusing only the
+separators still admits glob metacharacters, and the grammar is consumed by `fnmatch`:
+an id of `*` would make the selector written for it match EVERY lane change and run
+that tag's hook on sessions it was never registered for. Enumerating the safe
+characters refuses that whole class instead of the separators that happened to be
+foreseen. `.` IS admitted, because it is none of those things — `fnmatch` treats it as a
+literal, so a hand-named `in.review` reaches the grammar rather than vanishing from every
+matcher context. The allowlist is lower-case only, because `_context_matches` folds case and
+an upper-case id would otherwise admit two spellings of one token; an id the validator
+refuses is skipped with a logged warning rather than silently dropped.
+
+**Why ids and not display names.** Emitting `added:<name>` alongside the id read
+better — an author could write `*added:In_Review*` for a lane shown as "In Review" —
+but it put a user-controlled string into a structural grammar and cost more than it
+bought. Whitespace divides tokens and `:` divides a direction from its value, so a
+name had to be escaped or one lane could forge another lane's token; a collapsing
+sanitizer turned out to be many-to-one (`In Review`, `In:Review` and a literal
+`In_Review` all became `In_Review`), which fires a destructive close-out hook for
+the **wrong** lane, so the escape had to be injective; and the resulting spelling
+(`*added:In_20Review*`) would have been frozen contract from the first subscriber
+onward. Ids already select a lane, contain no separator to escape, and are stable
+across renames, so a matcher keeps working when a lane is relabelled.
+
+The sequencing is settled by the asymmetry: adding name tokens later is **additive**,
+removing them later is **breaking**, and this event ships with zero subscribers — so
+leaving that grammar unfrozen costs nothing today. A subscriber wanting the
+human-readable label reads `added`/`removed` from the payload and resolves the
+ids it finds there; the follow-up event-picker UI can resolve a name to an id when
+composing the matcher.
+
+An id is **validated, not escaped**: ids are `uuid4().hex[:12]`, but `tags.json` is
+persisted state a human can edit, so an id carrying whitespace or `:` is skipped
+rather than tokenized. That degrades matching for that one tag instead of splitting
+into two tokens or forging the opposite direction.
+
+**Contract limits, all deliberate:**
+
+- **Status tags only.** `chat_auto_tag.maybe_auto_tag` writes non-status tags
+  routinely and never writes status ones, so firing on every tag would make the
+  event chatty for the board-lane case that motivates it while adding nothing.
+- **Informational — a hook cannot veto.** Exit code 2 blocks a `PreToolUse` call;
+  this event ignores it. By the time it fires the write is applied and the drag has
+  happened, so a veto would make the board unusable when a hook breaks rather than
+  preventing anything. A refused or rolled-back write never fires it.
+- **Only ids are tokenized, and an id must match the single `_TOKEN_ALLOWED` allowlist stated above, so nothing user-controlled reaches the grammar.**
+  Whitespace separates tokens and `:` separates a direction from its value, so a tag
+  NAME reaching a token raw could forge either: a lane named `removed:done` would
+  emit `added:removed:done` and fire a `*removed:done*` cleanup hook on a session
+  that just ENTERED a lane, and `done x` would split and forge a match for a
+  different lane called `done`. Escaping names was tried and dropped as a
+  subtraction: the escape had to be *injective* (collapsing separator runs to `_`
+  made `In Review`, `In:Review` and a literal `In_Review` share one token, firing a
+  destructive hook for the wrong lane), and its spelling would then be frozen
+  contract. Dropping name tokens removes that surface instead of guarding it — see
+  the matcher-grammar section above for the sequencing argument. Ids are
+  `uuid4().hex[:12]` and carry no separator, but are **validated** anyway because
+  `tags.json` is persisted state: a malformed id is skipped, never rewritten.
+- **Three event allowlists diverge intentionally.** The event is in
+  `hooks.HOOK_EVENTS` (dispatchable) and `validation.ALLOWED_HOOK_EVENTS`
+  (registrable through the hook create/update API), and deliberately **absent**
+  from `agent._VALID_HOOK_EVENTS` — kiro-cli rejects a generated agent config
+  naming an event it does not know. A test pins all three memberships together
+  with this rationale, so the divergence cannot be "fixed" by syncing them.
+
+**The SEL rows this event adds, stated so an auditor can find them and a host can
+budget them.** A lane-dispatch decision writes ONE `log_api_access` row under
+`operation="hooks.session_lane_changed"`, on either outcome, so the count does not
+depend on whether the dispatch was permitted. The rate is per DECISION, not per
+session and not per tag: deleting a status tag strips it from every session holding
+it and still records one row for that whole batch. The floor is zero and zero is the
+default shipping state — the row is written only once an enabled `SessionLaneChanged`
+hook is registered, so a host with no subscriber adds none. No volume figure is
+stated here on purpose: nothing in the implementation measures one, so any
+rows-per-day number would be an estimate rather than a contract.
+
+**Known deferral (partially mitigated here).** Resolving the `capabilities.script_hooks`
+gate walks `profiles/` synchronously, so any `async` caller resolving it inline stalls the
+event loop for that walk — a `no-blocking-call-on-event-loop` violation reachable from lane
+dispatch. Both `async` call sites in `hooks.py` therefore await ONE seam,
+`_script_hooks_capability_denied_async`, which hops to a thread. Unconditional, not keyed on
+the event: scoping it to `SessionLaneChanged` was tried and withdrawn, because it put an
+equality branch in shared dispatch that every future event would grow while leaving the
+other events stalling anyway. Centralised in one wrapper rather than a hop at each call
+site, because it remains a CALLER-side workaround: the cause-level remedy is non-blocking
+resolution, or a cached fingerprint, in the owning module — and when that lands there is one
+seam to delete instead of a hop per caller. Synchronous callers outside this module still
+resolve inline and still stall.
+
 ### User kiro-cli Hooks (`agent.kiro_hooks` in `config.json`)
 
 User-defined kiro-cli hooks that persist across `kirocrew update`. Follows the
@@ -4455,6 +4729,80 @@ User-defined kiro-cli hooks that persist across `kirocrew update`. Follows the
 ```json
 {"agent": {"kiro_hooks": {"preToolUse": [{"matcher": "*", "command": "/path/to/hook.sh"}]}}}
 ```
+
+**Two accepted shapes.** The object above, and the array of hook documents a
+kiro-agent profile carries:
+
+```json
+{"agent": {"kiro_hooks": [
+  {"name": "guard", "trigger": "PreToolUse", "matcher": "*",
+   "action": {"type": "command", "command": "/path/to/hook.sh"}}
+]}}
+```
+
+Each shape has exactly one reader. `normalize_spec_hooks()` in `agent.py` reads
+the array and returns the internal list of hook documents, and
+`hook_documents_to_object_form()` derives the object form handed to kiro-cli. The
+object form is read only by `_merge_kiro_hooks()`, which owns its validation and
+its audit, so its serialized bytes and its error path are unchanged by the array
+form's arrival — re-deriving it from documents would move both. Anything that is
+not an array, an object included, is warned about and SEL-audited by
+`normalize_spec_hooks()`, and the one caller sends an object straight to the
+merge instead of here. So a value that is neither shape is audited rather than
+dropped in silence. The standalone hook-file wrapper
+`{"version": "v1", "hooks": [...]}` is a file format, not a spec value: it is an
+object, so the merge sees `version`/`hooks` as unknown event keys and rejects it.
+
+Array-form rules (implemented in `normalize_spec_hooks()`):
+- `trigger` accepts the whole alias table from the trigger alias table in `kiro-team/kiro-agent` (blob `2d4a3127e32e5e81e68d5c2ea406a6a5728f6d78`, `trigger-names.ts` under its hooks package) — twelve canonical triggers with their PascalCase identity rows, the IDE's
+  legacy camelCase spellings, the CLI aliases and one Open Plugins legacy alias —
+  keyed case-insensitively, which is one deliberate leniency over kiro-agent's
+  own case-sensitive lookup. That blob is the version to re-read when adding a
+  name
+- `action` is `{"type": "command", "command": ...}` or
+  `{"type": "agent", "prompt": ...}`; the type must be a string and the payload a
+  non-empty string within `_MAX_HOOK_PAYLOAD_LEN`
+- `name` and `description` are bounded by `_MAX_HOOK_NAME_LEN` and
+  `_MAX_HOOK_DESCRIPTION_LEN`, `timeout` must be a positive integer, `enabled` and
+  `confirm` must be booleans, and `matcher` follows the object form's rules
+- at most `_MAX_SPEC_HOOK_DOCUMENTS` documents are read from one field
+- a rejected document is warned about and SEL-audited; the documents beside it
+  still load
+- documents are then projected onto the object form and merged by
+  `_merge_kiro_hooks()`, so both shapes meet the same command, matcher, dedup and
+  cap rules
+
+Left out of the kiro-cli emission, kept in the stored spec — and left out for
+that TRIGGER only, since autoimport still discovers a script in the hooks
+directory on its own unless a suppressed document names it: an `action` of type
+`agent`, the seven triggers kiro-cli has no event name for (`SessionEnd`, `PreTaskExec`,
+`PostTaskExec`, `PostFileCreate`, `PostFileSave`, `PostFileDelete`, `Manual`), and
+the per-hook `name`, `description` and `timeout`. `enabled: false` and
+`confirm: true` are NOT in that class: each grants less execution than the object
+form can express, so either one keeps the hook out of the kiro-cli spec entirely,
+with a log line and a SEL audit naming which. `hook_documents_suppressed_commands()`
+maps the resolved command of every entry carrying those two fields to the CAUSE the
+audit line reports — read from the RAW array, before validation, so a document that
+says `enabled: false` and is then rejected for an unrelated field still keeps its
+script out of the scan. One filter serves both causes, so the cause travels with the
+command rather than being assumed: a confirmation-gated hook is not recorded as one
+the author disabled, and `enabled: false` outranks `confirm: true` on one document
+and across two naming the same command. Bypassing the validator means carrying its
+bounds: the same `_MAX_SPEC_HOOK_DOCUMENTS` slice, so a document the log calls
+ignored cannot still delete a script, and `_MAX_HOOK_PAYLOAD_LEN` on the retained
+command. On Windows, a UNC or device-shaped command outside the shares
+`unc_probe_allowed()` admits is refused before THIS resolution, because
+`Path.resolve()` on one is an outbound SMB authentication; the shape is judged on the
+authored string and on its user-expanded form. `_validate_hook_command()` does not
+ask: the object form has always resolved its command there and autoimport hands it a
+path already resolved, so a refusal there would prevent no probe while un-installing
+every hook on a host whose hooks directory lives on a share. Each script left out of
+the scan is SEL-audited, because an off-document that validation rejected never
+reaches the emission path's own audit — and
+`_apply_user_kiro_hooks()` subtracts them from what autoimport discovered before
+the single merge pass — otherwise a document naming a script under
+`~/.kiro/hooks` is dropped here and rediscovered there, landing on autoimport's
+default event rather than the one the document named.
 
 Merge rules (implemented in `_merge_kiro_hooks()` in `agent.py`):
 - Bundled hooks from `config/defaults.json` are always present and always first

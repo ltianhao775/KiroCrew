@@ -185,7 +185,6 @@ src/kiro_crew/dashboard/port_reclaim.py
 src/kiro_crew/dashboard/routes/skills.py
 src/kiro_crew/dashboard/slowloris.py
 src/kiro_crew/dashboard/stale_asset_watchdog.py
-src/kiro_crew/dashboard/system_notices.py
 src/kiro_crew/dashboard/tailnet_serve.py
 src/kiro_crew/dashboard/terminal_commands.py
 src/kiro_crew/dashboard/theme_validate.py
@@ -234,7 +233,6 @@ src/kiro_crew/knowledge/spend.py
 src/kiro_crew/knowledge/store.py
 src/kiro_crew/knowledge/sync.py
 src/kiro_crew/knowledge/watcher.py
-src/kiro_crew/mcp_cleanup.py
 src/kiro_crew/mcp_gateway/abort.py
 src/kiro_crew/mcp_gateway/app_call.py
 src/kiro_crew/mcp_gateway/apps.py
@@ -269,7 +267,6 @@ src/kiro_crew/pod/launchd.py
 src/kiro_crew/pod/provision.py
 src/kiro_crew/publish_governance.py
 src/kiro_crew/publish_sync.py
-src/kiro_crew/resource_status.py
 src/kiro_crew/sel.py
 src/kiro_crew/service/apparmor.py
 src/kiro_crew/service/common.py
@@ -309,7 +306,6 @@ test/test_acp_metadata_fields.py
 test/test_acp_offload.py
 test/test_acp_prompt_blocks.py
 test/test_acp_stale_recovery.py
-test/test_acp_tool_identity.py
 test/test_acp_tool_search.py
 test/test_acp_true_provider_error.py
 test/test_acp_turn_lock.py
@@ -582,7 +578,6 @@ test/test_file_stream.py
 test/test_file_watch.py
 test/test_fire_tool_hooks.py
 test/test_fixtures_helper.py
-test/test_folder_store_writer.py
 test/test_folder_watch_handlers.py
 test/test_folder_watcher.py
 test/test_frontend_dist_resolve.py
@@ -617,7 +612,6 @@ test/test_image_artifacts.py
 test/test_inbound_unbind_notice.py
 test/test_installer_distro.py
 test/test_installer_node_floor.py
-test/test_installer_shim_and_cleanup.py
 test/test_instance_credential_pairing.py
 test/test_instances_search_federation.py
 test/test_interactions_shortcut.py
@@ -626,7 +620,6 @@ test/test_is_interrupted.py
 test/test_issue_radar_crew_github.py
 test/test_issue_radar_crew_routes.py
 test/test_issue_radar_crew_runtime.py
-test/test_issue_radar_crew_store.py
 test/test_issue_radar_gh_bin.py
 test/test_issue_radar_investigation_tool.py
 test/test_issue_radar_list_probe.py
@@ -640,7 +633,6 @@ test/test_issue_triage_workflow.py
 test/test_kas_display_mapping.py
 test/test_kas_subagent_progress.py
 test/test_kiro_usage_api.py
-test/test_knowledge.py
 test/test_knowledge_add_source.py
 test/test_knowledge_agent_source.py
 test/test_knowledge_artifact_ingest.py
@@ -661,7 +653,6 @@ test/test_lesson_contradiction.py
 test/test_lesson_ranking.py
 test/test_lifecycle_hooks.py
 test/test_link_dashboard.py
-test/test_llm_pool.py
 test/test_local_gate.py
 test/test_loopback_proxy.py
 test/test_manifest_hooks.py
@@ -710,7 +701,6 @@ test/test_mcp_probe_treadmill.py
 test/test_mcp_probe_warn_once.py
 test/test_mcp_registry_governance.py
 test/test_mcp_seed.py
-test/test_mcp_server_alias.py
 test/test_mcp_shareability.py
 test/test_mcp_shared.py
 test/test_mcp_shared_cache.py
@@ -799,7 +789,6 @@ test/test_provider_dispatch.py
 test/test_publish_providers.py
 test/test_publish_sync.py
 test/test_queue_during_subagents.py
-test/test_queue_receipt.py
 test/test_quick_send.py
 test/test_read_bounded_json.py
 test/test_recovery_card_parity.py
@@ -867,7 +856,6 @@ test/test_skill_home_paths.py
 test/test_skill_index_app_symlinks.py
 test/test_skill_paths_and_mcp_sync.py
 test/test_skill_pending.py
-test/test_skill_pending_api.py
 test/test_skill_pending_notify.py
 test/test_skill_providers.py
 test/test_skill_script_validator.py
@@ -900,7 +888,6 @@ test/test_socketsec.py
 test/test_source_providers.py
 test/test_source_providers_comment_guard.py
 test/test_source_summary.py
-test/test_spawn_followup.py
 test/test_spawn_list_redaction.py
 test/test_stable_release_gate.py
 test/test_stale_asset_watchdog.py
@@ -938,7 +925,6 @@ test/test_theme_authoring_skill.py
 test/test_theme_css_security.py
 test/test_theme_install.py
 test/test_thread_parent_context.py
-test/test_title_refresh.py
 test/test_to_dict_board_fields.py
 test/test_toolbox_migration.py
 test/test_trusted_apps_api.py
@@ -963,7 +949,6 @@ test/test_watchdog.py
 test/test_web_verify_downscale.py
 test/test_webapp_preview.py
 test/test_webapp_teardown_card_reset.py
-test/test_webhooks_api.py
 test/test_webhooks_auth_surface.py
 test/test_webhooks_event_loop.py
 test/test_webhooks_signing.py

@@ -308,6 +308,115 @@ def reconcile_member_config(slug, name, agent_cfg, roster_view) -> "list[str] | 
         return None
 
 
+def member_message_payload(role, content, meta, ts: float, *, sanitize) -> dict:
+    """The ``member/message`` event for one row landing in a member's chat.
+
+    Every row bumps recency (``ts``); only SPEECH -- a user or assistant row
+    with visible text that is not a system notice or a workflow envelope
+    (``is_speech_row``) -- carries a ``preview``, so the roster keeps quoting the
+    last thing said when a patrol turn, a say-nothing reply or a cron envelope
+    lands. The preview is built by ``speech_preview`` -- strip markdown, run the
+    caller's redaction chain, cap with an ellipsis -- which is the SAME function
+    the roster's cold read (``last_speech_info``) uses, so
+    the folded preview and the read agree byte for byte and
+    ``reconcile_member_preview`` has nothing to correct for a live message.
+    Module level so the live writer and its test share ONE definition.
+    """
+    from kiro_crew.dashboard.system_notices import is_speech_row
+    from kiro_crew.history_projection import TranscriptReadProjection
+    from kiro_crew.preview_text import speech_preview
+
+    payload: dict[str, object] = {"ts": ts}
+    # Normalised first, as the cold read does: structured content is speech
+    # when its text blocks say something.
+    text = TranscriptReadProjection._content_text(content)
+    if not is_speech_row(role, text, meta):
+        return payload
+    preview = speech_preview(text, sanitize)
+    if preview:
+        payload["preview"] = preview
+    return payload
+
+
+def _preview_is_still_at(values: dict, observed: dict) -> bool:
+    """Does the roster still show the preview the caller decided to correct?
+
+    Module level so the reconcile and its tests share ONE definition.
+
+    The correction is computed from a SNAPSHOT of the roster projection and the
+    transcript, and written afterwards. Between the two a live ``member/message``
+    -- the crewmate speaking right now -- can land a newer preview and recency.
+    The ``last_message`` fold is last-wins by append order and ``last_active_ts``
+    takes the event's ``ts`` as is, so a correction that lands AFTER that live
+    event would durably regress both to the stale read, in an append-only log
+    with no compaction and nothing to reopen it until the member speaks again.
+    So the roster block must be UNCHANGED on the two fields the correction
+    rewrites: the quote and the recency epoch. Only those two, not the whole
+    block or the slug's sequence -- an unrelated event (a status change, a slot
+    open) must not starve a correction that is still right.
+    """
+    from kiro_crew.eventlog import types
+
+    now = values.get(types.PROJ_ROSTER) or {}
+    then = observed.get(types.PROJ_ROSTER) or {}
+    return (now.get("last_message"), now.get("last_active_ts")) == (
+        then.get("last_message"),
+        then.get("last_active_ts"),
+    )
+
+
+def reconcile_member_preview(slug, name, preview, msg_ts, roster_view) -> bool:
+    """Append a correcting member/message when the log's roster preview drifts
+    from the transcript's speech-only read.
+
+    The roster row's ``last_message`` is folded last-wins from ``member/message``
+    events. Events written BEFORE the preview became speech-only (or by any
+    writer that does not apply ``is_speech_row``) carry machinery text -- a tool
+    line, a patrol turn -- and a cold fold would keep quoting it beside a chat
+    that draws none of it. The transcript is the authority: ``api_members`` has
+    just read it with ``last_speech_info`` and passes the answer here, INCLUDING
+    an empty one, so a never-spoken patroller's stale preview is corrected to
+    blank rather than left standing. Appends nothing when the two already agree,
+    so a second read writes nothing. Carries the transcript's newest epoch as
+    ``ts`` (the roster orders by it) when one is known, else the current time.
+
+    The append is conditional: it goes through
+    ``append_closer_if_still_applies`` with ``_preview_is_still_at``, re-asked
+    under the per-slug write lock against the CURRENT projection, so a live
+    message that landed between the roster read and this write refuses the
+    correction instead of being overwritten by it. A refusal is a normal
+    outcome (the live path already wrote the right preview) and the next roster
+    read compares afresh.
+
+    Returns True when an event was appended. Best-effort: failures are swallowed.
+    """
+    if not slug:
+        return False
+    try:
+        view = roster_view if isinstance(roster_view, dict) else {}
+        current = view.get("last_message")
+        wanted = preview if isinstance(preview, str) else ""
+        if (current or "") == wanted:
+            return False
+        from kiro_crew.eventlog import types
+        from kiro_crew.eventlog.service import get_service
+
+        svc = get_service()
+        svc.ensure(slug, name or slug)
+        ts = float(msg_ts) if msg_ts else time.time()
+        appended = svc.append_closer_if_still_applies(
+            slug,
+            types.MEMBER_MESSAGE,
+            {"ts": ts, "preview": wanted},
+            still_applies=_preview_is_still_at,
+            observed={types.PROJ_ROSTER: view},
+        )
+        return appended is not None
+    except Exception:
+        logger.debug("reconcile_member_preview failed for slug=%r", slug, exc_info=True)
+        return False
+
+
 def _patrol_is_still_armed_at(values: dict, observed: dict) -> bool:
     """Does the patrol the caller decided to close still exist, unchanged?
 

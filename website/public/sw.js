@@ -97,6 +97,12 @@ self.addEventListener('fetch', e => {
   // mode === 'navigate', so the offline fallback would serve the SPA shell
   // (/index.html) INTO the widget frame instead of the document.
   if (url.pathname.startsWith('/sandbox-doc/')) return
+  // Standalone app-window documents. These are full top-level applications,
+  // not SPA routes: serving the cached dashboard shell into a frameless overlay
+  // can create an always-on-top, full-display dashboard with no close controls.
+  // Leave navigation and failures to the browser. Electron app-window hosts
+  // already fail closed on 4xx/5xx and transport errors.
+  if (url.pathname.startsWith('/app-windows/')) return
   // App backends (e.g. /apps/dev-fleet/api/*)
   if (url.pathname.startsWith('/apps/')) return
   // Vite content-hashed assets — the immutable HTTP cache still owns them, so

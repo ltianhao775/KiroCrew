@@ -1973,6 +1973,11 @@ def _pod_pid_record_path(cfg: PodConfig, name: str, port: int) -> Path:
     return cfg.home_dir(name) / run_marker.RUN_DIR_NAME / run_marker.pid_file_name(port)
 
 
+def _pod_secret_path(cfg: PodConfig, name: str, port: int) -> Path:
+    """Path of pod *name*'s per-listener credential inside its isolated home."""
+    return cfg.home_dir(name) / run_marker.RUN_DIR_NAME / run_marker.secret_file_name(port)
+
+
 def _pod_recorded_pid(cfg: PodConfig, name: str, port: int) -> int | None:
     """Gateway PID recorded in pod *name*'s isolated home, PROVEN to still name
     that same process, or ``None``.
@@ -2211,12 +2216,12 @@ def health(cfg: PodConfig, name: str, port: int, timeout: int = 3) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Token mint — reads the pod's OWN .local_secret (in its isolated HOME), then
-# calls /api/token/local with X-Local-Secret over the pod's private unix
-# socket. Keeps the secret read inside this process (never an agent-issued
-# `cat`), and keeps the secret's delivery inside the pod's owner-only home
-# (never a rebindable loopback port). The connected socket's peer is
-# kernel-verified against the attested gateway pid before any bytes are sent,
+# Token mint — reads the pod's OWN internal-API credential (in its isolated
+# HOME, per listener first), then calls /api/token/local with X-Local-Secret over
+# the pod's private unix socket. Keeps the secret read inside this process
+# (never an agent-issued `cat`), and keeps the secret's delivery inside the pod's
+# owner-only home (never a rebindable loopback port). The connected socket's peer
+# is kernel-verified against the attested gateway pid before any bytes are sent,
 # so even a same-UID rebind of the socket path receives nothing.
 # --------------------------------------------------------------------------- #
 def _attested_gateway_verifier(cfg: PodConfig, name: str, port: int, socket_path: Path):
@@ -2226,7 +2231,7 @@ def _attested_gateway_verifier(cfg: PodConfig, name: str, port: int, socket_path
     who answers the socket FILE: the path sits in a directory its owner can
     always rewrite, so a same-UID process can unlink it and bind its own
     listener there — and the mint request would hand that listener the pod's
-    ``.local_secret``. The kernel can prove it: peer credentials on the
+    internal-API credential. The kernel can prove it: peer credentials on the
     connected socket (``SO_PEERCRED`` on Linux, ``LOCAL_PEERPID`` on macOS)
     name the listener's pid as of ``listen()``, so requiring that pid to equal
     the attested gateway pid refuses a rebound socket BEFORE any HTTP bytes.
@@ -2266,15 +2271,187 @@ def _attested_gateway_verifier(cfg: PodConfig, name: str, port: int, socket_path
     return _verify
 
 
-def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
-    secret_file = cfg.home_dir(name) / ".local_secret"
+# Recreating a pod is the only restart the pod CLI offers, and `down` reclaims the
+# pod's HOME, so every remedy that suggests it states that cost. It is offered only
+# where it can actually repair the refusal, which is the pre-code gateway whose
+# transport refusal may really be a missing AF_UNIX admission. A gate that judges
+# who connected is never offered it, and neither is a credential mismatch: a live
+# second gateway in the same home produces one without the pod's state being wrong.
+_POD_RECREATE = (
+    "`kirocrew pod down {name} && kirocrew pod up {name}` — and `down` DELETES the "
+    "pod's HOME, so copy anything you still need out of it first"
+)
+
+# Every 403 this route sends is a fixed short JSON literal, so a longer reply is not
+# one of them and holds no ``code`` worth reading. Bounding the read keeps a single
+# oversized reply from costing the one-shot CLI its own length in memory, and a body
+# over the cap is treated exactly like an unreadable one: the operator is sent to the
+# pod's audit record rather than to a cause parsed out of an untrusted length.
+_MINT_403_BODY_CAP = 64 * 1024
+
+#: Longest slice of a pod's own ``error`` text this module echoes to the terminal.
+_MAX_ECHOED_DETAIL_LEN = 64
+
+
+def _terminal_safe_detail(detail: str) -> str:
+    """Reduce a pod's ``error`` text to characters safe to print.
+
+    A pod's gateway runs that pod's own worktree checkout, so this text is chosen
+    by the code under test rather than by this process, and it lands on the
+    operator's terminal through :func:`kiro_crew.pod.cli._die`, which prints it
+    unchanged. Every non-printable code point is dropped — C0/C1 controls, so ESC
+    and BEL, which start and end ANSI SGR and OSC sequences, and Unicode format
+    characters — and the result is capped, so a crafted reply can neither drive the
+    terminal nor flood the line. ``str.isprintable`` is the filter, which also
+    rejects newlines, so the reply cannot forge extra lines of this message; it
+    keeps letters, digits, punctuation and ordinary spaces of every script without
+    enumerating escape grammars.
+
+    Same filter and cap as :func:`kiro_crew.cli_server._terminal_safe_name`, which
+    reduces an untrusted process name for the same reason.
+    """
+    return "".join(ch for ch in detail if ch.isprintable())[:_MAX_ECHOED_DETAIL_LEN]
+
+
+def _mint_403_cause(exc: urllib.error.HTTPError, name: str) -> str:
+    """The pod's OWN reason for refusing a token mint, as the remedy that matches it.
+
+    ``/api/token/local`` refuses at three independent gates — transport admission,
+    the credential comparison, and owner provenance — and returns a
+    machine-readable ``code`` for each, alongside the same distinction in its
+    ``security_events.jsonl`` record. Reading that code is what lets a refusal name
+    the gate that applied instead of listing candidates, which matters because the
+    remedies differ and none of the three is a recreate. Transport admission and
+    owner provenance both judge WHO CONNECTED, so recreating the pod clears neither;
+    a credential mismatch has two causes and a live second gateway in the same home
+    produces one of them without the pod's state being wrong. A recreate deletes the
+    pod's HOME.
+
+    A gateway that sends any of these codes carries this endpoint's current shape, so
+    the one cause that a worktree update plus a recreate does fix — a gateway too old
+    to admit ``AF_UNIX`` on this route at all — can only appear on a reply carrying NO
+    code, and is named only there.
+
+    Never raises. An unreadable, over-long, non-JSON or ``code``-less body yields
+    guidance that sends the operator to the pod's own audit record rather than to a
+    guess. Where the pod's own ``error`` text is quoted back, it is reduced to
+    printable characters and capped first, because it reaches the terminal unchanged.
+    """
     try:
-        secret = secret_file.read_text().strip()
-    except FileNotFoundError as exc:
-        raise PodError(
-            f"no .local_secret for pod {name!r} — is it running? ({secret_file})"
-        ) from exc
+        raw = exc.read(_MINT_403_BODY_CAP + 1)
+    except Exception:
+        raw = b""
+    if len(raw) > _MINT_403_BODY_CAP:
+        raw = b""
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+    code = payload.get("code") if isinstance(payload.get("code"), str) else ""
+    sent = payload.get("error")
+    detail = _terminal_safe_detail(sent) if isinstance(sent, str) else ""
+    recreate = _POD_RECREATE.format(name=name)
+    if code == "member_owner_token_refused":
+        return (
+            "the gateway did not accept this CALLER as the pod's local owner "
+            "(code member_owner_token_refused). The transport was admitted and the "
+            "pod's internal-API credential was accepted; the process behind them was "
+            "refused, "
+            "and the pod records that as resources=unverified-owner-process in its "
+            "security_events.jsonl.\n"
+            "  Recreating the pod does NOT change this verdict — the verdict is "
+            "about which process called, not about the pod's state or its secret — "
+            "and `kirocrew pod down` DELETES the pod's HOME.\n"
+            "  The gate admits a caller whose process start id the gateway can read "
+            "and which its own platform accepts as an ordinary host process: on Linux "
+            "that is a caller sharing the gateway's user and mount namespaces, so a "
+            "different namespace is refused even at the same uid, and on macOS it is a "
+            "caller running outside a sandbox profile. Mint from a host process that "
+            "meets this platform's condition."
+        )
+    if code == "loopback_only":
+        return (
+            "the gateway refused this TRANSPORT before it read the secret (code "
+            "loopback_only), and records it as resources=non-loopback in its "
+            "security_events.jsonl. A gateway that sends this code carries the "
+            "unix-socket admission on /api/token/local, so it did not reject the "
+            "socket for being one: it declined to confirm the connecting peer as its "
+            "own principal. That admission takes only a positive kernel MATCH, so a "
+            "mismatched peer credential and an unverifiable one are both refused.\n"
+            "  Recreating the pod does NOT change this verdict either, because it is "
+            "about who connected rather than about the pod's state, and `kirocrew pod "
+            "down` DELETES the pod's HOME. Check that this caller runs as the uid that "
+            "owns the pod's home, and that the kernel can report peer credentials on "
+            "this socket at all: a credential it cannot report is refused exactly like "
+            "one that names another principal."
+        )
+    if code == "invalid_secret":
+        return (
+            "the gateway rejected the credential this mint sent as not matching "
+            "its own (code invalid_secret). Two different things look identical "
+            "here, and only one of them is the pod's state: a credential left "
+            "behind by an earlier run, or a live second gateway in this pod's home "
+            "holding the shared .local_secret slot while the port belongs to "
+            "another generation.\n"
+            "  The pod's run directory tells them apart: the per-listener file for "
+            "this port carries the credential of the process that owns it, and the "
+            "mint prefers it. If that file is absent while the pod is serving, its "
+            "gateway predates the per-listener credential and only then is the "
+            "shared slot the whole story."
+        )
+    said = f" It said: {detail}" if detail else ""
+    return (
+        "the pod sent no machine-readable cause, so its gateway is older than these "
+        f"codes or its reply could not be read.{said}\n"
+        "  The pod's own security_events.jsonl names the gate in its token.local "
+        "record: resources=non-loopback is transport admission, invalid-secret is "
+        "the secret comparison, and unverified-owner-process is caller provenance. "
+        "On a gateway that old, non-loopback can also mean it predates unix-socket "
+        "admission on /api/token/local and refuses this transport whatever the secret; "
+        f"that cause is repaired by updating the pod's worktree before recreating it: "
+        f"{recreate}. Caller provenance is repaired by neither, and a credential "
+        "mismatch only when no second gateway is live in this pod's home."
+    )
+
+
+def _pod_mint_secret(cfg: PodConfig, name: str, port: int) -> str:
+    """Pod *name*'s internal-API credential for the gateway on *port*.
+
+    Resolution is per LISTENER first, then the shared ``.local_secret``, which is
+    the order :func:`kiro_crew.config.loader.read_local_secret` states as the
+    invariant. That helper cannot be reused here because it resolves against the
+    CALLING process's data home, while this reads a pod's isolated one.
+
+    The order is what keeps the mint honest rather than merely tidy. The shared
+    file holds one slot per data home, and a gateway starting while a sibling is
+    still serving on another port publishes its credential ONLY to the per-port
+    file, leaving the shared slot pointing at the sibling. A caller reading the
+    shared slot then authenticates as one generation while dialling another and
+    is refused, which is indistinguishable at the wire from a secret left behind
+    by an earlier run.
+
+    Raises :class:`PodError` when neither file can be read, naming both.
+    """
+    per_port = _pod_secret_path(cfg, name, port)
+    shared = cfg.home_dir(name) / ".local_secret"
+    for candidate in (per_port, shared):
+        try:
+            secret = candidate.read_text().strip()
+        except OSError:
+            continue
+        if secret:
+            return secret
+    raise PodError(
+        f"no internal-API credential for pod {name!r} — is it running? Looked for "
+        f"{per_port}, then {shared}."
+    )
+
+
+def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
     port = derive_port(cfg, name)
+    secret = _pod_mint_secret(cfg, name, port)
     owner = port_owner(cfg, name, port)
     if owner != OWNER_POD:
         # Positive proof kept even though the send below rides the pod's own
@@ -2316,9 +2493,9 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
     req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
     try:
         # Over the pod's own unix socket, never TCP: this request CARRIES
-        # the pod's `.local_secret`, and the pod's TCP port is ordinary loopback
-        # that any local user can bind the moment the pod releases it — with no
-        # peer-credential API on the wire to tell the squatter from the gateway.
+        # the pod's internal-API credential, and the pod's TCP port is ordinary
+        # loopback that any local user can bind the moment the pod releases it — with
+        # no peer-credential API on the wire to tell the squatter from the gateway.
         # `unix_socket_urlopen` has no TCP handler, so "no fallback" is structural:
         # a missing, stale, or refusing socket raises instead of handing the
         # header to whatever answered. The URL keeps the loopback host so the
@@ -2332,22 +2509,13 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
             token = json.loads(resp.read()).get("token", "")
     except urllib.error.HTTPError as exc:
         if exc.code == 403:
-            # A 403 on this transport has two distinct causes, and only one is
-            # about the caller. Name both, because the operator's next move
-            # differs: a gateway too old to admit AF_UNIX on /api/token/local
-            # refuses EVERY request on this socket regardless of the secret,
-            # and no retry with the right secret can succeed until the pod's
-            # code is updated.
+            # A 403 here is one of three distinct refusals, and the pod says which
+            # in the body it already sends. Report that one: the remedies differ,
+            # and the owner-provenance refusal is not repaired by the recreate the
+            # other two want — a recreate deletes the pod's HOME.
             raise PodError(
                 f"pod {name!r} refused the token mint over its API socket "
-                f"(HTTP 403).\n"
-                f"  If this pod's worktree predates unix-socket admission on "
-                f"/api/token/local, its gateway 403s this transport no matter "
-                f"the secret — update the pod's worktree, then restart it: "
-                f"kirocrew pod down {name} && kirocrew pod up {name}\n"
-                f"  Otherwise the gateway rejected the pod's .local_secret "
-                f"(a stale secret from an earlier run); restarting the pod "
-                f"regenerates both ends.\n"
+                f"(HTTP 403): {_mint_403_cause(exc, name)}\n"
                 f"  Not retried on 127.0.0.1:{port} — the pod's secret must not "
                 f"be sent to a process that is not this pod's gateway."
             ) from exc
@@ -2553,9 +2721,9 @@ def pod_api(
             "the credential would go to whatever answered."
         )
     if not socket_path.exists():
-        # Refuse BEFORE minting: `mint_token` sends the pod's `.local_secret` to
-        # obtain a credential, so a request that cannot be delivered must not pay
-        # for one. Existence is checked only to produce this actionable message
+        # Refuse BEFORE minting: `mint_token` sends the pod's internal-API
+        # credential to obtain one, so a request that cannot be delivered must not
+        # pay for it. Existence is checked only to produce this actionable message
         # -- correctness does not rest on it, because the send below has no TCP
         # path to fall back to if the file disappears in between.
         raise PodError(
@@ -3308,6 +3476,9 @@ def build_pod_env(
     # KIROCREW_PORT above is the target — so drop it unconditionally rather
     # than rely on resolution precedence alone.
     env.pop("KIROCREW_BOUND_PORT", None)
+    # Same cross-plane guard for the companion host evidence (exported only
+    # for specific-interface binds — see dashboard.server).
+    env.pop("KIROCREW_BOUND_HOST", None)
     if skip_model_download:
         # Set AFTER the scrub loop so no present-or-future scrub pattern can strip
         # the guarantee back out.

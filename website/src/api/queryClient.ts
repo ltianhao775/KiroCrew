@@ -48,26 +48,85 @@ export const retryDelayPolicy = (attempt: number, error: unknown): number =>
     : Math.min(1_000 * 2 ** attempt, 30_000)
 
 /**
+ * A client carrying the dashboard's caching policy.
+ *
+ * A factory rather than a shared options object, because there is more than one
+ * client: the dashboard's own singleton below, and one per external app, whose
+ * cache is kept apart from this one. Both must run the same retry ladder and the
+ * same staleness rule, and a factory is what makes that one decision in one
+ * place instead of a literal to keep in sync. Fresh options per call, so no
+ * client can reach another's through a mutated object.
+ */
+export function newQueryClient(): QueryClient {
+  return new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: retryPolicy,
+        retryDelay: retryDelayPolicy,
+        // Infinity: queries never go stale on their own. Freshness is driven
+        // exclusively by WebSocket push (invalidateQueries on server events).
+        // This eliminates the focus-refetch storm (refetchOnWindowFocus only
+        // fires on *stale* queries) without changing the safe default — the
+        // option stays true, so any query that sets a finite staleTime will
+        // still refetch on focus as React Query intends.
+        staleTime: Infinity,
+      },
+    },
+  })
+}
+
+/**
  * Single shared QueryClient instance. Exported so non-React modules (notably
  * api/client.ts's warm-path refresh recovery) can invalidate cached queries
  * such as ['auth-me'] without holding a React context handle. main.tsx passes
  * this same instance to QueryClientProvider, so useQueryClient() hits it too.
+ *
+ * Reachable from host code only. It is absent from the App Kit import map and
+ * from every vendor stub, which is what `appQueryClient.ts` relies on: an
+ * external app cannot import its way back to this cache.
  */
-export const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      retry: retryPolicy,
-      retryDelay: retryDelayPolicy,
-      // Infinity: queries never go stale on their own. Freshness is driven
-      // exclusively by WebSocket push (invalidateQueries on server events).
-      // This eliminates the focus-refetch storm (refetchOnWindowFocus only
-      // fires on *stale* queries) without changing the safe default — the
-      // option stays true, so any query that sets a finite staleTime will
-      // still refetch on focus as React Query intends.
-      staleTime: Infinity,
-    },
-  },
-})
+export const queryClient = newQueryClient()
+
+/**
+ * Clients the host's own recovery paths sweep besides the dashboard's.
+ *
+ * A session lapse breaks queries wherever they live, and an external app's
+ * queries live on a client of that app's own (`app-sdk/appQueryClient.ts`). That
+ * client is deliberately unreachable from an app bundle, and a module-level
+ * export is how host code reaches it without the recovery path importing the app
+ * layer: the app layer registers, the sweep iterates.
+ *
+ * A Set, so a client registered twice is swept once. Nothing unregisters: an app
+ * client lives as long as the document, and so does this module.
+ */
+const registeredClients = new Set<QueryClient>()
+
+/** Include this client in host-driven recovery sweeps. */
+export function registerRecoverableQueryClient(client: QueryClient): void {
+  registeredClients.add(client)
+}
+
+/** The dashboard's client, then every registered one, each listed once. */
+export function recoverableQueryClients(): QueryClient[] {
+  return [...new Set<QueryClient>([queryClient, ...registeredClients])]
+}
+
+/**
+ * Apply one invalidation to every client in the document.
+ *
+ * For a host recovery rule that is about the state a query is IN rather than
+ * about a key: which keys exist differs per client, so a predicate that names a
+ * broken query has to run against each of them or it heals the dashboard and
+ * leaves an app's panel in the error state the lapse put it in.
+ *
+ * Host to app only. An app still reaches nothing of the dashboard's: this is the
+ * host refreshing an app's failed query, not an app touching a host key.
+ */
+export function invalidateAcrossQueryClients(
+  filters: Parameters<QueryClient['invalidateQueries']>[0],
+): void {
+  for (const client of recoverableQueryClients()) void client.invalidateQueries(filters)
+}
 
 type DefaultMemoryMode = 'persistent' | 'incognito' | 'temporary'
 type DashboardConfigMemoryMode = { default_memory_mode?: unknown }

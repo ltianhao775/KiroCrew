@@ -4,8 +4,14 @@
  * pages/settings/ChatPanel.tsx and pages/settings/VoicePanel.tsx.
  */
 import { safeSetItem } from '../../utils/safeStorage'
+import { DEFAULT_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE, MIN_MESSAGE_FONT_SIZE } from './contentWidth'
 
 export type ContentWidth = 'compact' | 'comfortable' | 'full'
+
+/* The font-size bounds live in ./contentWidth (with the width scaling that
+ * needs them) and are re-exported here so importers of the config module keep
+ * one source for everything chat-config shaped. */
+export { DEFAULT_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE, MIN_MESSAGE_FONT_SIZE }
 
 /** Send-key mode: enter (Enter sends), ctrl-enter (Ctrl+Enter sends), enter-ctrl-newline (Enter sends, Ctrl+Enter = newline) */
 export type SendMode = 'enter' | 'ctrl-enter' | 'enter-ctrl-newline'
@@ -52,6 +58,9 @@ export interface ChatConfig {
    *  <name>" affordance those folders have, so it is the user's call rather than
    *  something a client with no stored config inherits. */
   hideEmptyFolderBody: boolean
+  /** Which pane edge hosts the turn minimap. The right-edge variant replaces
+   *  the native scrollbar while the rail is shown. */
+  minimapSide: MinimapSide
   /** Keep a long paste as full editable text in the composer instead of
    *  collapsing it into a `[ Paste #N · M lines ]` chip. Default false: the chip
    *  is what keeps the composer (and the sent bubble) from laying out a
@@ -59,10 +68,19 @@ export interface ChatConfig {
    *  the user's call rather than something a client with no stored config
    *  inherits. Cmd/Ctrl+Shift+V remains the per-paste escape hatch either way. */
   showFullPastes: boolean
+  /** Font size in px for the conversation surface — what the user reads and
+   *  writes: message text, inline and block code, tables, follow-up chips and
+   *  the composer — clamped to [MIN_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE].
+   *  Each element keeps the ratio to body text it has at the default, and the
+   *  Compact content width scales with it (see `scaleContentWidth` in ./contentWidth). Chrome —
+   *  sidebar, session list, status lines, toolbars — is unaffected, same as
+   *  `contentWidth`. */
+  messageFontSize: number
 }
 
 export type FileChipStyle = 'expanded' | 'minimal'
 export type FollowUpLayout = 'multiline' | 'scroll'
+export type MinimapSide = 'left' | 'right'
 /** Per-char streaming entrance animation. 'immediate' restores the pre-buffer
  *  behavior (raw chunk paint + tail glow only). */
 export type StreamMode = 'immediate' | 'smooth'
@@ -77,7 +95,10 @@ const LS_KEY = 'mc-chat-config'
  *  it. The sidebar's view toggle persists this flag BEFORE creating its first
  *  column, so a deliberate board user always has an explicit `true` stored and
  *  is unaffected by the default. */
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false }
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE }
+
+const clampMessageFontSize = (n: number): number =>
+  Math.max(MIN_MESSAGE_FONT_SIZE, Math.min(MAX_MESSAGE_FONT_SIZE, Math.round(n)))
 
 const VALID_FILE_CHIP_STYLES: ReadonlySet<FileChipStyle> = new Set(['expanded', 'minimal'])
 const VALID_FOLLOW_UP_LAYOUTS: ReadonlySet<FollowUpLayout> = new Set(['multiline', 'scroll'])
@@ -121,6 +142,8 @@ export function loadChatConfig(): ChatConfig {
     // string turn off paste collapsing, which is the main-thread guard for a
     // very large paste.
     if (typeof cfg.showFullPastes !== 'boolean') cfg.showFullPastes = false
+    if (cfg.minimapSide !== 'left' && cfg.minimapSide !== 'right') cfg.minimapSide = 'left'
+    cfg.messageFontSize = typeof cfg.messageFontSize === 'number' ? clampMessageFontSize(cfg.messageFontSize) : DEFAULT_MESSAGE_FONT_SIZE
     return cfg
   }
   catch { return { ...DEFAULTS } }

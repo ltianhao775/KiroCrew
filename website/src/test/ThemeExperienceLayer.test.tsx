@@ -730,5 +730,26 @@ describe('ThemeExperienceLayer', () => {
       await userEvent.click(screen.getByRole('button', { name: /enable experience/i }))
       expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-xyz')
     })
+
+    it('does NOT revoke a valid grant on a render-cache Level-1 seed, then honours it once the L2 detail arrives', () => {
+      // Cold load: the render cache seeds the Level-1 projection of an L2 pack
+      // (level capped to 1, personaInfo stripped) before the server detail
+      // arrives. A valid grant for the pack's persona is stored.
+      localStorage.setItem('mc-theme-consent-bikini-bottom', 'sha-abc')
+      setTheme({ level: 1, assets: { branding: { botName: 'Bubbles' } } })
+      const { container, rerender } = render(<ThemeExperienceLayer />)
+      // The seed has no consent to read or revoke: grant intact, no re-prompt.
+      expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-abc')
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(frames(container)).toHaveLength(0)
+      // Server detail lands: full L2 entry with the matching persona sha256.
+      setTheme({ assets: l2Assets({ personaInfo: persona('sha-abc') }) })
+      act(() => {
+        rerender(<ThemeExperienceLayer />)
+      })
+      expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-abc')
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(frames(container).length).toBeGreaterThan(0)
+    })
   })
 })

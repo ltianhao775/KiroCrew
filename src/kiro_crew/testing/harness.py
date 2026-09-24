@@ -908,6 +908,7 @@ def _launch_gateway(
 ) -> subprocess.Popen:
     """Launch only our test gateway; no caller-supplied executable or argv."""
     cmd = platform_compat.isolated_python_argv(
+        "-P",
         "-m",
         "kiro_crew",
         "gateway",

@@ -205,6 +205,28 @@ meets, `connect.mint_token`'s `ttl="6h"` session token, and the two bound differ
 things. `FargateConfig.task_bounds()` is the one place that key name maps onto the
 engine's `ttl_seconds`.
 
+The bound is enforced at TWO points, and the second is the one that reaches the case
+the first cannot. `provision` sweeps the cluster before it launches, which clears a
+leftover from an earlier launch; it cannot reach a cluster whose last launch has
+already happened, so a task leaked by an owner's final launch bills until someone
+reads an invoice. The launcher therefore also derives the same number into the
+`RunTask` container override as `SMC_TASK_TTL_SECONDS`, and the crew supervisor stops
+its essential container once that deadline passes. The task's own deadline needs no
+scheduler, no further launch, and no gateway running. Both points read one number, so
+they cannot name different lifetimes, and the sweep measures from the task's
+`startedAt` while the in-task deadline starts when the supervisor begins waiting --
+earlier, so where a launch does happen the sweep is the one that fires.
+
+Two things an operator should expect from the in-task half. It takes effect only in an
+image that carries it, and the image is digest-pinned in this file, so a task launched
+against an older digest is bounded by the sweep alone until the pin moves. And a task
+that stops itself leaves its crew record behind for the same reason a crash or an
+out-of-memory stop does: the record lives with the gateway, and a container cannot
+reach it.
+
+A lifetime stop is an ORDERLY stop. The supervisor exits zero on it, so an expiry does
+not appear on the console beside a crash loop; the container log names the reason.
+
 The OTHER half of `TaskBounds` is deliberately not operator-reachable.
 `DEFAULT_MAX_RUNNING_TASKS` stays fixed at the engine's value, because
 `fargate_engine` describes it as a ceiling on the population an operator reaches "only
@@ -513,8 +535,10 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
   to an arbitrary role — otherwise a leaked credential could tag a pre-existing
   unbounded `kirocrew-ec2-*` role `kirocrew:managed=true`, then inline admin +
   pass it. `iam:TagRole` is therefore **not** unconditioned in the role-management
-  statement; it is its own statement gated on
-  `aws:ResourceTag/kirocrew:managed=true` (`IamTagRoleOnManaged`). `TagRole` is
+  statement; it is gated on `aws:ResourceTag/kirocrew:managed=true` in the merged
+  `IamPutRolePolicyAndTagRoleOnManaged` statement (which it shares with
+  `PutRolePolicy` — same Effect, role ARN and Condition, combined to keep the
+  policy under IAM's 6,144-char cap). `TagRole` is
   still *required* because CloudFormation's `CreateRole` passes the role's `Tags`
   inline and AWS authorizes that as `iam:TagRole` (`id_tags_roles.html`). The
   gate works because of an empirically-verified asymmetry (least-privilege
@@ -625,13 +649,14 @@ each is a property of a `dict` that a test can state.
 ### What a revision is keyed on
 
 One task-definition family per crew, one revision per (image digest, secret ARN
-set, cpu architecture, log configuration), registered on demand against a cached
-ARN. The key is dictated by the API, not chosen: `RunTask` can override `cpu`,
-`memory`, `ephemeralStorage`, `taskRoleArn`, `executionRoleArn` and a container's
-`command` and `environment`, and it cannot override `image`, `secrets`,
-`logConfiguration` or `runtimePlatform`. Those four are therefore the only fields
-a launch cannot bend at run time, so they are the only ones that can force a new
-revision. Steady state is one API call, two on the first launch of a new digest.
+set, cpu architecture, log configuration, store), registered on demand against a
+cached ARN. The key is dictated by the API, not chosen: `RunTask` can override
+`cpu`, `memory`, `ephemeralStorage`, `taskRoleArn`, `executionRoleArn` and a
+container's `command` and `environment`, and it cannot override `image`,
+`secrets`, `logConfiguration`, `runtimePlatform`, `volumes` or `mountPoints`.
+Those are therefore the only fields a launch cannot bend at run time, so they are
+the only ones that can force a new revision. Steady state is one API call, two on
+the first launch of a new digest.
 
 Two consequences follow. Keying on size is wrong because size is an override, and
 `TaskDefinitionSpec` carries no size field, so it is absent as an input rather
@@ -666,6 +691,61 @@ must be constant for teardown to match it, and the correlation value must vary f
 a caller to find one launch. `ec2.py` already separates them the same way, tagging
 `kirocrew:managed=true` beside `kirocrew:instance=<tag>`; collapsing both into one
 key let a caller's value displace the marker.
+
+### The data home is a declared volume, or the sessions end with the task
+
+A task's own disk is erased when the task stops, and the only storage knob a
+`RunTask` request can set is `ephemeralStorage`, which is that disk. The image is
+built for the other arrangement: it creates `/var/lib/kirocrew/sessions/archive`,
+`artifacts` and `run`, chowns them to its non-root user, and points
+`KIROCREW_HOME`, `SMC_DATA_HOME` and `SMC_CONFIG_DIR` at that directory, so a crew
+that keeps its data home on the task's disk loses every transcript, the session
+archive and the installed bundle the moment it stops -- and comes back looking
+healthy. `volumes` and `mountPoints` exist only on the task **definition**, so the
+definition is the one place the store can be named.
+
+`StoreSpec` names it: an EFS file system id, and optionally an access point id.
+Both are validated where the store is **constructed**, not where the document is
+built, so an unusable id cannot sit inside a spec whose fingerprint a caller then
+computes -- that would be a key for a document that can never be registered. An
+absent id and a malformed one are both refused, and the refusal names the cost
+rather than only the shape, because the field is not obviously load-bearing. Both
+live id lengths are accepted (8 and 17 hex); a re-cased or space-padded value is
+refused rather than repaired, since the account holds exactly one spelling of an
+id and a value needing repair came from somewhere other than the file system it
+names.
+
+`transitEncryption` and IAM authorization are not caller fields. Both are forced
+on. `transitEncryption` defaults to DISABLED at AWS and the traffic is the crew's
+transcripts. Mount authorization without `iam` falls back to the file system's own
+policy plus network reach, so any task that can reach the mount target can mount
+it; with `iam` ENABLED the mount is authorized against the task role, which is
+derived per crew. `accessPointId` is the only part of `authorizationConfig` that
+varies, and an access point additionally fixes the POSIX user the mount operates
+as and scopes what it can see to the access point's own root directory.
+
+The volume and the container's mount point are produced together, or neither is:
+a declared volume no container mounts registers and changes nothing, which is the
+shape a reviewer cannot see. `CREW_DATA_HOME` is the container path, and a test
+reads the image's own `ENV` to pin the two together, because a mount anywhere else
+backs a directory nothing in the task reads and both sides stay valid alone.
+
+Three obligations this leaves elsewhere, named so they are not discovered at first
+launch. **One store per crew, single writer**: the volume mounts the file system
+root, with no `rootDirectory`, so two crews pointed at one file system -- or two
+concurrent tasks of one crew -- share one data home, and their session archives,
+`run/` state and bundles collide with the same no-signal failure this section
+exists to remove. A refusal cannot live here, because the document builder sees one
+spec at a time and never the other crew's; whatever hands out file system ids owes
+each crew its own file system or its own access point. **Root writability**:
+without an access point the file system's own root must already be writable by the
+container's non-root user, which belongs to whatever creates the file system. **The
+role grant**: the per-crew task role needs `elasticfilesystem:ClientMount` and
+`ClientWrite` for that file system, which belongs to whatever creates the roles.
+
+`store` is `None` on every launch the engine builds today: there is no
+configuration home for a file system id yet, so the engine states the ephemeral
+answer explicitly rather than inventing an id.
 
 ### The credential reaches the container through the definition
 
@@ -715,14 +795,21 @@ The refusals, each stated as a property rather than as the case that prompted it
   thought of is not a guarantee, so the channel is closed by set membership and
   this module writes the derived values itself.
 - A name belongs to the closed set when a caller-supplied value could CONTRADICT
-  what the request already asserts, on one of two limbs: it decides **what the
-  task is**, which the spec's secrets fix through the crew they name, or it
+  what the request already asserts, on one of three limbs: it decides **what the
+  task is**, which the spec's secrets fix through the crew they name, it
   decides **who may reach it**, which is the credential set and the trust-domain
-  declaration. `SMC_CREW_NAME` and `SMC_SINGLE_PRINCIPAL` are derived and written
+  declaration, or it decides **what it may cost**, which is the lifetime the
+  launcher also enforces. `SMC_CREW_NAME`, `SMC_SINGLE_PRINCIPAL` and
+  `SMC_TASK_TTL_SECONDS` are derived and written
   here; `SMC_CONTROL_SECRET`, `KIRO_API_KEY`, `SMC_BUNDLE_DIR` and
   `SMC_FRONT_PORT` are refused and never written. Everything else stays the
   caller's: a bucket cannot contradict the spec, because the spec says nothing
   about buckets.
+- `SMC_TASK_TTL_SECONDS` is derived rather than accepted because a caller who could
+  raise it could keep a task past the bound the sweep enforces, which is opting out
+  of a cost cap rather than configuring it. `0` is written when no lifetime is asked
+  for and the container reads that as unbounded, so the variable is always present
+  and its absence never has to be told apart from a launcher that forgot it.
 - Writing `SMC_CREW_NAME` is what gives the container's own
   `manifest crew_name == SMC_CREW_NAME` refusal something to catch. When both
   values came from the caller they could agree with each other while contradicting

@@ -630,6 +630,57 @@ class TestMemberDispatchLoad:
         assert [m for m in logs if "agent.member_dispatch" in m and "not a boolean" in m], logs
 
 
+class TestCrewPanelLoad:
+    """agent.crew_panel load-time coercion.
+
+    The operator ceiling on the crew member's own webview, and the third key on
+    the shared fail-closed loop. A MISSING key defaults to true (the capability's
+    zero-configuration contract), but a PRESENT-but-malformed value -- the routine
+    quoted `"false"` config mistake -- must coerce to FALSE, so a botched opt-out
+    withdraws the grant rather than silently leaving every member able to publish.
+    """
+
+    def test_missing_key_defaults_true(self) -> None:
+        assert _load_from_dict({}).agent.crew_panel is True
+
+    def test_explicit_true_and_false(self) -> None:
+        assert _load_from_dict({"agent": {"crew_panel": True}}).agent.crew_panel is True
+        assert _load_from_dict({"agent": {"crew_panel": False}}).agent.crew_panel is False
+
+    def test_quoted_false_coerces_to_false_not_true(self) -> None:
+        assert _load_from_dict({"agent": {"crew_panel": "false"}}).agent.crew_panel is False
+
+    def test_any_present_non_bool_coerces_to_false(self) -> None:
+        for bad in ("false", "true", "yes", 1, 0, {}, [], None):
+            assert _load_from_dict({"agent": {"crew_panel": bad}}).agent.crew_panel is False, bad
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"crew_panel": False}})
+        reloaded = _load_from_dict(loaded.to_dict())
+        assert reloaded.agent.crew_panel is False
+
+    def test_coercion_says_so_in_the_log(self) -> None:
+        """The shared loop covers this key too, so the signal does as well."""
+        cfg, logs = _load_from_dict_with_logs({"agent": {"crew_panel": "true"}})
+        assert cfg.agent.crew_panel is False
+        assert [m for m in logs if "agent.crew_panel" in m and "not a boolean" in m], logs
+
+    def test_the_three_switches_share_one_loop(self) -> None:
+        """One loop, so no switch can keep the guard while another loses it."""
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "session_control": "false",
+                    "member_dispatch": "false",
+                    "crew_panel": "false",
+                }
+            }
+        )
+        assert cfg.agent.session_control is False
+        assert cfg.agent.member_dispatch is False
+        assert cfg.agent.crew_panel is False
+
+
 class TestFallbackModelLoad:
     """agent.fallback_model flows through the explicit load() kwargs."""
 
@@ -2813,10 +2864,11 @@ class TestSttRetiredProviders:
 
     def test_an_unknown_provider_is_told_what_it_could_have_been(self, caplog) -> None:
         """A typo gets the selectable list; a retired name gets the reason instead,
-        because "mlx is not one of local/apple/transcribe" answers the wrong
-        question for someone who had it working yesterday."""
+        because "mlx is not one of local/apple/transcribe/off" answers the wrong
+        question for someone who had it working yesterday. A typo also lands on
+        ``off`` rather than ``local``: ``test_stt_provider_off`` carries why."""
         with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
-            assert _validated_stt_provider("whispr") == STT_PROVIDER_LOCAL
+            assert _validated_stt_provider("whispr") == "off"
         assert "whispr" in caplog.text
         for selectable in loader_module._VALID_STT_PROVIDERS:
             assert selectable in caplog.text
@@ -2841,16 +2893,18 @@ class TestSttRetiredProviders:
         with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
             assert _validated_stt_provider("whisper") == STT_PROVIDER_LOCAL
             assert _validated_stt_provider("parakeet") == STT_PROVIDER_LOCAL
-            assert _validated_stt_provider("whispr") == STT_PROVIDER_LOCAL
+            assert _validated_stt_provider("whispr") == "off"
         assert "whisper" in caplog.text
         assert "parakeet" in caplog.text
         assert "whispr" in caplog.text
 
     def test_a_non_string_provider_degrades_rather_than_raising(self, tmp_path: Path) -> None:
         """The membership tests take an ``object``, so a hand-edited number or a
-        JSON ``null`` has to fall through to the default instead of a TypeError."""
+        JSON ``null`` has to fall through instead of a TypeError. ``null`` names
+        nothing and is read as the absent key (the default); a number is a value
+        that cannot be honoured and fails closed like any other unknown one."""
         assert _loaded_stt(tmp_path, {"provider": None}).provider == STT_PROVIDER_LOCAL
-        assert _loaded_stt(tmp_path, {"provider": 7}).provider == STT_PROVIDER_LOCAL
+        assert _loaded_stt(tmp_path, {"provider": 7}).provider == "off"
 
 
 class TestSttRemovedFieldsAreInert:
@@ -4642,6 +4696,39 @@ class TestKnowledgeAutoIngest:
             assert key in _EDITABLE_CONFIG, key
 
 
+class TestMemoryPersistenceAndInjectionToggles:
+    """``memory.persistence_enabled`` / ``inject_memory`` / ``inject_lessons``:
+    default on, override reads, junk falls back to the default (``_safe_bool``
+    accepts only real booleans)."""
+
+    def test_defaults_are_on(self) -> None:
+        mc = _load_from_dict({}).memory
+        assert (mc.persistence_enabled, mc.inject_memory, mc.inject_lessons) == (
+            True,
+            True,
+            True,
+        )
+
+    def test_an_empty_memory_section_leaves_every_toggle_on(self) -> None:
+        mc = _load_from_dict({"memory": {}}).memory
+        assert (mc.persistence_enabled, mc.inject_memory, mc.inject_lessons) == (
+            True,
+            True,
+            True,
+        )
+
+    @pytest.mark.parametrize("key", ["persistence_enabled", "inject_memory", "inject_lessons"])
+    def test_false_reads_false(self, key: str) -> None:
+        mc = _load_from_dict({"memory": {key: False}}).memory
+        assert getattr(mc, key) is False
+
+    @pytest.mark.parametrize("key", ["persistence_enabled", "inject_memory", "inject_lessons"])
+    @pytest.mark.parametrize("bad", ["false", 0, 1, None, [], {}])
+    def test_junk_falls_back_to_on(self, key: str, bad: object) -> None:
+        mc = _load_from_dict({"memory": {key: bad}}).memory
+        assert getattr(mc, key) is True
+
+
 class TestKnowledgePoolIdleTtl:
     """``knowledge.pool_idle_ttl_secs`` parsing: default, override, explicit 0,
     and rejection of negative / bool / typed-wrong values back to the default."""
@@ -4879,6 +4966,16 @@ class TestOrchestratorWatchdogThemeAreParsed:
         cfg = _load_from_dict({"dashboard": {"import_onboarded": True}})
         assert cfg.dashboard.import_onboarded is True
         assert cfg.to_dict()["dashboard"]["import_onboarded"] is True
+
+    def test_crewmates_onboarded_defaults_false_for_new_config(self) -> None:
+        assert DashboardConfig().crewmates_onboarded is False
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.crewmates_onboarded is False
+
+    def test_crewmates_onboarded_round_trips(self) -> None:
+        cfg = _load_from_dict({"dashboard": {"crewmates_onboarded": True}})
+        assert cfg.dashboard.crewmates_onboarded is True
+        assert cfg.to_dict()["dashboard"]["crewmates_onboarded"] is True
 
     def test_import_onboarded_string_false_falls_back_without_jsonschema(
         self, monkeypatch: pytest.MonkeyPatch

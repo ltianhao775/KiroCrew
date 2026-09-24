@@ -7,6 +7,7 @@ setup. These are aiohttp-compatible handler functions.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac as _hmac
 import importlib
@@ -38,6 +39,7 @@ from kiro_crew.apps.backend import (
 )
 from kiro_crew.apps.bridges import (
     RegistrationResult,
+    app_conversation_keys,
     deregister_app,
     deregister_app_crons_from_service,
     register_app,
@@ -137,12 +139,51 @@ from kiro_crew.publish_governance import DEPLOY_WEB_PROVIDER_ID, publish_denied_
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
+    scrub_env,
     wrap_argv,
     wrap_argv_async,
 )
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
+
+#: Variables an ``openCommand`` launcher needs in order to reach the running
+#: desktop session, copied through on top of the :func:`minimal_env` allowlist
+#: (which has none of them). Every name here is a LOCATION HINT -- a display
+#: number, an X authority file path, a bus address, a session flavour -- so
+#: copying them widens what the child can FIND, never what it can
+#: authenticate as. Enumerated rather than pattern-matched: a prefix rule over
+#: the parent environment is how a credential reaches an app-authored shell by
+#: accident. ``XDG_RUNTIME_DIR`` is absent because the allowlist already
+#: carries it.
+#:
+#: ``DBUS_SESSION_BUS_ADDRESS`` belongs here, and withholding it would buy
+#: nothing. Three things decide that.
+#:
+#: The sandbox owns it, not this list. ``sandbox._CGROUP_SCOPE_BUS_ENV_KEYS``
+#: pairs it with ``XDG_RUNTIME_DIR`` as the ``systemd-run --user`` wrapper's
+#: OWN dependency: the cgroup ceiling needs the caller's session bus to place
+#: the child in a scope, so both are restored after the credential scrub and
+#: then dropped again INSIDE the scope with an ``env -u`` shim. A sandboxed
+#: child therefore never keeps either one, whatever this list says.
+#:
+#: Dropping the address closes no door anyway. libdbus falls back to
+#: ``$XDG_RUNTIME_DIR/bus``, and ``XDG_RUNTIME_DIR`` is in ``minimal_env``'s
+#: allowlist because it is also where the Wayland socket lives -- so removing
+#: it to close the fallback would break every Wayland launch, which is the
+#: legitimate use this endpoint exists for.
+#:
+#: What is left reaches only the operator's opt-in unconfined mode, where the
+#: same shell can already run any program it likes. Withholding a bus address
+#: from a process that can spawn anything is not a control.
+_OPEN_COMMAND_DESKTOP_ENV_KEYS = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1157,6 +1198,13 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     # Cost: a concurrent same-app lifecycle op waits up to the onUninstall
     # timeout — acceptable, since those ops genuinely conflict and the lock is
     # per-app (other apps are unaffected).
+    #
+    # Counted inside the lock (Step 6) but reported after it, so it is bound
+    # before the block that fills it. The flag rides along because the count alone
+    # cannot be reported: a drop that did not reach disk is a pointer a reinstall
+    # will still resume, and `dropped` on its own reads as a clean sweep.
+    dropped = 0
+    pointer_flush_failed = False
     async with app_lifecycle_lock(name):
         # A retained startup hook still owns the old app's AppContext. Bound the
         # wait and refuse the uninstall if it remains live; deleting files or
@@ -1405,6 +1453,129 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             result = await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), lambda: uninstall_app(name, keep_data=keep_data)
             )
+
+        # Step 6: drop the resume pointer of every conversation the app owned.
+        #
+        # INSIDE the lifecycle lock, and that is the point: this is a step of the
+        # uninstall, not an epilogue to it. Outside, a concurrent reinstall could
+        # take the lock the moment we release it and be serving the SAME slot key
+        # again while our scan is still running — and the pointer we then clear is
+        # the new installation's, not the dead one's. The lock is keyed on the app
+        # name, so it serializes exactly the reinstall that would collide.
+        #
+        # On success only: a failed uninstall leaves nothing changed, so a
+        # still-installed app keeps the pointers its slots are still entitled to
+        # resume. Not in `deregister_app` (Step 3) — that also runs on disable, and
+        # App Store Sync is a disable/enable pair.
+        #
+        # Enumerated AND cleared through the LIVE session map, never a throwaway
+        # `SessionMap`: this gateway holds a long-lived map whose `_data` loaded at
+        # startup and whose every write rewrites the whole file from that snapshot.
+        # Both halves follow from that one fact.
+        #
+        # Writing detached would be undone by the next unrelated mutation —
+        # restoring the very pointer just dropped — and would take whatever the live
+        # map had not flushed with it (`SessionMap`'s rule 3).
+        #
+        # READING detached is the same fact from the other side: the file lags this
+        # map by exactly what it has not flushed, so a detached enumeration can omit
+        # a key whose pointer already exists, and the clear then leaves that pointer
+        # for a reinstall to resume. `mapped_session_keys()` is the in-memory answer;
+        # `session_keys()` adds a key whose allocation is in flight and has not
+        # reached the map yet. Ownership still comes from the metadata line on disk,
+        # which is what survives a closed tab.
+        #
+        # `discard_conversation` tears the live session down, so a still-open tab of
+        # the uninstalled app cannot re-record a sid from the session it was holding.
+        #
+        # ONE pass, and the window it leaves is NAMED rather than narrowed. An
+        # allocation already reserved is inside `session_keys()`, so it is enumerated
+        # here. One that reserves after this pass is not, and no number of passes
+        # reaches it: closing that window means holding admission against this app's
+        # keys for the duration of the uninstall, and the only admission gate on the
+        # manager sets `_closing` PROCESS-WIDE — it would refuse turns for every app
+        # and every conversation while one app uninstalls, which is the larger harm.
+        # A per-key admission gate is a change to the allocation boundary, owned by
+        # whoever owns that boundary, not by this cleanup step. So the residual is
+        # stated here and in the description rather than half-closed by a retry loop
+        # that reads as though it were closed.
+        #
+        # The residual costs one stale pointer on one key of an app the user has
+        # already removed, and the next cold start under that key self-corrects as
+        # soon as the suppression flag is consumed.
+        if result.ok:
+            sessions = getattr(request.app.get("state"), "sessions", None)
+            if sessions is not None:
+                candidates = sessions.mapped_session_keys() | sessions.session_keys()
+                # Ownership reads each candidate's metadata line off disk; off the
+                # loop so a large history does not park the gateway.
+                owned = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(app_conversation_keys, name, mapped_keys=candidates),
+                )
+                for key in owned:
+                    try:
+                        # `replay=False`, not the default: dropping the sid stops the
+                        # NATIVE resume only. The transcript stays on disk by design,
+                        # so a cold start under this key would still have
+                        # `build_session_replay` inject the removed app's history into
+                        # the next installation's first turn — the same bug through a
+                        # second channel. The default `replay=True` actively DISCARDS
+                        # any standing suppression, so leaving it would be worse than
+                        # silent.
+                        try:
+                            await sessions.discard_conversation(key, replay=False)
+                        finally:
+                            # The sid is already gone by the time anything in there can
+                            # raise: `discard_conversation` clears it and sets the
+                            # in-memory flag inside its registry lock, and only THEN
+                            # awaits `provider.shutdown()`, which its own `finally`
+                            # deliberately lets propagate. Skipping this on that path
+                            # leaves the suppression memory-only, so a restart before
+                            # the reinstall replays the removed app's transcript into
+                            # the new installation's first turn — the bug this step
+                            # exists to prevent, reached through the failure path.
+                            #
+                            # Persistently at all, because the flag `replay=False` sets
+                            # lives in this process's memory: a gateway restart between
+                            # the uninstall and the reinstall would lose it.
+                            sessions.suppress_replay_persistently(key)
+                        dropped += 1
+                    except Exception:  # noqa: BLE001 — bookkeeping must not fail an uninstall
+                        logger.warning(
+                            "could not drop the resume pointer for %r", key, exc_info=True
+                        )
+                if owned:
+                    # `owned`, not `dropped`: a key whose teardown raised still had its
+                    # suppression flag written by the `finally` above, and that write is
+                    # only worth anything once it reaches disk.
+                    #
+                    # Durable BEFORE the uninstall reports success, which is the same
+                    # invariant the CLI path states as `flush()` before releasing the
+                    # lock. `clear_sid` on the loop only SCHEDULES a debounced flush,
+                    # so without this the handler answers 200 while the dropped
+                    # pointer is still only in memory — and a restart inside that
+                    # window brings the stale sid back with the app already gone.
+                    #
+                    # Wrapped for the same reason the per-key body above is: by the
+                    # time this runs `uninstall_app` has already removed the app's
+                    # files, so the uninstall is past being retried as a whole. An
+                    # ENOSPC or a permission error here would raise straight out of
+                    # the handler and skip `invalidate_app_secret_cache`,
+                    # `_unregister_notification_channels` and `forget_app_hooks` --
+                    # and a surviving slot-close hook makes the removed app's
+                    # leftover tabs UNDISMISSABLE, which costs the user more than
+                    # the pointer this write failed to persist. The CLI sibling
+                    # states the same rule as `SessionPointerCleanup(failed=True)`.
+                    try:
+                        await sessions.aflush()
+                    except Exception:  # noqa: BLE001 -- bookkeeping must not fail an uninstall
+                        pointer_flush_failed = True
+                        logger.warning(
+                            "could not persist %r's dropped resume pointer(s)",
+                            name,
+                            exc_info=True,
+                        )
     if not result.ok:
         sel().log_api_access(
             caller="dashboard",
@@ -1422,6 +1593,15 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     # leftover tabs UNDISMISSABLE -- `notify_slot_closed` returns False when the
     # hook raises and `api_chat_slot_delete` refuses the close on that.
     forget_app_hooks(name)
+
+    if dropped:
+        if pointer_flush_failed:
+            uninstall_log.append(
+                f"Dropped {dropped} conversation pointer(s) in memory, but the write "
+                "did not persist -- a reinstall may still resume one"
+            )
+        else:
+            uninstall_log.append(f"Dropped {dropped} conversation pointer(s)")
 
     # Step 6: Clean up workspace (each registry app has its own workspace)
     if is_registry_source(info.get("source", "")):
@@ -1928,10 +2108,35 @@ async def handle_open_app(request: web.Request) -> web.Response:
             base_cmd, mode="standard", _prepare=wrap_argv
         )
         sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
+        # The manifest's own shell string runs here, and an installed app is
+        # untrusted content, so this child gets the same ALLOWLIST the install
+        # and build commands from that same manifest get. An allowlist rather
+        # than a denied-key scrub because the set to withhold is open-ended: the
+        # gateway's own model credential is not a channel token and is not named
+        # by any scrub list, so a subtract-the-known-bad environment handed it
+        # straight to the app.
+        #
+        # The allowlist alone cannot launch a desktop app -- it carries no
+        # display, authority-file or bus address -- and this endpoint only
+        # reaches the spawn on a host that HAS a display, so the location hints
+        # in ``_OPEN_COMMAND_DESKTOP_ENV_KEYS`` are copied on top, each only
+        # when the parent actually defines it.
+        # The allowlist is shared with the install and build commands, which run
+        # git against the owner's own repositories, so it carries the SSH agent
+        # socket. A launcher does not need it, and an app-authored shell holding
+        # it authenticates as the operator wherever their keys reach. ``scrub_env``
+        # takes it back out, together with the AWS secret/session pair, the GPG
+        # home and the askpass hook.
+        launch_env = scrub_env(minimal_env())
+        for desktop_key in _OPEN_COMMAND_DESKTOP_ENV_KEYS:
+            desktop_value = os.environ.get(desktop_key)
+            if desktop_value is not None:
+                launch_env[desktop_key] = desktop_value
         proc = await create_subprocess_limited(
             *sandboxed_cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=launch_env,
         )
         # Don't wait — launch is fire-and-forget
         sel().log_api_access(
@@ -3266,6 +3471,7 @@ def _repo_key_owner_count(repo: str) -> int:
     """
     from kiro_crew.apps.registry import (
         _effective_registries,
+        _external_registry_cache_identity,
         _load_registry_file,
         _read_external_registry_cache,
     )
@@ -3278,7 +3484,9 @@ def _repo_key_owner_count(repo: str) -> int:
         ):
             sources += 1
         for reg in _effective_registries():
-            cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
+            cached = _read_external_registry_cache(
+                _external_registry_cache_identity(reg), ignore_ttl=True
+            )
             if any(
                 isinstance(e, dict)
                 and isinstance(e.get("repo"), str)

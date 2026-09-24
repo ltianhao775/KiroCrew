@@ -589,9 +589,9 @@
   },
   {
     "id": "reverse-shell-nc",
-    "pattern": "nc -e.*",
+    "pattern": "(?<![\\w.-])(?<!\\w=)nc\\s+-e",
     "category": "reverse-shell",
-    "description": "Blocks 'nc -e', which spawns a netcat reverse shell handing remote command execution to an attacker."
+    "description": "Blocks 'nc -e', which spawns a netcat reverse shell handing remote command execution to an attacker. Anchored to the `nc` command token -- bare, path-qualified (`/usr/bin/nc`), or after a wrapper or a shell separator -- so an unrelated command that merely ends in the same letters, such as `rsync -e ssh`, is not a reverse shell."
   },
   {
     "id": "reverse-shell-ncat",

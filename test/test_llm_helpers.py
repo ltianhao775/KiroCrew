@@ -461,7 +461,7 @@ class TestStreamAndCollectTransient:
 
     @pytest.mark.asyncio
     async def test_retries_transient_then_succeeds(self) -> None:
-        """Two transient failures, then success — recovered, no shutdown."""
+        """A transient error before any tool activity retries and succeeds."""
         call_count = 0
 
         async def _stream(msg):
@@ -484,6 +484,36 @@ class TestStreamAndCollectTransient:
         assert call_count == 3
         # Transient retries do NOT cancel (no in-flight turn) and never shutdown.
         provider.cancel.assert_not_awaited()
+        provider.shutdown.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tool_activity_before_busy_retry_stays_sticky(self) -> None:
+        """An earlier attempt's tool call blocks a later transient replay."""
+        call_count = 0
+
+        async def _stream(msg):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield LLMEvent(
+                    kind=EVENT_TOOL_CALL,
+                    title="delete customer records",
+                    tool_input={"record_ids": ["record-123"], "confirm": True},
+                )
+                raise AcpPromptBusy("Prompt already in progress")
+            raise AcpError(self._TRANSIENT)
+            yield  # pragma: no cover
+
+        provider = AsyncMock()
+        provider.cancel = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.stream = _stream
+
+        with patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(AcpError):
+            await stream_and_collect(provider, "test")
+
+        assert call_count == 2
+        provider.cancel.assert_awaited_once()
         provider.shutdown.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1247,33 +1277,24 @@ class TestStreamAndCollectThrottleFallback:
 
     @pytest.mark.asyncio
     async def test_completed_tool_call_disables_the_chain(self) -> None:
-        """REGRESSION (review finding): a tool call can complete an EXTERNAL
-        MUTATION before any text streams. The same-model retry (Case 2,
-        pre-existing semantics) still runs, but the fallback chain must NOT
-        replay the original prompt — that would re-run the mutation once per
-        candidate attempt. Any fired tool across any attempt disables the
-        chain and the error surfaces as before the feature."""
-        from kiro_crew.llm_helpers import _TRANSIENT_RETRIES
-
+        """A textless tool mutation blocks same-model and fallback replays."""
         call_count = 0
 
         async def _stream(msg):
             nonlocal call_count
             call_count += 1
-            if call_count == 1:
-                # Tool fires (external mutation completes), then the backend
-                # throttles before any text streams.
-                yield LLMEvent(kind=EVENT_TOOL_CALL, title="mutate-thing")
+            yield LLMEvent(
+                kind=EVENT_TOOL_CALL,
+                title="delete customer records",
+                tool_input={"record_ids": ["record-123"], "confirm": True},
+            )
             raise AcpError(self._TRANSIENT)
-            yield  # pragma: no cover
 
         provider = self._provider(_stream)
         with patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(AcpError):
             await stream_and_collect(provider, "test", fallback_models=["fb-1", "fb-2"])
 
-        # Case 2's same-model budget still applied (pre-existing behavior),
-        # but the chain never engaged: no set_model, no extra replays.
-        assert call_count == _TRANSIENT_RETRIES + 1
+        assert call_count == 1
         provider.set_model.assert_not_awaited()
 
     @pytest.mark.asyncio

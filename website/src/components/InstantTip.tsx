@@ -19,10 +19,12 @@ import { createPortal } from 'react-dom'
  * - Keyboard focus shows synchronously. A tab stop is deliberate in a way a
  *   pointer transit is not, and a keyboard user has no second cursor to wave.
  * - Escape hides while open, without requiring blur.
- * - Any scroll hides while open: the position is captured at show time, so
- *   after a scroll the bubble would sit detached from its anchor. Capture
- *   phase, because the strips that scroll (`overflow-x-auto`) do not bubble
- *   their scroll events to window.
+ * - A scroll that can move the anchor hides while open: the position is
+ *   captured at show time, so after such a scroll the bubble would sit
+ *   detached from its anchor. Capture phase, because the strips that scroll
+ *   (`overflow-x-auto`) do not bubble their scroll events to window. A scroll
+ *   anywhere else in the document leaves the anchor where it was, so the
+ *   bubble stays (see `scrollMovesAnchor`).
  */
 export interface TipPos { top: number; left: number }
 
@@ -31,6 +33,23 @@ export interface TipPos { top: number; left: number }
  *  hook parameter: both consumers want the same feel, and a per-site knob was
  *  surface with zero callers. Exported so tests advance exactly this. */
 export const OPEN_DELAY_MS = 100
+
+/**
+ * Whether a `scroll` event that fired on `target` can have moved `anchor` on
+ * screen: the page itself scrolled (window / document), or a scroll container
+ * the anchor sits inside scrolled. Any other element's scroll leaves the anchor
+ * where it was, so the position captured at show time is still right.
+ *
+ * Fails closed: with no anchor to compare against, an anchor that is no longer
+ * in the document (its element was replaced under the pointer while the bubble
+ * stayed open -- a chip changing shape on a pick does that), or a target that
+ * is not a DOM node, the scroll counts as moving it.
+ */
+export function scrollMovesAnchor(target: EventTarget | null, anchor: HTMLElement | null): boolean {
+  if (!anchor || !anchor.isConnected || target === null || target === window || target === document) return true
+  if (!(target instanceof Node)) return true
+  return target !== anchor && target.contains(anchor)
+}
 
 export function useInstantTip() {
   const [tip, setTip] = useState<TipPos | null>(null)
@@ -63,12 +82,22 @@ export function useInstantTip() {
   useEffect(() => () => cancelPending(), [])
 
   // Escape and scroll dismiss only while open, so the listeners exist only
-  // while open. The rect goes stale the moment anything scrolls; hiding is
+  // while open. The rect goes stale the moment the ANCHOR moves; hiding is
   // strictly better than a bubble stranded at old coordinates.
+  //
+  // Only a scroll that can move the anchor counts: the window/document, or a
+  // scroll container the anchor sits inside. The capture-phase listener also
+  // sees every other scroller in the document -- the transcript re-pinning
+  // after a row re-measures, a sidebar lane re-sorting on a live update, a
+  // side panel following its own tail -- none of which move a chip in the
+  // composer band. Hiding on those reads as the bubble vanishing under a
+  // resting pointer, for no reason the user can see.
   useEffect(() => {
     if (!tip) return
     const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') hide() }
-    const onScroll = () => hide()
+    const onScroll = (e: Event) => {
+      if (scrollMovesAnchor(e.target, anchorRef.current)) hide()
+    }
     window.addEventListener('keydown', onKeyDown)
     window.addEventListener('scroll', onScroll, { capture: true, passive: true })
     return () => {

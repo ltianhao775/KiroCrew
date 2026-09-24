@@ -1501,6 +1501,7 @@ def test_gateway_launcher_fixed_command_and_restart_seed(
             expected = [
                 sys.executable,
                 "-s",
+                "-P",
                 "-m",
                 "kiro_crew",
                 "gateway",

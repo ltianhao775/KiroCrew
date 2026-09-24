@@ -2543,6 +2543,53 @@ async def test_a_quiet_probe_tick_dispatches_zero_turns(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_judge_overriding_a_quiet_probe_is_not_metered_as_a_free_tick(
+    tmp_path, monkeypatch
+):
+    """A tick that DELIVERS must not be booked as one that saved a turn.
+
+    The probe finds nothing and the judge then answers on evidence the probe cannot
+    read, so this tick spends a turn. Charging the free-tick counter and the streak
+    before asking would overstate the saving this feature exists to report, and it
+    would walk a loop that keeps delivering toward a forced floor tick it never earned.
+    """
+    import kiro_crew.autonudge as _an
+
+    fired: list[NudgeLoop] = []
+
+    async def on_fire(loop):
+        fired.append(loop)
+        return True
+
+    monkeypatch.setattr(
+        _an.irq, "poll", lambda *a, **k: _an.irq.Verdict(_an.irq.Outcome.QUIET, "checks running")
+    )
+    service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+    loop = NudgeLoop(
+        id="monitor03j",
+        slot_key="chat-1-123",
+        message="Babysit https://github.com/acme/widgets/pull/42",
+        monitor=_structured_monitor(kind="gh-pr", target="acme/widgets#42"),
+        gate=True,
+    )
+    loop.monitor.quiet_streak = 3
+    service._loops[loop.id] = loop
+
+    async def judge_fires(_loop):
+        return False
+
+    service._judge_tick_is_quiet = judge_fires
+
+    await service._timer(loop, delay=0)
+
+    assert len(fired) == 1, "the judge's answer spends the turn"
+    assert loop.monitor is not None
+    assert loop.monitor.quiet_ticks == 0, "a delivered tick is not a free one"
+    assert loop.monitor.quiet_streak == 0, "and it does not walk toward the floor"
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_a_waking_probe_tick_dispatches_exactly_one_turn(tmp_path, monkeypatch):
     import kiro_crew.autonudge as _an
 

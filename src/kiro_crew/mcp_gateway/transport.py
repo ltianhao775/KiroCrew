@@ -123,7 +123,6 @@ _NMPWAIT_WAIT_FOREVER = 0xFFFFFFFF  # noqa: N806 - Windows API constant
 # ``None``, which is why the check below tests both shapes.
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value  # noqa: N806 - Windows API constant
 _SDDL_REVISION_1 = 1  # noqa: N806 - Windows API constant
-_ERROR_FILE_NOT_FOUND = 2  # noqa: N806 - Windows API constant
 _ERROR_SEM_TIMEOUT = 121  # noqa: N806 - Windows API constant
 _ERROR_PIPE_BUSY = 231  # noqa: N806 - Windows API constant
 

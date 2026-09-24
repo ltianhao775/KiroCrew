@@ -60,7 +60,7 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.loader import config_dir as _config_dir
 
 # This light leaf keeps ``kiro_crew.agent`` off the daemon's boot path.
-from kiro_crew.env import _SPEC_ENV_DENIED_PREFIXES
+from kiro_crew.env import _SPEC_ENV_DENIED_PREFIXES, mcp_search_path, spec_path_key
 from kiro_crew.executors import (
     configure_default_executor,
     maintenance_executor,
@@ -186,8 +186,12 @@ def _spawns_own_control_plane(
     *,
     env: Mapping[str, str] | None = None,
     work_dir: str | os.PathLike[str] | None = None,
+    denial: list[str] | None = None,
 ) -> bool:
     """Whether spawning ``command args`` for *server_name* runs Kiro Crew's own control plane.
+
+    ``denial`` collects the reason a reserved name is refused (see
+    :func:`_deny_control_plane`); the verdict itself is the return value.
 
     The server NAME is not proof: it arrives in the stub's register frame and
     the spawn target resolves separately from the spec-derived
@@ -241,24 +245,28 @@ def _spawns_own_control_plane(
     # once per spawn, not per call.
     from kiro_crew.agent import managed_mcp_spec_entry
 
+    def deny(reason: str) -> bool:
+        return _deny_control_plane(server_name, reason, denial)
+
     expected = managed_mcp_spec_entry(server_name, include_opt_in=True)
     if not expected:
-        return _deny_control_plane(server_name, "no managed spec entry resolves for this name")
+        return deny("no managed spec entry resolves for this name")
     expected_command = str(expected.get("command") or "")
     if not expected_command or not command:
-        return _deny_control_plane(server_name, "spec or spawn command is empty")
+        return deny("spec or spawn command is empty")
     try:
         same_binary = os.path.realpath(command) == os.path.realpath(expected_command)
     except (OSError, ValueError):
-        return _deny_control_plane(server_name, f"command {command!r} is unresolvable")
+        return deny(f"command {command!r} is unresolvable")
     if not same_binary:
-        return _deny_control_plane(
-            server_name, f"spawned {command!r} is not the spec's {expected_command!r}"
-        )
+        return deny(f"spawned {command!r} is not the spec's {expected_command!r}")
     argv = [str(a) for a in args]
     expected_argv = [str(a) for a in expected.get("args", [])]
     if argv != expected_argv:
-        return _deny_control_plane(server_name, f"args {argv!r} differ from spec {expected_argv!r}")
+        # The spawned argv is spec-derived and may carry a token; this reason
+        # travels into the identity_unattested refusal, so it names the count
+        # and the managed argv (ours), never the spawned values.
+        return deny(f"args ({len(argv)}) differ from spec {expected_argv!r}")
     child_env = env if env is not None else os.environ
     loader_env = next(
         (
@@ -270,15 +278,22 @@ def _spawns_own_control_plane(
         "",
     )
     if loader_env:
-        return _deny_control_plane(server_name, f"child environment carries non-empty {loader_env}")
+        return deny(f"child environment carries non-empty {loader_env}")
     shadow = _kiro_crew_import_is_shadowed(command, argv, work_dir)
     if shadow:
-        return _deny_control_plane(server_name, f"import root {shadow!r} shadows kiro_crew")
+        return deny(f"import root {shadow!r} shadows kiro_crew")
     return True
 
 
-def _deny_control_plane(server_name: str, reason: str) -> bool:
-    """Record why a reserved-name backend gets no session token; always False."""
+def _deny_control_plane(server_name: str, reason: str, denial: list[str] | None = None) -> bool:
+    """Record why a reserved-name backend gets no session token; always False.
+
+    ``denial``, when given, receives the reason so the spawn site can pin it on
+    the backend and forward it to that backend's frames
+    (``Backend.control_plane_denial`` -> ``CallerContext.identity_denial``): the
+    log line below is otherwise the ONLY record, and it lands in
+    ``logs/mcp-gatewayd.stdout``, which no session ever shows the operator.
+    """
     logger.warning(
         "mcp-gateway: backend %r spawned under a control-plane name but is denied the "
         "session token: %s; its tools that post back to the gateway for the calling "
@@ -286,6 +301,8 @@ def _deny_control_plane(server_name: str, reason: str) -> bool:
         server_name,
         reason,
     )
+    if denial is not None:
+        denial.append(reason)
     return False
 
 
@@ -311,6 +328,11 @@ def _caller_for_backend(
     if caller is None or conn is None or not conn.stub_session_token:
         return caller
     if not backend.control_plane:
+        # No token. A backend under a RESERVED name is told why, so its refusal
+        # can say what the daemon saw instead of "no token arrived"; a
+        # third-party backend has no denial and gets the bare caller.
+        if backend.control_plane_denial:
+            return dataclasses.replace(caller, identity_denial=backend.control_plane_denial)
         return caller
     return dataclasses.replace(caller, session_token=conn.stub_session_token)
 
@@ -507,11 +529,24 @@ _REGISTER_TIMEOUT_SECS = 5.0
 #                    ``rejected`` frames carry a ``class``. A stub that did not
 #                    see this capability never receives ``queued`` (its
 #                    single-response pre-flight would read it as a rejection).
+#   tenant_nonce   — every registered connection is given a per-connection nonce,
+#                    forwarded in ``params._meta`` on each request, including the
+#                    requests whose caller this daemon cannot name. A stub that
+#                    asked to POOL a server separating unnamed co-tenants by that
+#                    nonce (``POOLING_REQUIRES_TENANT_NONCE``) has no other way to
+#                    tell, and the backend has none either: for an unnamed caller,
+#                    an absent tenant block is equally what a 1:1 topology with no
+#                    gateway looks like, and the two need opposite answers — the
+#                    per-process fallback separates sessions exactly right in the
+#                    first and collapses every co-tenant onto one namespace in the
+#                    second. Same reachability as ``poolable_ack``: a daemon that
+#                    outlived a package upgrade is adopted and serves new stubs.
 REGISTERED_CAPABILITIES: tuple[str, ...] = (
     "ensure_backend",
     "bridge_ping",
     "poolable_ack",
     "spawn_queue",
+    "tenant_nonce",
 )
 
 # Rejection classes carried on ``rejected`` frames. The stub runs
@@ -2411,26 +2446,36 @@ def _conn_index_add(conn: _StubConn) -> None:
 #: binding only costs a re-claim — the identity itself is never invented here.
 _MAX_TOKEN_BINDINGS = 512
 
-#: ``stub_session_token`` -> (caller that owns it, runtime pid the claim named).
+#: ``stub_session_token`` -> (caller, runtime pid the claim named, that pid's
+#: process start token — the recycle guard, since a pid is a reusable NUMBER).
 #: Written ONLY from a ``claim`` frame, which arrives over the uid-gated 0700
 #: socket from the gateway process that minted the token — so a binding is
 #: Crew-authored, never peer-asserted. Read at register time and by
 #: :func:`_apply_claim`, which is what lets one runtime's connections be
 #: re-targeted per SESSION instead of per PID.
-_TOKEN_BINDINGS: "OrderedDict[str, tuple[CallerContext, int]]" = OrderedDict()
+_TOKEN_BINDINGS: "OrderedDict[str, tuple[CallerContext, int, Optional[str]]]" = OrderedDict()
 
 
-def _bind_token(token: str, caller: CallerContext, pid: int) -> None:
-    """Record ``token`` -> *caller* from a claim frame (most recent last)."""
+def _bind_token(
+    token: str, caller: CallerContext, pid: int, pid_start_id: Optional[str] = None
+) -> None:
+    """Record ``token`` -> *caller* from a claim frame (most recent last).
+
+    *pid_start_id* is that pid's start token; ``None`` never denies a resolution.
+    """
     if not token:
         return
     _TOKEN_BINDINGS.pop(token, None)
-    _TOKEN_BINDINGS[token] = (caller, pid)
+    _TOKEN_BINDINGS[token] = (caller, pid, pid_start_id)
     while len(_TOKEN_BINDINGS) > _MAX_TOKEN_BINDINGS:
         _TOKEN_BINDINGS.popitem(last=False)
 
 
-def _token_caller(token: str, attested_pids: Collection[int] = ()) -> Optional[CallerContext]:
+def _token_caller(
+    token: str,
+    attested_pids: Collection[int] = (),
+    pid_start_ids: Optional[dict[int, Optional[str]]] = None,
+) -> Optional[CallerContext]:
     """The session bound to *token*, for a connection the KERNEL places under it.
 
     A claim binds a token TOGETHER WITH the runtime PID it named, and this
@@ -2449,6 +2494,12 @@ def _token_caller(token: str, attested_pids: Collection[int] = ()) -> Optional[C
     the walk from it is gatewayd's own, so the chain cannot be authored by the
     registrant.
 
+    *pid_start_ids* is this connection's register-time snapshot, and supplying it
+    adds the generation term: membership alone lets a binding whose process died
+    be satisfied by whatever inherits its pid NUMBER, which is what the pid factor
+    exists to bound. Only a DEFINITE mismatch denies — an unknown on either side
+    is a match, as on Windows — mirroring the guard in :func:`_apply_claim`.
+
     An empty chain therefore answers ``None`` for a bound token rather than
     trusting it: a connection whose ancestry the kernel did not attest is not
     shown to be under the runtime the claim named. That is not a dead end —
@@ -2462,8 +2513,13 @@ def _token_caller(token: str, attested_pids: Collection[int] = ()) -> Optional[C
     entry = _TOKEN_BINDINGS.get(token)
     if entry is None:
         return None
-    caller, bound_pid = entry
-    return caller if bound_pid in set(attested_pids) else None
+    caller, bound_pid, bound_start_id = entry
+    if bound_pid not in set(attested_pids):
+        return None
+    registered = (pid_start_ids or {}).get(bound_pid)
+    if bound_start_id is not None and registered is not None and registered != bound_start_id:
+        return None
+    return caller
 
 
 def _token_is_unbound(token: str) -> bool:
@@ -2622,7 +2678,9 @@ async def _apply_claim(
         return {"type": "claim-rejected", "reason": reason}
     raw_session_token = frame.get("stub_session_token")
     session_token = raw_session_token if isinstance(raw_session_token, str) else ""
-    _bind_token(session_token, updated_caller, pid)
+    raw_token = frame.get("pid_start_id")
+    claim_token = raw_token if isinstance(raw_token, str) else None
+    _bind_token(session_token, updated_caller, pid, claim_token)
     conns = _CONN_INDEX.get(pid, set())
     if not conns:
         # A claim naming a pid with NO indexed connection is the exact silent
@@ -2653,8 +2711,6 @@ async def _apply_claim(
     # "identity unknown" (Windows, unreadable /proc, legacy claim frames) and
     # MUST count as a match, otherwise every claim on those platforms would
     # be rejected.
-    raw_token = frame.get("pid_start_id")
-    claim_token = raw_token if isinstance(raw_token, str) else None
     # Pass 1: retarget every eligible connection SYNCHRONOUSLY (no awaits)
     # before any eviction runs — see the wrong-principal note below.
     retargeted: list[tuple[Any, str]] = []
@@ -3513,6 +3569,34 @@ async def _handle_connection(
         stub_session_token,
     )
     _conn_index_add(conn)
+    if stub_session_token:
+        # The binding was read before anything could reach this connection, and a
+        # claim landing across the awaits above matches ZERO connections — so the
+        # pre-await reading would stand for life: no identity, or the session the
+        # token was rekeyed away from. Re-ask once the index holds it and take the
+        # answer WHOLE, ``None`` included: a stale name is worse than none, and
+        # nothing revokes one later. Factors unchanged — the attested chain, never
+        # ``indexed_pids``, plus the recycle guard. No eviction is owed: no frame
+        # has been read, so no grant exists under the old name.
+        rebound = _token_caller(stub_session_token, peer_host_pids, conn.pid_start_ids)
+        old_key = caller.session_key if caller is not None else ""
+        new_key = rebound.session_key if rebound is not None else ""
+        caller = rebound
+        conn.caller = rebound
+        if new_key != old_key:
+            _audit_caller_claimed(
+                old_key,
+                new_key,
+                conn.pool_label,
+                "allowed" if rebound is not None else "denied",
+                "" if rebound is not None else "token not claimed from this attested runtime",
+            )
+            logger.info(
+                "stub %s: session binding re-read once indexed — %s (was %s)",
+                stub_uuid,
+                new_key or "<none>",
+                old_key or "<none>",
+            )
 
     # Register this connection for the keepalive probe. Scoped to the handler's
     # own task so a dead transport can cancel exactly the coroutine that is
@@ -4269,6 +4353,18 @@ async def _acquire_backend(
                 pool_key,
             )
         )
+        declared_path_key = spec_path_key(declared)
+        if declared_path_key is not None:
+            declared_path = await asyncio.to_thread(
+                mcp_search_path,
+                declared[declared_path_key],
+            )
+            # The declared VALUE carries the operator's pin; the variable a
+            # child reads is the one the daemon already carries (``PATH`` on
+            # POSIX, where ``Path`` is a distinct variable). Writing under the
+            # spec's spelling would leave a POSIX backend with no PATH at all.
+            declared = {key: value for key, value in declared.items() if key.upper() != "PATH"}
+            spawn_env[spec_path_key(spawn_env) or "PATH"] = declared_path
         accepted_temp_keys: tuple[str, ...] = ()
         if declared:
             # A ``secret://`` temp has no path until resolution. Classifying
@@ -4358,6 +4454,7 @@ async def _acquire_backend(
         # run. Off the loop: the check imports ``kiro_crew.agent``, reads config
         # and stats the filesystem, and a cold spawn must not stall gateway
         # traffic or heartbeats.
+        denial: list[str] = []
         control_plane = await asyncio.to_thread(
             _spawns_own_control_plane,
             pool_key.server_name,
@@ -4365,6 +4462,7 @@ async def _acquire_backend(
             list(args),
             env=spawn_env,
             work_dir=work_dir,
+            denial=denial,
         )
         if control_plane:
             # Defense in depth after the verdict: the fence above already
@@ -4416,6 +4514,7 @@ async def _acquire_backend(
         for _sk in _secret_keys:
             spawn_env.pop(_sk, None)
         backend.control_plane = control_plane
+        backend.control_plane_denial = denial[0] if not control_plane and denial else ""
         # Start the stdout pump immediately so replies to the first
         # forwarded message can route back. The task is owned by the
         # Backend and cancelled at shutdown().

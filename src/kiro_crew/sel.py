@@ -3283,6 +3283,12 @@ def _infer_source(session_key: str) -> str:
     # it binds the parent slot, and the ``slack`` fallback below never claims it.
     if session_key.startswith("side:"):
         return "dashboard"
+    # A reply thread on a crewmate chat message (``dashboard/chat_threads.py``)
+    # runs its isolated turn under ``thread:<slot>:<mid>`` -- the same dashboard
+    # surface as the side chat, keyed apart from the parent slot for the same
+    # reason, and classified here for the same reason.
+    if session_key.startswith("thread:"):
+        return "dashboard"
     if session_key.startswith("cron:"):
         return "cron"
     if session_key.startswith("subagent:"):

@@ -14,10 +14,13 @@ from kiro_crew.monitoring.models import (
     MAX_MONITOR_CHECK_IDENTITY_CHARS,
     MAX_MONITOR_CONDITION_KEY_CHARS,
     MAX_MONITOR_CONDITIONS,
+    PULL_REQUEST_CHECK_FIELDS,
     PULL_REQUEST_MERGEABILITY,
     PULL_REQUEST_MONITOR_KINDS,
     PULL_REQUEST_REVIEW_DECISIONS,
     PULL_REQUEST_STATES,
+    PULL_REQUEST_SUPERSEDED_CHECK_FIELD,
+    PULL_REQUEST_SUPERSEDED_INCOMPLETE_IDENTITY,
     MonitorCondition,
     MonitorObservation,
     MonitorObservationStatus,
@@ -28,7 +31,12 @@ from kiro_crew.monitoring.models import (
 )
 from kiro_crew.security import redact
 
-PULL_REQUEST_CHECK_STATES = frozenset({"failed", "passed", "pending", "unknown"})
+# Every state a provider may report, which is exactly the set of canonical check
+# buckets: the bucket names and the states are one vocabulary, so a state added to
+# one of them cannot go missing from the other.
+PULL_REQUEST_CHECK_STATES = frozenset(
+    (*PULL_REQUEST_CHECK_FIELDS, PULL_REQUEST_SUPERSEDED_CHECK_FIELD)
+)
 MAX_PULL_REQUEST_HEAD_REVISION_CHARS = 128
 
 _URL_IN_CHECK_IDENTITY_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -139,6 +147,12 @@ class PullRequestFacts:
     unresolved_review_threads: int
     review_threads_complete: bool
     checks_complete: bool = True
+    #: A stable digest over the pull request's PR-level (issue) comment bodies,
+    #: or "" when there are none. Provider-specific: only the GitHub adapter reads
+    #: them today. This is the surface a review bot's verdict comment actually
+    #: lives on -- created_at frozen at PR open, body rewritten in place -- so it
+    #: is the digest that catches the four bot verdicts a thread digest cannot see.
+    pr_comment_body_digest: str = ""
 
     def __post_init__(self) -> None:
         if self.kind not in PULL_REQUEST_MONITOR_KINDS:
@@ -171,6 +185,8 @@ class PullRequestFacts:
             raise ValueError("review_threads_complete must be a boolean")
         if not isinstance(self.checks_complete, bool):
             raise ValueError("checks_complete must be a boolean")
+        if not isinstance(self.pr_comment_body_digest, str):
+            raise ValueError("pr_comment_body_digest must be a string")
 
 
 @dataclass(frozen=True)
@@ -252,7 +268,7 @@ def canonical_pull_request_facts(facts: PullRequestFacts) -> dict[str, object]:
     """Project one exact bounded canonical fact object."""
     buckets = {
         state: sorted(check.identity for check in facts.checks if check.state == state)
-        for state in ("failed", "passed", "pending", "unknown")
+        for state in PULL_REQUEST_CHECK_FIELDS
     }
     overflow = not facts.checks_complete or any(
         len(values) > MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET for values in buckets.values()
@@ -265,6 +281,29 @@ def canonical_pull_request_facts(facts: PullRequestFacts) -> dict[str, object]:
             *checks["unknown"][: MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET - 1],
             "checks:incomplete",
         ]
+    # Displaced rows are reported rather than discarded, so the report can show which
+    # rows a suppressed wake was suppressed FOR. They are kept out of the overflow
+    # test above on purpose: they carry no verdict, so however many of them a head
+    # accumulates, every live row is still measured and the board is still complete.
+    # The bucket is written only when it holds something, which is what keeps the
+    # canonical shape -- and so the fingerprint -- unchanged for every other subject.
+    # This is the one place the bucket is cut, and the cut says so: a reader that sees
+    # a saturated list without a sentinel would take it for the whole list, and the
+    # count derived from it for the whole count. The sentinel is spent inside the
+    # bucket instead of on ``checks_complete`` on purpose -- these rows carry no
+    # verdict, so losing some of them leaves the board fully measured.
+    superseded = sorted(
+        check.identity
+        for check in facts.checks
+        if check.state == PULL_REQUEST_SUPERSEDED_CHECK_FIELD
+    )
+    if len(superseded) > MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET:
+        superseded = [
+            *superseded[: MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET - 1],
+            PULL_REQUEST_SUPERSEDED_INCOMPLETE_IDENTITY,
+        ]
+    if superseded:
+        checks[PULL_REQUEST_SUPERSEDED_CHECK_FIELD] = superseded
     if facts.review_decision == "changes_requested":
         blocking_review = "changes_requested"
     elif facts.unresolved_review_threads:
@@ -273,7 +312,7 @@ def canonical_pull_request_facts(facts: PullRequestFacts) -> dict[str, object]:
         blocking_review = "unknown"
     else:
         blocking_review = "none"
-    return {
+    canonical: dict[str, object] = {
         "blocking_review": blocking_review,
         "checks": checks,
         "checks_complete": not overflow,
@@ -287,6 +326,18 @@ def canonical_pull_request_facts(facts: PullRequestFacts) -> dict[str, object]:
         "target": facts.target,
         "unresolved_review_threads": facts.unresolved_review_threads,
     }
+    # Present ONLY when there is a digest to carry, so a subject with no PR-level
+    # comment bodies keeps the exact canonical shape every provider shared before
+    # this field existed -- a hard requirement, because the shape is pinned by
+    # full-dict equality tests and hashed into the fingerprint. It is deliberately
+    # NOT in ``PULL_REQUEST_OBSERVATION_FIELDS``: that list drives the public
+    # projection, which fail-closes on an absent field and would inject an
+    # always-present key into the projected observation. This is a per-condition
+    # wake signal that ``pull_request_conditions`` reads, not a projected public
+    # fact.
+    if facts.pr_comment_body_digest:
+        canonical["pr_comment_body_digest"] = facts.pr_comment_body_digest
+    return canonical
 
 
 def actionable_fingerprint_facts(canonical: Mapping[str, object]) -> dict[str, object]:
@@ -417,6 +468,29 @@ def pull_request_conditions(canonical: Mapping[str, object]) -> tuple[MonitorCon
                 resets_on=MonitorResetsOn.REVISION,
             )
         )
+    comment_digest = canonical.get("pr_comment_body_digest")
+    if isinstance(comment_digest, str) and comment_digest:
+        # The digest is inside the KEY, not only the brief: the engine dedupes
+        # per condition key, so a stable key with a changing brief would be
+        # masked and never wake again. A bot rewrites a verdict comment IN PLACE
+        # -- created_at does not move -- so a count or a newest-timestamp probe
+        # cannot see it, only a digest over the bodies can. WAKE / NEVER: a
+        # comment belongs to the conversation, not the commit, so a force-push
+        # must not replay it (the same reasoning as the two review conditions
+        # above). Fail-closed lives in the provider: it emits "" (so this key is
+        # absent) on an incomplete comment read, so an empty/absent digest is the
+        # incomplete-read signal and no condition is emitted. There is no separate
+        # ``pr_comments_complete`` canonical field because an always-present key
+        # would break the pinned full-canonical shape and the public projection,
+        # and PR-level comment completeness has no bearing on readiness anyway.
+        conditions.append(
+            MonitorCondition(
+                key=f"review_comment_bodies:{comment_digest}",
+                severity=MonitorSeverity.WAKE,
+                brief="pull request comments changed",
+                resets_on=MonitorResetsOn.NEVER,
+            )
+        )
     # Deduplicate by key while keeping order: a provider is free to report two
     # checks under one identity, and two conditions under one key is one
     # condition the engine would mask and age twice.
@@ -442,6 +516,9 @@ def classify_pull_request_facts(
         return MonitorObservationStatus.PENDING, "pull_request_state_unknown"
     if facts.draft:
         return MonitorObservationStatus.PENDING, "pull_request_draft"
+    # Every branch below names the state it reads, so a state none of them names --
+    # a terminal, non-blocking one -- is excluded from actionable AND from pending by
+    # construction: displaced rows neither wake the session nor hold it open.
     check_states = {check.state for check in facts.checks}
     if "failed" in check_states:
         return MonitorObservationStatus.ACTIONABLE, "checks_failed"

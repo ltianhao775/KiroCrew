@@ -12,6 +12,7 @@ black, and no document tells anyone to run it in the form that hurts.
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 from pathlib import Path
 
@@ -180,3 +181,92 @@ def test_black_exiting_one_with_no_findings_is_not_a_clean_tree() -> None:
     # over every recorded path, destroying the ratchet irrecoverably.
     source = SCRIPT.read_text(encoding="utf-8")
     assert "if proc.returncode == 1 and not found:" in source
+
+
+def _stub_black_version(monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+    """Report `version` for black only; other lookups reach the real function,
+    since a narrow stub would hijack pytest's own plugin machinery too."""
+    real = importlib.metadata.version
+
+    def _version(name: str) -> str:
+        return version if name == "black" else real(name)
+
+    monkeypatch.setattr(gate.importlib.metadata, "version", _version)
+
+
+def _pinned_version() -> str:
+    match = gate.BLACK_PIN.search((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert match, "pyproject.toml no longer carries a black== pin for the gate to read"
+    return match.group(1)
+
+
+def test_a_prune_under_the_wrong_black_refuses_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A prune revokes an exemption for good, so a wrong black must not write one.
+    baseline = tmp_path / "black-baseline.txt"
+    gate._write_baseline(baseline, {"kept.py", "graduated.py"})
+    before = baseline.read_bytes()
+
+    _stub_black_version(monkeypatch, "0.0.0-not-the-pin")
+    # Reached only if the guard runs after the scan, which is the ordering bug.
+    monkeypatch.setattr(
+        gate, "_unformatted", lambda targets: pytest.fail("black ran before the version check")
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        gate.main(["--update-baseline", "--baseline", str(baseline)])
+
+    message = str(excinfo.value)
+    # Both versions, so the reader knows which one to change.
+    assert "0.0.0-not-the-pin" in message
+    assert _pinned_version() in message
+    assert baseline.read_bytes() == before, "a refused prune rewrote the baseline anyway"
+
+
+def test_a_prune_refuses_when_pyproject_carries_no_black_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No pin means nothing to verify against, so it fails closed instead.
+    baseline = tmp_path / "black-baseline.txt"
+    gate._write_baseline(baseline, {"kept.py"})
+    before = baseline.read_bytes()
+
+    monkeypatch.setattr(gate, "ROOT", tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[tool.black]\n", encoding="utf-8")
+    monkeypatch.setattr(
+        gate, "_unformatted", lambda targets: pytest.fail("black ran before the version check")
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        gate.main(["--update-baseline", "--baseline", str(baseline)])
+
+    assert "no black== pin" in str(excinfo.value)
+    assert baseline.read_bytes() == before, "a refused prune rewrote the baseline anyway"
+
+
+def test_a_prune_under_the_pinned_black_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other arm: a matching version must not turn the guard into a wall.
+    baseline = tmp_path / "black-baseline.txt"
+    gate._write_baseline(baseline, {"kept.py", "graduated.py"})
+
+    _stub_black_version(monkeypatch, _pinned_version())
+    monkeypatch.setattr(gate, "_unformatted", lambda targets: {"kept.py"})
+
+    assert gate.main(["--update-baseline", "--baseline", str(baseline)]) == 0
+    assert set(gate._read_baseline(baseline)) == {"kept.py"}
+
+
+def test_the_read_only_gate_still_runs_under_a_mismatched_black(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The gate records nothing, so a skew there must not block a drifted black.
+    baseline = tmp_path / "black-baseline.txt"
+    gate._write_baseline(baseline, {"kept.py"})
+
+    _stub_black_version(monkeypatch, "0.0.0-not-the-pin")
+    monkeypatch.setattr(gate, "_unformatted", lambda targets: {"kept.py"})
+
+    assert gate.main(["--baseline", str(baseline)]) == 0

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../api/client'
 import { useAppDispatch } from '../store'
-import { cancelQueuedMessage, editQueuedMessage } from '../store/chatSlice'
+import { cancelQueuedMessage, editQueuedMessage, queueEntryAttachments } from '../store/chatSlice'
 import { restoreQueuedContent } from '../utils/fileTokens'
 import type { ChatMessage } from '../types'
 
@@ -190,13 +190,17 @@ export function useQueuedMessageActions({
       // other tabs). The record is consumed either way; `sent` guards the one
       // same-id hazard (see QueuedSendRecord). No stash hit — a reload,
       // another tab's card, an edited entry — falls to the strict parser,
-      // which claims only byte-exact round-trippable shapes and is never
-      // worse than the verbatim restore this replaced.
+      // handed the entry's own attachment list when the server echoed one
+      // on the row (`meta.files`, the same list a user row carries): with
+      // it the parser matches each own-line marker by exact text, so a
+      // spaced path restores whole; without it the parser claims only
+      // byte-exact round-trippable shapes and is never worse than the
+      // verbatim restore this replaced.
       const stashed = queuedSendStash.get(queueId)
       if (stashed) queuedSendStash.delete(queueId)
       const { text, files } = stashed && stashed.sent === msg.content
         ? { text: stashed.raw, files: stashed.files }
-        : restoreQueuedContent(msg.content)
+        : restoreQueuedContent(msg.content, queueEntryAttachments(msg.meta).files)
       restoreDraftRef.current?.(text, files)
     }
     // Optimistically remove the card; the WS echo is a no-op if already gone.

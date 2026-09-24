@@ -82,6 +82,62 @@ _AUDIT_CALLER = "core:babysit-pr-watch"
 
 _GH_TIMEOUT_SECS = 25
 
+#: Every observation key this probe can emit that WAKES the owning session,
+#: paired with the plain-language name a user-facing text gives it.
+#:
+#: A gated loop's cost promise is only honest while the texts that state it
+#: name exactly this set, so the texts render from here rather than spelling
+#: the set out themselves, and ``test_pr_watch_wake_sources_match_the_``
+#: ``observations_the_probe_builds`` asserts these keys plus
+#: :data:`TERMINAL_SOURCES` are the ones the module's ``Observation`` calls
+#: actually construct. Adding or gating a source therefore fails that test
+#: until one of these maps names it, instead of leaving the texts stale.
+WAKE_SOURCES: tuple[tuple[str, str], ...] = (
+    ("conflict", "a merge conflict"),
+    ("red", "a newly failing check (not one the branch already inherited)"),
+    ("ready", "every check settled green (unless that source is turned off)"),
+    ("comment", "a new comment"),
+    ("review", "a new submitted review"),
+)
+
+#: Observation keys that END the watch rather than waking it.
+#:
+#: Severity.TERMINAL, so naming these among the wake sources would promise a
+#: delivery that never arrives -- the watch is gone by then.
+TERMINAL_SOURCES: tuple[tuple[str, str], ...] = (
+    ("merged", "a merge"),
+    ("closed", "a close"),
+)
+
+
+def _joined(names: list[str]) -> str:
+    """Comma-separate the members, so a member may not carry a comma itself.
+
+    ``test_no_source_name_carries_a_comma`` holds that, because a member with
+    an internal comma renders as two list items and the second one has no
+    referent a reader can resolve.
+    """
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} or {names[1]}"
+    return ", ".join(names[:-1]) + f", or {names[-1]}"
+
+
+def wake_set_phrase() -> str:
+    """The wake set as one clause, for a user-facing text.
+
+    Callers own the sentence around it; this owns only the membership, which
+    is the part that goes stale when the probe grows a source.
+    """
+    return _joined([name for _key, name in WAKE_SOURCES])
+
+
+def terminal_set_phrase() -> str:
+    """The watch-ending set as one clause, for a user-facing text."""
+    return _joined([name for _key, name in TERMINAL_SOURCES])
+
+
 #: The one host a watch message may pin. Not a configuration point: a subject
 #: inferred from a public GitHub URL pins this so a bare ``owner/name`` slug
 #: cannot be re-pointed by an ambient ``GH_HOST``. Choosing an enterprise host

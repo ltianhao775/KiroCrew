@@ -58,6 +58,7 @@ from kiro_crew.monitoring.registry import (
 from kiro_crew.platform import redact_via_context
 from kiro_crew.sel import sel
 from kiro_crew.session_ledger import ledger_key, render_snapshot
+from kiro_crew.validation import ValidationError, validate_judge_spec
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,14 @@ def _redact_monitor_value(value: Any) -> Any:
 
 def _serialize(loop: Any) -> dict[str, Any]:
     payload = asdict(loop)
+    # Read positions, dropped on EVERY projection rather than only the structured
+    # one. A cursor is bookkeeping with no surface: it says nothing a reader could
+    # act on, and it names each watched target, so publishing it discloses the
+    # subject list without any reader being better off. ``asdict`` copies whatever
+    # the dataclass holds, so a judge field joins these reads by existing -- which
+    # is how this one did -- and the drop has to be here rather than in the
+    # structured-monitor filter, which a plain loop never reaches.
+    payload.pop("judge_cursors", None)
     if loop.monitor is None:
         # Legacy clients predate structured monitors and require their exact shape.
         payload.pop("monitor", None)
@@ -189,6 +198,35 @@ _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
         "max_cycles",
         "cycle_count",
         "last_fire_ts",
+        # The wake judge's own state. Withheld from a STRUCTURED monitor's legacy
+        # projection, and each for its own reason rather than as a block. A plain
+        # loop -- which is where a judge actually lives -- does not pass through
+        # this filter at all: it goes through ``_serialize``, which publishes
+        # ``judge``, ``judge_quiet_streak`` and ``judge_last_verdict`` and drops
+        # only ``judge_cursors``. That asymmetry is deliberate and was ruled on: the
+        # popover has to render the brief and the last reading for the owner, and the
+        # brief is the owner's own sentences about their own loop. A structured
+        # monitor is held to the stricter line because its record is owner-scoped
+        # everywhere else it is published.
+        #
+        # * ``judge`` is the owner's brief, carrying their ``wake_when`` /
+        #   ``quiet_when`` prose. Withheld HERE because a structured monitor's
+        #   subject is exactly what this route may not disclose.
+        # * ``judge_cursors`` is bookkeeping with no surface, and it names every
+        #   watched target: withheld on every projection, not just this one.
+        # * ``judge_quiet_streak`` and ``judge_last_verdict`` are the automation's
+        #   own accounting, the same class as ``cycle_count``. The verdict is
+        #   text-free by construction -- an outcome, an item COUNT and a timestamp --
+        #   so it can be published without carrying anything the judge read.
+        # * ``judge_wake_pending`` is a bare boolean -- one owed turn, or none -- and
+        #   names nothing at all. Withheld anyway, for the reason ``judge_quiet_streak``
+        #   is: this route holds a structured monitor to the stricter line, and the
+        #   plain loop that has a popover to render gets it from ``_serialize``.
+        "judge",
+        "judge_cursors",
+        "judge_quiet_streak",
+        "judge_last_verdict",
+        "judge_wake_pending",
     }
 )
 
@@ -901,6 +939,22 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
             {"error": "gate must be a boolean", "code": "not_a_boolean"}, status=400
         )
     gate = False if raw_gate is None else raw_gate
+    # Validated HERE, not at the chokepoint. `authorize_and_add_nudge` takes the
+    # brief through unchanged and says so: it owns the banner cap and the redaction
+    # passes but deliberately not this, because a refusal has to name the field the
+    # owner can fix and only the surface they typed it at can do that. This route is
+    # such a surface, so it runs the same `validate_judge_spec` the monitor_start
+    # tool runs rather than forwarding an unchecked object -- an unvalidated brief
+    # reaching the loop record would be the way around that bound.
+    #
+    # And it is ACCEPTED rather than refused, because silently dropping it is the one
+    # outcome that leaves a caller believing a judge is armed when none is.
+    try:
+        judge_spec = validate_judge_spec(body.get("judge"))
+    except ValidationError as exc:
+        return web.json_response(
+            {"error": f"{exc.field}: {exc.message}", "code": "invalid_judge_spec"}, status=400
+        )
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
@@ -914,6 +968,7 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         # and the channel refusal, so a non-string is a 400 from there rather
         # than a silent str() here that would persist "None" as a banner.
         banner=body.get("banner"),
+        judge=judge_spec,
         source="dashboard",
         caller=request.remote or "",
         gate=gate,

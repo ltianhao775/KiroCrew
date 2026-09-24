@@ -123,20 +123,13 @@ class TestContextTrace:
         _write(_isolated_shards, [_row("chat-1", {"memory": 100})])
         assert usage_mod.context_trace("chat-1", 14)["user_chars"] == 0
 
-    def test_estimated_other_is_zero_when_occupancy_unknown(self, _isolated_shards):
-        # No context_used recorded -> peak is 0 -> the remainder is unknowable.
+    def test_peak_is_zero_when_occupancy_unknown(self, _isolated_shards):
         _write(_isolated_shards, [_row("chat-1", {"memory": 100}, used=0)])
         out = usage_mod.context_trace("chat-1", 14)
         assert out["peak_context_used"] == 0
-        assert out["estimated_other_chars"] == 0
+        assert "estimated_other_chars" not in out
 
-    def test_estimated_other_never_negative(self, _isolated_shards):
-        # injected (100000 chars) dwarfs peak_used*4 (40) -> clamp to 0, not <0.
-        _write(_isolated_shards, [_row("chat-1", {"memory": 100_000}, used=10)])
-        assert usage_mod.context_trace("chat-1", 14)["estimated_other_chars"] == 0
-
-    def test_estimated_other_uses_peak_reading_and_char_estimate(self, _isolated_shards):
-        # peak is the MAX context_used across turns; estimate = peak*4 - injected.
+    def test_peak_is_the_largest_reading_across_turns(self, _isolated_shards):
         _write(
             _isolated_shards,
             [
@@ -147,7 +140,8 @@ class TestContextTrace:
         out = usage_mod.context_trace("chat-1", 14)
         assert out["peak_context_used"] == 900
         assert out["injected_chars"] == 200
-        assert out["estimated_other_chars"] == int(900 * 4.0) - 200
+        # Characters and tokens are never combined into one derived number.
+        assert "estimated_other_chars" not in out
 
 
 class TestApiContextTrace:
@@ -190,38 +184,22 @@ class TestApiContextTrace:
             assert len(body["turns"]) == 1
             assert body["turns"][0]["blocks"]["memory"] == 100
             assert body["user_chars"] == 10
-            # Remainder estimate flows through the handler: peak*4 - injected.
-            assert body["estimated_other_chars"] == int(1000 * 4.0) - 110
+            assert body["peak_context_used"] == 1000
+            assert "estimated_other_chars" not in body
 
 
-class TestContextTraceBilling:
-    """Billing rides the same shard row: credits/duration_ms join each turn."""
+class TestContextTraceCarriesNoBilling:
+    """The trace answers "what was injected"; billing has its own reader."""
 
-    def test_turn_carries_credits_and_duration(self, _isolated_shards):
+    def test_billing_fields_on_the_row_do_not_reach_the_turn(self, _isolated_shards):
         _write(
             _isolated_shards,
             [_row("chat-1", {"memory": 10}, credits=3.5, duration_ms=42_000)],
         )
         turns = usage_mod.context_trace("chat-1")["turns"]
-        assert turns[0]["credits"] == 3.5
-        assert turns[0]["duration_ms"] == 42_000
-
-    def test_missing_billing_is_omitted_not_zeroed(self, _isolated_shards):
-        _write(_isolated_shards, [_row("chat-1", {"memory": 10})])
-        turns = usage_mod.context_trace("chat-1")["turns"]
         assert "credits" not in turns[0]
         assert "duration_ms" not in turns[0]
-
-    def test_unusable_billing_values_are_dropped(self, _isolated_shards):
-        # bool is an int subclass but not a count; NaN predates the persist-side
-        # guard and json.loads accepts it as a bare token. Neither may surface.
-        _write(
-            _isolated_shards,
-            [_row("chat-1", {"memory": 10}, credits=True, duration_ms=float("nan"))],
-        )
-        turns = usage_mod.context_trace("chat-1")["turns"]
-        assert "credits" not in turns[0]
-        assert "duration_ms" not in turns[0]
+        assert turns[0]["total_chars"] == 10
 
 
 class TestApiContextTraceAppDenial:
@@ -277,4 +255,4 @@ class TestApiContextTraceAppDenial:
             resp = await client.get("/api/telemetry/context-trace?slot=chat-1")
             assert resp.status == 200
             body = await resp.json()
-            assert body["turns"][0]["credits"] == 2.0
+            assert body["turns"][0]["blocks"]["memory"] == 100

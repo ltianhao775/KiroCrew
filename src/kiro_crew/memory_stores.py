@@ -30,6 +30,8 @@ from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 
+from kiro_crew import crew_teams
+
 logger = logging.getLogger(__name__)
 
 #: Directory under the data home holding one subdirectory per NAMED store. The
@@ -1439,6 +1441,14 @@ def persist_member_config(
     function has failed; it can neither replace the winner nor adopt another
     store.
 
+    A CREATE also purges the new name from any crew team a deleted crew left
+    it on (``crew_teams.release_for_create``), INSIDE the locked mutation,
+    after the concurrency checks and immediately before the record is written,
+    so the purge and the registration are one critical section on EVERY create
+    path -- the dashboard, the CLI and an app's ``ensure_team`` alike, none can
+    opt out. A purge that cannot be made (``crew_teams.TeamsUnavailable``)
+    aborts the write and propagates.
+
     Updates may name only the fields the caller actually changed, preserving
     concurrent edits to other fields. None retains full-record publication;
     creation always publishes the full record. A new binding must be included.
@@ -1526,6 +1536,8 @@ def persist_member_config(
             ):
                 raise UnknownMemoryStore(f"memory store {store!r} ownership changed concurrently")
             stores[store] = {**(existing or {}), **store_record}
+        if create:
+            crew_teams.release_for_create(member)
         agents[member] = {**(current or {}), **agent_record}
         return data
 

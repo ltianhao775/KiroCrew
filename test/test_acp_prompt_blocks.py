@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew import hooks
+from kiro_crew import hooks, imaging
 from kiro_crew.acp import prompt_blocks
 from kiro_crew.acp.prompt_blocks import (
     _POSIX_PATH_RE,
@@ -38,6 +38,13 @@ def _png(tmp_path, name="shot.png"):
     p = tmp_path / name
     p.write_bytes(_PNG)
     return p
+
+
+def _image_bytes(fmt="PNG", size=(2, 2)):
+    pil = pytest.importorskip("PIL.Image")
+    buf = io.BytesIO()
+    pil.new("RGB", size, (127, 127, 127)).save(buf, format=fmt)
+    return buf.getvalue()
 
 
 class TestBuildPromptBlocks:
@@ -137,6 +144,72 @@ class TestBuildPromptBlocks:
 
     def test_default_cap_is_ten_mib(self):
         assert MAX_IMAGE_BYTES == 10 * 1024 * 1024
+
+
+class TestMediaTypeFromContent:
+    def test_content_wins_over_a_misleading_suffix(self, tmp_path):
+        p = tmp_path / "actually-a-jpeg.png"
+        p.write_bytes(_image_bytes("JPEG"))
+
+        blocks = build_prompt_blocks(f"see {p}")
+
+        assert [block["type"] for block in blocks] == ["text", "image"]
+        assert blocks[1]["mimeType"] == "image/jpeg"
+
+    @pytest.mark.parametrize(
+        "name,raw",
+        [
+            ("notes.png", b"plain text"),
+            ("vector.png", b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
+            ("cut.png", _PNG[:12]),
+        ],
+    )
+    def test_non_raster_or_truncated_content_stays_a_path(self, tmp_path, name, raw):
+        p = tmp_path / name
+        p.write_bytes(raw)
+
+        blocks = build_prompt_blocks(f"see {p}")
+
+        assert [block["type"] for block in blocks] == ["text"]
+        assert str(p) in blocks[0]["text"]
+
+    def test_riff_container_that_is_not_webp_stays_a_path(self, tmp_path):
+        p = tmp_path / "audio.webp"
+        p.write_bytes(b"RIFF" + b"\x00\x00\x00\x00" + b"WAVE" + b"fmt ")
+
+        blocks = build_prompt_blocks(f"see {p}")
+
+        assert [block["type"] for block in blocks] == ["text"]
+
+    def test_no_pillow_path_uses_the_sniffed_mime(self, tmp_path, monkeypatch):
+        p = tmp_path / "renamed.png"
+        original = _image_bytes("JPEG")
+        p.write_bytes(original)
+        monkeypatch.setattr(imaging, "_pil", lambda: None)
+
+        blocks = build_prompt_blocks(f"see {p}")
+
+        assert blocks[1]["mimeType"] == "image/jpeg"
+        assert base64.b64decode(blocks[1]["data"]) == original
+
+    def test_downscale_reencodes_by_content_not_by_name(self, tmp_path):
+        p = tmp_path / "big.png"
+        p.write_bytes(_image_bytes("JPEG", (MAX_IMAGE_EDGE_PX + 40, 10)))
+
+        blocks = build_prompt_blocks(f"see {p}")
+
+        assert blocks[1]["mimeType"] == "image/jpeg"
+        assert base64.b64decode(blocks[1]["data"]).startswith(b"\xff\xd8\xff")
+
+    def test_zero_edge_still_corrects_the_wire_mime(self, tmp_path):
+        p = tmp_path / "renamed.png"
+        original = _image_bytes("JPEG")
+        p.write_bytes(original)
+
+        blocks = build_prompt_blocks(f"see {p}", max_image_edge=0)
+
+        assert blocks[1]["mimeType"] == "image/jpeg"
+        assert base64.b64decode(blocks[1]["data"]) == original
 
 
 class TestSensitivePathGate:
@@ -270,7 +343,7 @@ class TestUncProbeGate:
 
     def test_attacker_host_is_refused(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
-            "kiro_crew.config.paths.data_home", lambda: tmp_path / "home"
+            "kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home"
         )
         assert hooks.unc_probe_allowed(r"\\evil\share\x.png") is False
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
@@ -278,7 +351,7 @@ class TestUncProbeGate:
     def test_unc_under_a_unc_data_home_is_allowed(self, monkeypatch):
         """Roaming profile: the data home ITSELF is a UNC share."""
         monkeypatch.setattr(
-            "kiro_crew.config.paths.data_home",
+            "kiro_crew.config.paths.peek_data_home",
             lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
         )
         allowed = hooks.unc_probe_allowed(
@@ -296,7 +369,7 @@ class TestUncProbeGate:
 
     def test_sibling_share_on_same_server_is_refused(self, monkeypatch):
         monkeypatch.setattr(
-            "kiro_crew.config.paths.data_home",
+            "kiro_crew.config.paths.peek_data_home",
             lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
         )
         if os.name == "nt":
@@ -314,7 +387,7 @@ class TestUncProbeGate:
 
     def _patch_roots(self, monkeypatch, tmp_path, agents_dir):
         """Local data home + the given agents dir, isolating the new root."""
-        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", lambda: agents_dir)
 
     def test_unc_kiro_agents_dir_is_allowed(self, monkeypatch, tmp_path):
@@ -363,7 +436,7 @@ class TestUncProbeGate:
 
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", boom)
         monkeypatch.setattr(
-            "kiro_crew.config.paths.data_home",
+            "kiro_crew.config.paths.peek_data_home",
             lambda: Path("//fileserver/home/me/.kiro/crew"),
         )
         assert hooks.unc_probe_allowed("//fileserver/home/me/.kiro/crew/uploads/x.png") is True
@@ -381,10 +454,36 @@ class TestUncProbeGate:
             calls.append(1)
             return Path(self._UNC_KIRO_HOME + "/agents")
 
-        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", counting_agents_dir)
         assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/foo.json") is True
         assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/bar.json") is True
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert len(calls) == 1
+
+    def test_data_home_is_resolved_once_per_configuration(self, monkeypatch, tmp_path):
+        """The data home is the OTHER resolving root, and it needs the same memo.
+
+        ``data_home()`` is cheap only on its default-home branch. With
+        ``KIROCREW_HOME`` set it calls ``_valid_override_home()`` first, on
+        every call, which does ``Path(override).expanduser().resolve()`` --
+        and a roaming profile is precisely when that override names a share, so
+        the per-check cost is an SMB round-trip. ``config_dir()``'s own memo
+        does not cover it: that memo sits behind the predicate.
+
+        Same contract as the agents root above, asserted the same way: the
+        accessor is consulted once per configuration, not once per check.
+        """
+        calls: list[int] = []
+
+        def counting_data_home():
+            calls.append(1)
+            return Path(self._UNC_KIRO_HOME + "/crew")
+
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", counting_data_home)
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", lambda: tmp_path / "agents")
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/crew/uploads/a.png") is True
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/crew/uploads/b.png") is True
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
         assert len(calls) == 1
 
@@ -398,7 +497,7 @@ class TestUncProbeGate:
             calls.append(1)
             raise RuntimeError("no usable home")
 
-        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
         monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", boom)
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
         assert hooks.unc_probe_allowed("//evil/share/y.png") is False

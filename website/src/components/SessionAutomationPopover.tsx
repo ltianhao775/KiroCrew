@@ -109,6 +109,12 @@ function monitorDraft(monitor: StructuredMonitor): Draft {
   }
 }
 
+/** Rebuild the popover's loop shape from the record the session holds.
+ *
+ * Every field is named here, so a field the record gains is invisible to the
+ * popover until it is named here too -- which is why the judge's three ride along
+ * explicitly rather than by spread: the popover draws its judge line from them,
+ * and their absence reads to it as a loop armed with no judge at all. */
 function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
   return {
     id: loop.id,
@@ -121,6 +127,10 @@ function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
     last_fire_ts: loop.lastFireAt,
     next_due_ts: loop.nextDueAt ?? 0,
     ...(loop.stopSentinelPath !== undefined ? { stop_sentinel_path: loop.stopSentinelPath } : {}),
+    ...(loop.judge !== undefined ? { judge: loop.judge } : {}),
+    ...(loop.judge_last_verdict !== undefined
+      ? { judge_last_verdict: loop.judge_last_verdict }
+      : {}),
   }
 }
 

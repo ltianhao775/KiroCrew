@@ -21,6 +21,20 @@ def test_an_orderly_signal_is_success(wired, tmp_path):  # noqa: F811
     assert rc == 0
 
 
+def test_a_spent_lifetime_is_success(wired, tmp_path):  # noqa: F811
+    """The bound working is not an incident.
+
+    A task stopped by its own deadline ran for as long as it was allowed and then
+    stood down. Reporting that as a failure would put an expiry beside a crash loop
+    on the console and leave an operator reading every one of them as a fault.
+    """
+    rc = entry.run(
+        make_settings(tmp_path, bucket=None),
+        wait_for_shutdown=lambda c: entry._LIFETIME_REASON,
+    )
+    assert rc == 0
+
+
 def test_a_crashed_backend_is_a_failure(wired, tmp_path):  # noqa: F811
     """The case the platform has to be able to see."""
     rc = entry.run(

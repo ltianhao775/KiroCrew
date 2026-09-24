@@ -19,10 +19,11 @@ from collections.abc import Iterator
 # identity (PoolKey hashes env).
 KIROCREW_SPAWNED_ENV = "KIROCREW_SPAWNED"
 KIROCREW_SPAWNED_VALUE = "1"
-# Per-spawn incarnation of an agent runtime, set on the root's environment and
+# Per-spawn incarnation of a tree Kiro Crew spawned as its own session leader --
+# an agent runtime, and an app backend -- set on the root's environment and
 # inherited by its whole tree. KIROCREW_SPAWNED says "a Kiro Crew spawned this";
 # this one says WHICH spawn, so a teardown that has lost its root can still tell
-# the root's own tree from a fresh runtime that took the root's recycled pid.
+# the root's own tree from a fresh spawn that took the root's recycled pid.
 KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
 
 # Canonical truthy set for boolean environment variables (KIROCREW_NO_JAIL,
@@ -1318,3 +1319,27 @@ MAX_BANNER_CHARS = 500
 # process whose first ``kiro_crew`` import reached ``artifacts`` before
 # ``validation``. ``artifacts.MAX_CONTENT_BYTES`` is this name, re-exported.
 ARTIFACT_MAX_CONTENT_BYTES = 26_214_400  # 25 MiB
+
+#: Why a tool call was denied, for the in-band notice's cause-specific wording
+#: (``dashboard.state.build_refusal_steer_notice``). Defined in this leaf rather
+#: than in ``dashboard.state`` because the messaging core (``messaging.driver``
+#: and the channel approval deciders) has to name a cause without importing the
+#: dashboard: a decider that lets its prompt expire records
+#: ``DENY_CAUSE_APPROVAL_TIMEOUT`` and the TurnDriver steers that cause before
+#: it rejects. ``dashboard.state`` re-exports every name, so its importers are
+#: unchanged.
+DENY_CAUSE_POLICY = "policy"
+DENY_CAUSE_INVALID_NAME = "invalid_name"
+DENY_CAUSE_HOOK_ERROR = "hook_error"
+DENY_CAUSE_BATCH_CASCADE = "batch_cascade"
+DENY_CAUSE_APPROVAL_TIMEOUT = "approval_timeout"
+DENY_CAUSE_APPROVAL_NO_BUDGET = "approval_no_budget"
+DENY_CAUSE_APPROVAL_UNDELIVERABLE = "approval_undeliverable"
+
+#: Upper bound on the best-effort in-band deny notice steered into a running
+#: turn before a permission rejection goes back on the wire. Every deny site
+#: (dashboard chat runner, native Slack handler, messaging TurnDriver) runs
+#: ``reject_tool`` plus a SEL audit write AFTER the steer, and an unbounded await
+#: on a backpressured ACP stdin would stall the reject that unblocks the turn.
+#: One number so the three surfaces cannot drift apart.
+STEER_NOTICE_BOUND_SECS = 5.0

@@ -39,6 +39,8 @@ const { mockUseTheme, DEFAULT_THEME } = vi.hoisted(() => {
     addCustomTheme: vi.fn(),
     deleteCustomTheme: vi.fn(),
     loadCustomThemes: vi.fn(),
+    installedThemeLoadFailed: false,
+    customThemeDataMap: new Map(),
   }
   return { mockUseTheme: vi.fn(() => DEFAULT_THEME), DEFAULT_THEME }
 })
@@ -454,6 +456,79 @@ describe('DisplayPanel – dropped overrides notice', () => {
   })
 })
 
+describe('DisplayPanel – theme load-error notice', () => {
+  // The provider derives `installedThemeLoadFailed` from the selection, the
+  // catalog and `customThemeDataMap`: true only while the active pack is listed
+  // and its detail is absent, so a failed RELOAD whose last good detail
+  // (render-cache seed or carry-forward) is still applied reads false. The
+  // panel shows the notice on that boolean alone, and its copy must offer a
+  // recovery the pack actually has: reinstall for an installed pack,
+  // edit-or-swap for an editor-created one.
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const INSTALLED_COPY = 'The installed theme could not be loaded. Reinstall it or choose another theme.'
+  const EDITOR_COPY = 'This theme could not be loaded. Choose another theme or edit this one.'
+  const THEMES = [
+    { value: 'default', label: 'Default', custom: false },
+    { value: 'custom-manrope', label: 'Manrope', custom: true, installed: true },
+    { value: 'custom-mine', label: 'Mine', custom: true, installed: false },
+  ]
+
+  it('shows the reinstall copy for an unstyled installed theme', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: true,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.getByText(INSTALLED_COPY)).toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+
+  it('shows the edit-or-swap copy for an unstyled editor-created theme', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-mine',
+      allThemes: THEMES,
+      installedThemeLoadFailed: true,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.getByText(EDITOR_COPY)).toBeInTheDocument()
+    // An editor theme has no install source, so "reinstall" is not a way out.
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+  })
+
+  it('renders no notice when the failed reload left the last good detail applied', () => {
+    // The provider's derived flag is false while the carried-forward detail is
+    // in the map; the panel must not second-guess it into a notice.
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: false,
+      customThemeDataMap: new Map([['manrope', { slug: 'manrope' }]]),
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+
+  it('renders no notice without a load failure', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: false,
+    }))
+    renderWithProviders(<DisplayPanel />)
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+})
+
 describe('DisplayPanel – Font Family picker (OpenDyslexic option)', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
@@ -469,5 +544,40 @@ describe('DisplayPanel – Font Family picker (OpenDyslexic option)', () => {
     expect(screen.getByRole('button', { name: 'Mono' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'OpenDyslexic' })).toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – sidebar session colors', () => {
+  beforeEach(() => { vi.clearAllMocks() })
+
+  // The four sidebar-color controls write straight to the store. The buttons
+  // render their labels as accessible text, so clicking each and reading the
+  // slice back proves the wiring end to end — the fixed-color swatches and the
+  // No color / Auto choices are one exclusive group over the same field.
+  it('dispatches palette, intensity, display mode and default color to the store', () => {
+    const { store } = renderWithProviders(<DisplayPanel />)
+    const state = () => store.getState().dashboard
+
+    fireEvent.click(screen.getByRole('button', { name: 'Gradient' }))
+    expect(state().sessionColorsMode).toBe('gradient')
+    fireEvent.click(screen.getByRole('button', { name: 'Solid Tint' }))
+    expect(state().sessionColorsMode).toBe('tint')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Vivid' }))
+    expect(state().sessionColorsIntensity).toBe('vivid')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Horizon' }))
+    expect(state().sessionColorsPalette).toBe('horizon')
+
+    const defaults = within(
+      screen.getByText('Default for New Sessions').parentElement as HTMLElement,
+    )
+    fireEvent.click(defaults.getByRole('button', { name: 'Auto' }))
+    expect(state().sessionDefaultColor).toBe('auto')
+    fireEvent.click(defaults.getByRole('button', { name: 'Color 2' }))
+    expect(state().sessionDefaultColor).toBe(1)
+    expect(defaults.getByRole('button', { name: 'Color 2' })).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(defaults.getByRole('button', { name: 'No color' }))
+    expect(state().sessionDefaultColor).toBeNull()
   })
 })

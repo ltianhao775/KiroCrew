@@ -32,6 +32,7 @@ from kiro_crew import _spawn_exec_shim as shim
 from kiro_crew import sandbox
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
+    RLIMIT_PROFILE_EXTRACTOR,
     RLIMIT_PROFILE_NONE,
     RLIMIT_PROFILE_SESSION_HOST,
     RLIMIT_PROFILE_TOOL,
@@ -108,8 +109,49 @@ class TestShimArgvContract:
         assert shim.main(["--"]) == 127
         assert "no command" in capsys.readouterr().err
 
-    def test_exec_failure_reports_127_not_a_traceback(self, capsys):
+    def test_exec_failure_reports_127_not_a_traceback(self, capsys, monkeypatch):
+        sleeps: list[float] = []
+        monkeypatch.setattr(shim.time, "sleep", sleeps.append)
         assert shim.main(["--", "/nonexistent/binary"]) == 127
+        assert "cannot execute" in capsys.readouterr().err
+        assert sleeps == [shim._EXECV_RETRY_DELAY_S] * (shim._EXECV_RETRY_ATTEMPTS - 1)
+
+    def test_transient_target_absence_is_retried_but_other_errors_are_not(
+        self, capsys, monkeypatch
+    ):
+        calls: list[tuple] = []
+        sleeps: list[float] = []
+        monkeypatch.setattr(shim.time, "sleep", sleeps.append)
+
+        def fake_execv(path, argv):
+            calls.append((path, argv))
+            if len(calls) == 1:
+                raise FileNotFoundError(2, "No such file or directory")
+            raise OSError(13, "Permission denied")
+
+        with patch.object(shim.os, "execv", fake_execv):
+            assert shim.main(["--", "/bin/echo"]) == 127
+        # One retry for the transient miss, then EACCES stops the loop.
+        assert len(calls) == 2
+        assert sleeps == [shim._EXECV_RETRY_DELAY_S]
+        assert "Permission denied" in capsys.readouterr().err
+
+    @posix_only
+    def test_a_terminal_command_missing_is_not_retried(self, capsys, monkeypatch):
+        """The rename-window retry is the runtime spawn's; a terminal command fails fast."""
+        calls: list[tuple] = []
+        sleeps: list[float] = []
+        monkeypatch.setattr(shim.time, "sleep", sleeps.append)
+        monkeypatch.setattr(shim.os, "login_tty", lambda fd: None)
+
+        def fake_execv(path, argv):
+            calls.append((path, argv))
+            raise OSError(2, "No such file or directory")
+
+        with patch.object(shim.os, "execv", fake_execv):
+            assert shim.main(["--ctty-fd=0", "--", "/bin/true"]) == 127
+        assert len(calls) == 1
+        assert sleeps == []
         assert "cannot execute" in capsys.readouterr().err
 
     def test_separator_inside_the_command_is_not_consumed(self):
@@ -117,7 +159,7 @@ class TestShimArgvContract:
 
         def fake_execv(_path, argv):
             calls.append(argv)
-            raise OSError(2, "stop here")
+            raise OSError(13, "stop here")
 
         with patch.object(shim.os, "execv", fake_execv):
             shim.main(["--", "/bin/echo", "--", "--rlimits=bogus"])
@@ -132,7 +174,7 @@ class TestShimArgvContract:
             patch.object(
                 shim.os,
                 "execv",
-                lambda *_a: order.append("exec") or (_ for _ in ()).throw(OSError(2, "x")),
+                lambda *_a: order.append("exec") or (_ for _ in ()).throw(OSError(13, "x")),
             ),
         ):
             shim.main(["--rlimits=RLIMIT_NOFILE:1024", "--oom-bias", "--", "/bin/true"])
@@ -168,7 +210,7 @@ class TestShimArgvContract:
             patch.object(
                 shim.os,
                 "execv",
-                lambda *_a: order.append("exec") or (_ for _ in ()).throw(OSError(2, "x")),
+                lambda *_a: order.append("exec") or (_ for _ in ()).throw(OSError(13, "x")),
             ),
         ):
             shim.main(["--rlimits=RLIMIT_NOFILE:1024", "--chdir-fd=9", "--", "/bin/true"])
@@ -194,12 +236,33 @@ class TestShimArgvContract:
         biased: list[bool] = []
         with (
             patch.object(shim, "_bias_oom_score", lambda: biased.append(True)),
-            patch.object(shim.os, "execv", lambda *_a: (_ for _ in ()).throw(OSError(2, "x"))),
+            patch.object(shim.os, "execv", lambda *_a: (_ for _ in ()).throw(OSError(13, "x"))),
         ):
             shim.main(["--", "/bin/true"])
             assert biased == []
             shim.main(["--oom-bias", "--", "/bin/true"])
             assert biased == [True]
+
+
+@posix_only
+class TestShimRetryEndToEnd:
+    @pytest.mark.asyncio
+    async def test_target_appearing_inside_the_retry_window_is_executed(self, tmp_path):
+        """The defect: the CLI binary is briefly absent mid-spawn, then reappears."""
+        target = tmp_path / "late-bird"
+
+        def create_target() -> None:
+            target.write_text("#!/bin/sh\nexit 0\n")
+            target.chmod(0o755)
+
+        threading.Timer(0.3, create_target).start()
+        proc = await asyncio.create_subprocess_exec(*spawn_shim_argv(), str(target))
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=30)
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+        assert rc == 0
 
 
 # --------------------------------------------------------------------------
@@ -234,6 +297,28 @@ class TestSpawnShimArgv:
         build = [a for a in spawn_shim_argv(RLIMIT_PROFILE_BUILD) if a.startswith("--rlimits=")]
         assert tool != build
         assert f"RLIMIT_NOFILE:{sandbox._BUILD_NOFILE_CEILING}" in build[0]
+
+    def test_extractor_profile_is_a_fixed_memory_and_cpu_ceiling(self):
+        # The document-parser child: RLIMIT_AS on by DEFAULT (the tool profile
+        # leaves it to ``max_memory_mb``, default 0), a CPU cap, the OOM bias --
+        # and no dependence on the operator's ``resource_limits`` block.
+        prefix = spawn_shim_argv(RLIMIT_PROFILE_EXTRACTOR)
+        [spec] = [a for a in prefix if a.startswith("--rlimits=")]
+        assert f"RLIMIT_AS:{sandbox._EXTRACTOR_MAX_AS_BYTES}" in spec
+        assert f"RLIMIT_CPU:{sandbox._EXTRACTOR_MAX_CPU_SECS}" in spec
+        assert f"RLIMIT_NOFILE:{sandbox._EXTRACTOR_MAX_NOFILE}" in spec
+        assert sandbox._EXTRACTOR_MAX_AS_BYTES == 1024 * 1024 * 1024
+        assert "--oom-bias" in prefix
+        tool = [a for a in spawn_shim_argv(RLIMIT_PROFILE_TOOL) if a.startswith("--rlimits=")]
+        assert "RLIMIT_AS:" not in tool[0]
+
+    def test_extractor_fallback_preexec_applies_the_same_ceiling(self, monkeypatch):
+        # The shim-less path carries the same numbers, so a truncated install
+        # does not silently drop the one bound this profile exists for.
+        monkeypatch.setattr(sandbox, "_EXTRACTOR_PREEXEC", sandbox._UNSET)
+        preexec = sandbox._preexec_for_profile(RLIMIT_PROFILE_EXTRACTOR)
+        assert preexec is not None
+        assert preexec is sandbox.extractor_resource_limit_preexec()
 
     def test_policy_free_profile_skips_the_interpreter_hop(self):
         # Nothing to do post-exec: no reason to pay an exec + startup.

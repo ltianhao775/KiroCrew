@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest'
 import { screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
+import { AppIdentityProvider } from '../../app-sdk/identity'
 import { i18nT } from '../../i18n/t'
 import { fmtBytes } from '../../i18n/format'
 import type {
@@ -167,7 +168,14 @@ async function renderDrive(section: 'drive' | 'library' | 'backup' | 'access') {
     : section === 'library' ? <LibrarySection account={ACCOUNT_ID} bucket={driveExists.bucket} />
     : section === 'backup' ? <BackupSection account={ACCOUNT_ID} />
     : <AccessSection account={ACCOUNT_ID} />
-  renderWithProviders(el)
+  // Under the app's own identity, the way `BuiltinAppRoute` mounts these
+  // sections: their queries are keyed through the host, so a bare render
+  // resolves them unprefixed and the cache layout stops being the product's.
+  renderWithProviders(
+    <AppIdentityProvider appId="aws-control" origin="builtin">
+      {el}
+    </AppIdentityProvider>,
+  )
 }
 
 /**
@@ -2794,6 +2802,48 @@ describe('DrivePage sections: per-install backup attribution', () => {
     expect(await screen.findByTestId('backup-install-error')).toHaveTextContent(
       i18nT('apps.awsControl.console.backup_install_rename_failed'),
     )
+  })
+
+  it('keeps the archive rows across a toggle when nothing namespaces the key', async () => {
+    // The ONE case in this file that mounts without an app identity, because the
+    // un-namespaced key IS the subject. The section keeps the rows on screen
+    // while a toggle refetches by finding the account in the PREVIOUS query's
+    // key, and the host decides how many segments sit in front of that account.
+    // An index counted from the front reads the remote-list flag as the account
+    // here, the placeholder is dropped, and the panel holding the toggle
+    // vanishes under the cursor mid-click.
+    //
+    // The co-tenant read is held IN FLIGHT rather than resolved, so the rows can
+    // only still be on screen because the placeholder put them there. Resolving
+    // it would let the refetch land and repaint the same rows for a reason this
+    // case is not testing.
+    stubDrivePresent()
+    const archive = {
+      nightly: false,
+      runs: {},
+      install: { id: INSTALL_ID, label: 'This Mac' },
+      remote: remoteWith({ otherLabel: 'Alice laptop' }),
+    } as BackupStatus
+    vi.mocked(awsControlApi.backup)
+      .mockReset()
+      .mockResolvedValueOnce(archive)
+      .mockResolvedValueOnce(archive)
+      .mockReturnValue(new Promise<BackupStatus>(() => {}))
+    renderWithProviders(<BackupSection account={ACCOUNT_ID} />)
+
+    fireEvent.click(await screen.findByTestId('backup-remote-toggle'))
+    const opened = await screen.findByTestId('backup-archive')
+    const before = within(opened).getAllByTestId('backup-archive-row').length
+    expect(before).toBeGreaterThan(0)
+
+    // A new key: the co-tenant roster costs its own AWS call, so this refetches.
+    fireEvent.click(within(opened).getByRole('switch'))
+    await waitFor(() => expect(awsControlApi.backup).toHaveBeenCalledTimes(3))
+
+    // Same account, so the rows already fetched stay while that call is in
+    // flight -- the rows, not a skeleton, and not an unmounted panel.
+    expect(screen.getByTestId('backup-archive')).toBeTruthy()
+    expect(screen.getAllByTestId('backup-archive-row')).toHaveLength(before)
   })
 })
 

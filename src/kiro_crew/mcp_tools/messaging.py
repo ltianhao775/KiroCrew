@@ -26,7 +26,9 @@ from typing import Any
 from kiro_crew import file_delivery_consent, mcp_core
 from kiro_crew.constants import CHANNEL_OWNER_DM_NAMESPACES
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
+from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.platform import wide_content_is_flagged
 from kiro_crew.security import BINARY_MIME_ALLOWLIST, redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import _SLACK_TS_RE, CHANNEL_ID_RE, CHANNEL_MAX_LEN
 
@@ -397,9 +399,10 @@ def schemas() -> list[dict[str, Any]]:
                 "Slack when the caller's Slack identity permits it. Use "
                 "when you've generated a report, export, artifact, or any "
                 "file the user should receive. Native channel delivery is "
-                "not guaranteed: when this session has no eligible channel "
-                "destination the result says so and the file is reachable "
-                "only from the dashboard. To put an IMAGE inline in a "
+                "not guaranteed: the result reports skips and failures, and "
+                "a Slack-linked session reports a successful Slack upload. "
+                "If neither delivers, the file remains available from the "
+                "dashboard. To put an IMAGE inline in a "
                 "messaging conversation, reference it in your reply as "
                 "![alt](/abs/path) from the session's working directory — "
                 "the channel renderer uploads it as a native picture, which "
@@ -942,13 +945,17 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             error=f"sensitive_filename: {redact(clean_name)}",
         )
         return "Error: filename contains sensitive content. Rename the file first."
-    # For text files, check content for sensitive data; binary files skip this
-    # and validate MIME against the shared BINARY_MIME_ALLOWLIST (deny-by-default).
-    is_text = True
+    # Content is scanned whichever way it decodes: UTF-8 text through ``redact``,
+    # non-UTF-8 bytes through the shared ``binary_content_is_flagged``. Binary
+    # must also carry an allow-listed MIME type (deny-by-default), and that check
+    # runs first so bytes of a type this path refuses outright are never scanned.
+    # ``wide_content_is_flagged`` runs on BOTH branches: NUL-interleaved ASCII is
+    # valid UTF-8, so a wide-encoded credential decodes cleanly and its characters
+    # arrive NUL-separated, which the contiguous-ASCII detectors do not match.
+    flagged = False
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        is_text = False
         guessed = mimetypes.guess_type(clean_name)[0] or ""
         if guessed not in BINARY_MIME_ALLOWLIST:
             mcp_core.sel().log_tool_invocation(
@@ -959,13 +966,9 @@ def file_send(name: str, args: dict[str, Any]) -> str:
                 error=f"binary_mime_not_allowed: {guessed}",
             )
             return f"Error: binary file type not allowed: {guessed or 'unknown'}. Allowed: audio, video, image, PDF."
-        mcp_core.sel().log_tool_invocation(
-            session_key="mcp_core",
-            source="mcp",
-            tool_name="file_send",
-            outcome="info",
-            error="binary_file_skipping_content_scan",
-        )
+        flagged = binary_content_is_flagged(raw)
+    else:
+        flagged = redact(text) != text or wide_content_is_flagged(raw)
     # A positive here is almost always CORRECT -- the reported case (a VPN device
     # private key) matches the PEM branch, the highest-confidence detector in the
     # catalogue -- so the remedy is not a looser scan but an owner who can say
@@ -974,7 +977,7 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     # ``_gate_upload_file``, which does not read the consent store and refuses them
     # regardless (see file_delivery_consent for why that is structural).
     delivered_under_consent = False
-    if is_text and redact(text) != text:
+    if flagged:
         if not file_delivery_consent.is_granted(file_delivery_consent.CLASS_OWNER_DASHBOARD):
             mcp_core.sel().log_tool_invocation(
                 session_key="mcp_core",
@@ -994,6 +997,24 @@ def file_send(name: str, args: dict[str, Any]) -> str:
                 "upload legs can never be granted."
             )
         delivered_under_consent = True
+    dest = mcp_core.outbox_dir() / clean_name
+    try:
+        with dest.open("xb") as f:
+            f.write(raw)
+    except FileExistsError:
+        dest = (
+            mcp_core.outbox_dir()
+            / f"{Path(clean_name).stem}_{uuid.uuid4().hex}{Path(clean_name).suffix}"
+        )
+        dest.write_bytes(raw)
+    if delivered_under_consent:
+        # Emitted once the bytes are on disk. A full outbox or a read-only
+        # workspace is an ordinary operational condition, and only
+        # ``FileExistsError`` is recovered above, so any other write error
+        # propagates from here; a record written before the copy would claim a
+        # consented delivery that never happened and there is no retraction
+        # entry to correct it. Over-reporting a release of flagged content is the
+        # direction an incident review cannot afford.
         mcp_core.sel().log_tool_invocation(
             session_key="mcp_core",
             source="mcp",
@@ -1006,16 +1027,6 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             outcome="delivered",
             detail=f"file_send: {clean_name}",
         )
-    dest = mcp_core.outbox_dir() / clean_name
-    try:
-        with dest.open("xb") as f:
-            f.write(raw)
-    except FileExistsError:
-        dest = (
-            mcp_core.outbox_dir()
-            / f"{Path(clean_name).stem}_{uuid.uuid4().hex}{Path(clean_name).suffix}"
-        )
-        dest.write_bytes(raw)
     mcp_core.sel().log_tool_invocation(
         session_key="mcp_core",
         source="mcp",
@@ -1069,6 +1080,7 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     # native leg first would reroute the file to the linked chat instead of
     # the named Slack channel.
     channel_warning = ""
+    channel_skip_reason = ""
     # Resolve-half of the shared strict gate only: file_send degrades (skips
     # the native channel leg) rather than refusing when identity is absent.
     strict_key, _ = mcp_core.require_strict_session_key("file_send native delivery")
@@ -1090,7 +1102,8 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             # point: without it the caller reads a bare "File sent" and cannot
             # tell a delivery from a dashboard-only copy, so an agent that
             # picked the wrong tool has nothing to correct against.
-            channel_warning = _describe_channel_skip(str(channel_resp["skipped"]))
+            channel_skip_reason = str(channel_resp["skipped"])
+            channel_warning = _describe_channel_skip(channel_skip_reason)
     # Also upload to Slack when the caller's Slack identity permits it.
     #
     # Resolve identity as a THREE-state result (see
@@ -1106,6 +1119,10 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     # tracked channel) because its identity is known and none of those paths
     # broadcast at channel root for an unknown caller.
     identity, thread_ts = mcp_core._classify_slack_identity()
+    # Slack-linked sessions cannot have a native document-channel destination.
+    # Its routine no-destination skip says nothing about the Slack leg below.
+    if identity == "thread" and channel_skip_reason == "no_channel_destination":
+        channel_warning = ""
     slack_warning = ""
     if identity == "unresolved":
         mcp_core.sel().log_tool_invocation(
@@ -1138,6 +1155,11 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             # Same three-state response as the channel leg above, same rule: a
             # skip the endpoint computed and audited must not read as an upload.
             slack_warning = _describe_slack_skip(str(slack_resp["skipped"]))
+        elif slack_resp.get("ok") is True:
+            # ok-without-skipped means the endpoint actually delivered, for
+            # every resolved identity (owner DM, session-map thread, tracked
+            # channel) — not just Slack-linked threads.
+            slack_warning = " (delivered to Slack)"
     msg = f"File sent: {dest.name} ({desc})" if desc else f"File sent: {dest.name}"
     return msg + channel_warning + slack_warning
 

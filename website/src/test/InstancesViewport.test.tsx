@@ -286,7 +286,7 @@ describe('InstancesViewport', () => {
     expect(store.getState().instances.activeId).toBeNull()
   })
 
-  it('the Settings → Remote Instances link returns to Local before navigating (same overlay rule as the hand-off)', async () => {
+  it('the Settings → Remote Crew link returns to Local before navigating (same overlay rule as the hand-off)', async () => {
     // The link soft-navigates the LOCAL SPA, which sits underneath this panel's
     // opaque root overlay while a remote tab is active. Without leaving the
     // remote tab the click looks dead. A modified click opens a new tab and
@@ -313,7 +313,7 @@ describe('InstancesViewport', () => {
     renderWithProviders(<InstancesViewport />, { store })
     expect(await screen.findByText(/Connection error/i)).toBeInTheDocument()
 
-    const link = screen.getByRole('link', { name: /Settings → Remote Instances/ }) as HTMLAnchorElement
+    const link = screen.getByRole('link', { name: /Settings → Remote Crew/ }) as HTMLAnchorElement
     expect(link.getAttribute('href')).toBe('/settings/instances')
 
     fireEvent.click(link, { metaKey: true })
@@ -433,9 +433,9 @@ describe('InstancesViewport', () => {
 
     expect(await screen.findByText(/Connection error/i)).toBeInTheDocument()
     // The full switcher renders atop the panel: Local + the instance tab.
-    const bar = await screen.findByRole('group', { name: /Remote instances/i })
+    const bar = await screen.findByRole('group', { name: /Remote crews/i })
     expect(bar).toBeInTheDocument()
-    await u.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await u.click(screen.getByRole('button', { name: /Switch crew/i }))
     expect(screen.getByRole('menuitemradio', { name: /Local/i })).toBeInTheDocument()
     expect(screen.getByRole('menuitemradio', { name: /Cloud One/i })).toBeInTheDocument()
 
@@ -466,7 +466,7 @@ describe('InstancesViewport', () => {
     })
     renderWithProviders(<InstancesViewport macInset />, { store })
 
-    const bar = await screen.findByRole('group', { name: /Remote instances/i })
+    const bar = await screen.findByRole('group', { name: /Remote crews/i })
     expect(bar.style.paddingLeft).toBe('84px')
   })
 
@@ -522,10 +522,56 @@ describe('InstancesViewport', () => {
 
     expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
     // The full switcher renders atop the overlay: the user can always escape.
-    const bar = await screen.findByRole('group', { name: /Remote instances/i })
+    const bar = await screen.findByRole('group', { name: /Remote crews/i })
     expect(bar).toBeInTheDocument()
     // Not the error panel — no Retry while the load is still in flight.
     expect(screen.queryByText(/Connection error/i)).toBeNull()
+  })
+
+  it('keeps a host drag strip over the loading and connection-error overlays so macOS can still drag the window', async () => {
+    // Regression (macOS window-drag bug): on frameless macOS the window is
+    // dragged SOLELY by `.host-drag-strip` divs, and the per-pane strips are
+    // gated off once an overlay is up. Both the loading overlay and the
+    // error/disconnected panel cover the top band with an opaque `bg-bg` layer
+    // over a still-mounted iframe, so without an overlay strip the title bar
+    // becomes un-draggable while a pane is connecting or has failed. Each
+    // overlay must carry its own `overlay-drag-strip`.
+
+    // Connecting/loading: warm + connected but not yet ready → loading overlay.
+    mockConnectedCd1()
+    const loadingStore = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+    })
+    const { unmount } = renderWithProviders(<InstancesViewport />, { store: loadingStore })
+    expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByTestId('overlay-drag-strip')).toHaveClass('host-drag-strip'))
+    unmount()
+
+    // Connection error: active, non-warm, status error → error panel overlay.
+    vi.mocked(api.listInstances).mockResolvedValue({
+      instances: [
+        {
+          id: 'cd-1',
+          name: 'Cloud One',
+          ssh_host: 'cd-1-alias',
+          remote_port: 7777,
+          local_port: 0,
+          ttl: '20h',
+          remote_bin: '',
+          was_connected: true,
+          status: { instance_id: 'cd-1', state: 'error', error: 'ssh unreachable', remote_port: 7777 },
+        },
+      ],
+      warm_set_cap: 5,
+    })
+    const errorStore = createTestStore({
+      instances: { warm: {}, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store: errorStore })
+    expect(await screen.findByText(/Connection error/i)).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByTestId('overlay-drag-strip')).toHaveClass('host-drag-strip'))
+    // Retry stays clickable under the strip (injected no-drag rule).
+    expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument()
   })
 
   it('suppresses the host drag strips in focus mode so the pane can peek its own chrome', async () => {
@@ -660,6 +706,116 @@ describe('InstancesViewport', () => {
     })
     expect(focusChromeVisible()).toBe(false)
     __resetFocusMode()
+  })
+
+  describe('off-window cursor relay (mc-cursor-away-watch)', () => {
+    // An embedded pane's focus-mode reveal is dismissed on the cursor's DISTANCE
+    // from the window, which only the Electron main process can measure — and a
+    // cross-origin pane has no preload to ask it. The host watches on its behalf.
+    function installBridge() {
+      const bridge = {
+        watches: 0,
+        stops: 0,
+        reply: null as ((away: boolean) => void) | null,
+      }
+      ;(window as Window & { electronAPI?: unknown }).electronAPI = {
+        watchCursorAway: (cb: (away: boolean) => void) => {
+          bridge.watches += 1
+          bridge.reply = cb
+          return () => { bridge.stops += 1; bridge.reply = null }
+        },
+      }
+      return bridge
+    }
+    afterEach(() => { delete (window as Window & { electronAPI?: unknown }).electronAPI })
+
+    const frameFor = (port: number) =>
+      [...document.querySelectorAll('iframe')].find(f => f.src.includes(`:${port}`)) as HTMLIFrameElement
+    const send = (data: unknown, port: number, source: Window | null) =>
+      act(async () => {
+        window.dispatchEvent(new MessageEvent('message', {
+          data, origin: `http://127.0.0.1:${port}`, source,
+        }))
+      })
+    async function renderTwoPanes() {
+      mockConnectedCd1()
+      const store = createTestStore({
+        instances: {
+          warm: { 'cd-1': { port: 7778, token: 'tok' }, 'cd-2': { port: 7779, token: 'tok2' } },
+          activeId: 'cd-1', mru: ['cd-1', 'cd-2'], unread: {}, ready: { 'cd-1': true, 'cd-2': true },
+        },
+      })
+      const view = renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(frameFor(7778)).toBeDefined())
+      await waitFor(() => expect(frameFor(7779)).toBeDefined())
+      // happy-dom never loads a cross-origin frame, so give each iframe a stand-in
+      // window the host can address and a message can name as its source.
+      const fakeWindow = (el: HTMLIFrameElement) => {
+        const w = { postMessage: vi.fn() } as unknown as Window
+        Object.defineProperty(el, 'contentWindow', { configurable: true, get: () => w })
+        return w
+      }
+      const w1 = fakeWindow(frameFor(7778))
+      const w2 = fakeWindow(frameFor(7779))
+      const post1 = vi.mocked(w1.postMessage)
+      const post2 = vi.mocked(w2.postMessage)
+      return { store, view, w1, w2, post1, post2 }
+    }
+    const watch = (id: string) => ({ type: 'mc-cursor-away-watch', v: 1, id })
+
+    it('watches for the active pane and forwards the one answer to its own origin', async () => {
+      const bridge = installBridge()
+      const { w1, post1 } = await renderTwoPanes()
+
+      await send(watch('w-1'), 7778, w1)
+      expect(bridge.watches).toBe(1)
+      expect(post1).not.toHaveBeenCalled()
+
+      act(() => { bridge.reply!(true) })
+      expect(post1).toHaveBeenLastCalledWith(
+        { v: 1, id: 'w-1', type: 'mc-cursor-away', away: true }, 'http://127.0.0.1:7778',
+      )
+      // Never broadcast: every post is addressed to the pane's exact origin.
+      for (const call of post1.mock.calls) expect(call[1]).not.toBe('*')
+    })
+
+    it('ignores a background pane and a request from the wrong frame', async () => {
+      const bridge = installBridge()
+      const { w1, w2, post1, post2 } = await renderTwoPanes()
+
+      // cd-2 is not the pane on screen: no watch, no answer.
+      await send(watch('w-bg'), 7779, w2)
+      // cd-1's origin, but the message came from another frame's window.
+      await send(watch('w-spoof'), 7778, w2)
+      // Right frame, unknown protocol version.
+      await send({ ...watch('w-v2'), v: 2 }, 7778, w1)
+      expect(bridge.watches).toBe(0)
+      expect(post1).not.toHaveBeenCalled()
+      expect(post2).not.toHaveBeenCalled()
+    })
+
+    it('disarms on the pane\'s cancel and on a pane switch', async () => {
+      const bridge = installBridge()
+      const { store, w1 } = await renderTwoPanes()
+
+      await send(watch('w-1'), 7778, w1)
+      // A cancel naming a different watch leaves the live one alone.
+      await send({ type: 'mc-cursor-away-cancel', v: 1, id: 'other' }, 7778, w1)
+      expect(bridge.stops).toBe(0)
+      await send({ type: 'mc-cursor-away-cancel', v: 1, id: 'w-1' }, 7778, w1)
+      expect(bridge.stops).toBe(1)
+
+      await send(watch('w-2'), 7778, w1)
+      expect(bridge.watches).toBe(2)
+      await act(async () => { store.dispatch(setActiveId('cd-2')) })
+      expect(bridge.stops).toBe(2)
+    })
+
+    it('stays silent without a native bridge', async () => {
+      const { w1, post1 } = await renderTwoPanes()
+      await send(watch('w-1'), 7778, w1)
+      expect(post1).not.toHaveBeenCalled()
+    })
   })
 
   it('applies the incoming pane\'s chrome state on switch instead of the outgoing one\'s', async () => {
@@ -1027,7 +1183,7 @@ describe('InstancesViewport', () => {
       vi.useRealTimers()
     }
     // The escape-hatch strip is on the panel (query resolves under real timers).
-    expect(await screen.findByRole('group', { name: /Remote instances/i })).toBeInTheDocument()
+    expect(await screen.findByRole('group', { name: /Remote crews/i })).toBeInTheDocument()
   })
 
   it('Retry after a load timeout force-reloads the iframe even for an identical token', async () => {

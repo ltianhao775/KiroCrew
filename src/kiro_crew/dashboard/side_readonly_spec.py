@@ -251,7 +251,9 @@ def _read_base_spec(base_name: str, project_dir: str | None) -> tuple[dict[str, 
     from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 
     if project_dir:
-        for spec_file in project_agent_files(project_dir):
+        for spec_file in project_agent_files(
+            project_dir, operation="side_readonly_spec", source="dashboard"
+        ):
             if project_agent_name(spec_file) == base_name:
                 data = _read_agent_spec(
                     spec_file, operation="side_readonly_spec", source="dashboard"
@@ -288,7 +290,9 @@ def _refuse_if_shadowed(derived_name: str, target: Path, project_dir: str | None
     from kiro_crew.agent_discovery import project_agent_files, project_agent_name
 
     if project_dir:
-        for spec_file in project_agent_files(project_dir):
+        for spec_file in project_agent_files(
+            project_dir, operation="side_readonly_spec", source="dashboard"
+        ):
             if spec_file.stem == derived_name or project_agent_name(spec_file) == derived_name:
                 raise ReadOnlySpecError(
                     "derived_name_shadowed",

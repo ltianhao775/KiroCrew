@@ -33,11 +33,13 @@ const themeState = {
   onboarded: true,
   importOnboarded: true,
   privacyAcked: true,
+  crewmatesOnboarded: true,
   themeBootReady: false,
   themes: [],
   markOnboarded: vi.fn(),
   markImportOnboarded: vi.fn(),
   markPrivacyAcked: vi.fn(),
+  markCrewmatesOnboarded: vi.fn(),
   setColorTheme: vi.fn(),
   setMode: vi.fn(),
 }

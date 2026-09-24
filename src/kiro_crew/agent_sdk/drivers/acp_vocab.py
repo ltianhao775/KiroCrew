@@ -16,6 +16,7 @@ the import this module replaces.
 
 from __future__ import annotations
 
+from kiro_crew.acp.client import AcpProcessDied
 from kiro_crew.acp.session_handle import NATIVE_CHILD_NOT_RESUMABLE, AcpRequestTimeout
 from kiro_crew.acp.types import (
     EVENT_STRUCTURED_STATUS,
@@ -33,6 +34,7 @@ from kiro_crew.acp.types import (
 )
 
 __all__ = [
+    "is_runtime_death",
     "EVENT_STRUCTURED_STATUS",
     "NATIVE_CHILD_NOT_RESUMABLE",
     "STATUS_EXTENSION_VERSION",
@@ -48,3 +50,16 @@ __all__ = [
     "StructuredStatus",
     "classify_stop_reason",
 ]
+
+
+def is_runtime_death(exc: BaseException) -> bool:
+    """Whether *exc* is the runtime dying under a session's in-flight prompt.
+
+    ``AcpSessionHandle._died`` raises ``AcpProcessDied`` into the prompt that
+    was streaming when the runtime was killed, and the session provider maps
+    the runtime's own ``AcpRuntimeDead`` onto the same class. The sub-agent
+    run loop asks this of an exception it caught while a reap it started was
+    in flight -- "is this the echo of my own teardown?" -- and the answer is
+    a class test that application code must not spell itself.
+    """
+    return isinstance(exc, AcpProcessDied)

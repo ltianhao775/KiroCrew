@@ -48,6 +48,7 @@ from kiro_crew.cloud.fargate.identity import (
     sole_binding,
     task_family,
     task_role_arn,
+    validated_crew_name,
     validated_region,
 )
 from kiro_crew.cloud.fargate.runtask import (
@@ -61,6 +62,7 @@ from kiro_crew.cloud.fargate.runtask import (
     REFUSED_ENV,
     STARTED_BY_MAX,
     TASK_OVERRIDE_KEYS,
+    TASK_TTL_ENV,
     Placement,
     TaskSize,
     derived_environment,
@@ -80,6 +82,7 @@ from kiro_crew.cloud.fargate.taskdef import (
     REGISTRATION_CPU,
     REGISTRATION_MEMORY,
     LogSpec,
+    StoreSpec,
     TaskDefinitionSpec,
     credential_recipient,
     default_log_spec,
@@ -116,7 +119,9 @@ __all__ = [
     "MANAGED_TAG_VALUE",
     "MODEL_CREDENTIAL_ENV",
     "Placement",
+    "StoreSpec",
     "TASK_OVERRIDE_KEYS",
+    "TASK_TTL_ENV",
     "TaskDefinitionSpec",
     "TaskSize",
     "agree",
@@ -137,5 +142,6 @@ __all__ = [
     "task_definition_document",
     "task_family",
     "task_role_arn",
+    "validated_crew_name",
     "validated_region",
 ]

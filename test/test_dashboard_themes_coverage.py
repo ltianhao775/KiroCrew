@@ -63,14 +63,19 @@ def _body(response: web.Response) -> Any:
 
 
 def _request(
-    method: str, path: str, *, body: object = ..., match_info: dict | None = None
+    method: str,
+    path: str,
+    *,
+    body: object = ...,
+    match_info: dict | None = None,
+    headers: dict[str, str] | None = None,
 ) -> web.Request:
     """A real (mocked) aiohttp request.
 
     ``body=None`` models a malformed payload: ``request.json()`` raising is what
     the handlers' ``except Exception -> 400`` branches are written for.
     """
-    req = make_mocked_request(method, path, match_info=match_info or {})
+    req = make_mocked_request(method, path, match_info=match_info or {}, headers=headers or {})
     if body is None:
         req.json = AsyncMock(side_effect=ValueError("not json"))  # type: ignore[method-assign]
     elif body is not ...:
@@ -1221,19 +1226,12 @@ class TestApiThemeDetailGet:
 # ── asset / overlay / topbar serving ───────────────────────────────────────
 
 
-class TestThemeHtmlResponse:
-    def test_carries_the_sandbox_csp_and_nosniff(self) -> None:
-        resp = th._theme_html_response("<div>hi</div>")
-        assert resp.content_type == "text/html"
-        assert resp.headers["X-Content-Type-Options"] == "nosniff"
-        assert resp.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
-
-
-def _asset_request(slug: str, path: str) -> web.Request:
-    return _request(
+def _asset_request(slug: str, path: str, *, headers: dict[str, str] | None = None) -> web.Request:
+    return make_mocked_request(
         "GET",
         f"/api/theme/{slug}/assets/{path}",
         match_info={"slug": slug, "path": path},
+        headers=headers or {},
     )
 
 
@@ -1283,12 +1281,98 @@ class TestApiThemeAsset:
         assert resp.headers["X-Content-Type-Options"] == "nosniff"
         assert resp.headers["Content-Security-Policy"] == th._THEME_ASSET_CSP
 
+    @pytest.mark.asyncio
+    async def test_200_carries_a_weak_etag_and_revalidating_cache_control(
+        self, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
+        resp = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
+        assert resp.status == 200
+        assert resp.headers["ETag"].startswith('W/"')
+        assert resp.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
 
-def _overlay_request(slug: str, oid: str) -> web.Request:
+    @pytest.mark.asyncio
+    async def test_matching_if_none_match_is_a_304_with_the_same_guard_headers(
+        self, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
+        first = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
+        etag = first.headers["ETag"]
+        again = await th.api_theme_asset(
+            _asset_request("lcars", "styles/overrides.css", headers={"If-None-Match": etag})
+        )
+        assert again.status == 304
+        assert again.body is None
+        assert again.headers["ETag"] == etag
+        assert again.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+        assert again.headers["X-Content-Type-Options"] == "nosniff"
+        assert again.headers["Content-Security-Policy"] == th._THEME_ASSET_CSP
+
+    @pytest.mark.asyncio
+    async def test_changed_file_invalidates_the_etag(self, themes_dir: Path) -> None:
+        _make_pack(themes_dir / "lcars")
+        css = themes_dir / "lcars" / "styles" / "overrides.css"
+        _write_text(css, "a{}")
+        first = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
+        stale = first.headers["ETag"]
+        # A reinstall under the same slug replaces the pack in place.
+        _write_text(css, "a{color:red}")
+        again = await th.api_theme_asset(
+            _asset_request("lcars", "styles/overrides.css", headers={"If-None-Match": stale})
+        )
+        assert again.status == 200
+        assert again.body == b"a{color:red}"
+        assert again.headers["ETag"] != stale
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "*",
+            '"{tag}"',  # strong form of the same value: weak comparison matches
+            '"zzz", W/"{tag}"',  # a list, our tag not first
+        ],
+    )
+    async def test_if_none_match_star_strong_and_list_forms_are_304(
+        self, header: str, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
+        first = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
+        tag = th._theme_asset_etag(b"a{}")
+        assert first.headers["ETag"] == f'W/"{tag}"'
+        again = await th.api_theme_asset(
+            _asset_request(
+                "lcars",
+                "styles/overrides.css",
+                headers={"If-None-Match": header.format(tag=tag)},
+            )
+        )
+        assert again.status == 304
+
+    @pytest.mark.asyncio
+    async def test_non_matching_if_none_match_is_a_full_200(self, themes_dir: Path) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
+        resp = await th.api_theme_asset(
+            _asset_request(
+                "lcars", "styles/overrides.css", headers={"If-None-Match": 'W/"abd"'}
+            )
+        )
+        assert resp.status == 200
+        assert resp.body == b"a{}"
+
+
+def _overlay_request(
+    slug: str, oid: str, *, headers: dict[str, str] | None = None
+) -> web.Request:
     return _request(
         "GET",
         f"/api/theme/{slug}/overlay/{oid}",
         match_info={"slug": slug, "id": oid},
+        headers=headers,
     )
 
 
@@ -1335,14 +1419,42 @@ class TestApiThemeOverlay:
         resp = await th.api_theme_overlay(_overlay_request("lcars", "SCANNER"))
         assert resp.status == 200
         assert resp.text == "<div>scan</div>"
+        assert resp.content_type == "text/html"
+        assert resp.charset == "utf-8"
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
         assert resp.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
+        assert resp.headers["ETag"] == 'W/"' + th._theme_asset_etag(b"<div>scan</div>") + '"'
+        assert resp.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+
+    @pytest.mark.asyncio
+    async def test_matching_if_none_match_is_a_304_with_the_sandbox_csp(
+        self, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(
+            themes_dir / "lcars" / "overlays" / "scanner.html", "<div>scan</div>"
+        )
+        first = await th.api_theme_overlay(_overlay_request("lcars", "scanner"))
+        etag = first.headers["ETag"]
+        again = await th.api_theme_overlay(
+            _overlay_request("lcars", "scanner", headers={"If-None-Match": etag})
+        )
+        assert again.status == 304
+        assert again.body is None
+        assert again.headers["ETag"] == etag
+        assert again.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+        assert again.headers["X-Content-Type-Options"] == "nosniff"
+        assert again.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
 
 
-def _topbar_request(slug: str, mode: str) -> web.Request:
+def _topbar_request(
+    slug: str, mode: str, *, headers: dict[str, str] | None = None
+) -> web.Request:
     return _request(
         "GET",
         f"/api/theme/{slug}/topbar/{mode}",
         match_info={"slug": slug, "mode": mode},
+        headers=headers,
     )
 
 
@@ -1387,7 +1499,30 @@ class TestApiThemeTopbar:
         resp = await th.api_theme_topbar(_topbar_request("lcars", "dark"))
         assert resp.status == 200
         assert resp.text == "<div>bar</div>"
+        assert resp.content_type == "text/html"
+        assert resp.charset == "utf-8"
         assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert resp.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
+        assert resp.headers["ETag"] == 'W/"' + th._theme_asset_etag(b"<div>bar</div>") + '"'
+        assert resp.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+
+    @pytest.mark.asyncio
+    async def test_matching_if_none_match_is_a_304_with_the_sandbox_csp(
+        self, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "topbar" / "dark.html", "<div>bar</div>")
+        first = await th.api_theme_topbar(_topbar_request("lcars", "dark"))
+        etag = first.headers["ETag"]
+        again = await th.api_theme_topbar(
+            _topbar_request("lcars", "dark", headers={"If-None-Match": etag})
+        )
+        assert again.status == 304
+        assert again.body is None
+        assert again.headers["ETag"] == etag
+        assert again.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+        assert again.headers["X-Content-Type-Options"] == "nosniff"
+        assert again.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
 
 
 class TestResolveLocalSourceAncestorLinks:

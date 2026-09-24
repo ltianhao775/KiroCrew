@@ -16,9 +16,10 @@ existing suite leaves untouched:
 * ``/api/outbox`` and ``/api/outbox/{filename}`` — listing filters and the
   download refusals.
 * ``/api/reveal`` — the ``action=open`` arms and the no-opener fallback.
-* ``/api/upload`` and ``/api/screenshot`` — the non-macOS refusal and, with a
-  faked ``asyncio.create_subprocess_exec``, the success, cancel and timeout
-  arms. No real process is ever spawned.
+* ``/api/upload`` and ``/api/screenshot`` — the non-macOS refusal, the refusal
+  when the dialog binary does not resolve out of the trusted system directories,
+  and, with a faked ``asyncio.create_subprocess_exec``, the success, cancel and
+  timeout arms. No real process is ever spawned.
 * ``/api/dashboard/config`` — the PUT field validation matrix and the
   cancellation audit arm.
 * ``_content_matches_ext`` / ``_fuzzy_score`` — pure-function branches.
@@ -42,6 +43,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew import atomic_write as atomic_write_mod
@@ -270,7 +272,9 @@ class TestFileRead:
 class TestFileWrite:
     @staticmethod
     def _client_app() -> web.Application:
-        return _app("POST", "/api/file-write", files_mod.api_file_write)
+        # Owner-gated route: the identity is plumbing so these tests stay on the
+        # branch each one names (the gate itself: test_file_write_owner_gate.py).
+        return as_owner(_app("POST", "/api/file-write", files_mod.api_file_write))
 
     @pytest.mark.asyncio
     async def test_writes_content_atomically(self, tmp_path, mock_sel):
@@ -951,6 +955,19 @@ class _FakeProc:
             raise ProcessLookupError
 
 
+@pytest.fixture()
+def trusted_dialog_bin(monkeypatch):
+    """Resolve the dialog binaries without probing this host.
+
+    Both handlers pin their binary to the fixed system directories, and the
+    machine running these tests holds neither one there, so a darwin-simulating
+    test would otherwise land on the unavailable arm instead of the spawn.
+    """
+    monkeypatch.setattr(
+        platform_compat, "trusted_system_bin", lambda name: f"/usr/bin/{name}"
+    )
+
+
 class TestNativePickers:
     @pytest.mark.asyncio
     async def test_upload_is_refused_off_macos(self, mock_sel):
@@ -963,7 +980,43 @@ class TestNativePickers:
                 assert "only available on macOS" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
-    async def test_upload_returns_selected_paths(self, mock_sel):
+    async def test_upload_is_refused_when_osascript_is_not_trusted(self, mock_sel, monkeypatch):
+        """An osascript that does not resolve out of the trusted directories is a
+        refusal, not a bare-name spawn: PATH can lead with an agent-writable
+        directory, so the bare name is exactly what must never run."""
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
+        spawn = AsyncMock()
+        with patch("sys.platform", "darwin"), patch("asyncio.create_subprocess_exec", spawn):
+            async with TestClient(
+                TestServer(_app("POST", "/api/upload", files_mod.api_upload))
+            ) as client:
+                resp = await client.post("/api/upload")
+                assert resp.status == 501
+                body = await resp.json()
+                assert body["code"] == "file_picker_unavailable"
+                assert "unavailable" in body["error"]
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_is_refused_when_screencapture_is_not_trusted(
+        self, mock_sel, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
+        spawn = AsyncMock()
+        with patch("sys.platform", "darwin"), patch("asyncio.create_subprocess_exec", spawn):
+            async with TestClient(
+                TestServer(_app("POST", "/api/screenshot", files_mod.api_screenshot))
+            ) as client:
+                resp = await client.post("/api/screenshot")
+                assert resp.status == 501
+                body = await resp.json()
+                assert body["code"] == "screenshot_unavailable"
+                assert "unavailable" in body["error"]
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upload_returns_selected_paths(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(stdout=b"/Users/x/a.png\n\n/Users/x/b.txt\n")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
@@ -973,10 +1026,10 @@ class TestNativePickers:
                 resp = await client.post("/api/upload")
                 assert resp.status == 200
                 assert (await resp.json())["paths"] == ["/Users/x/a.png", "/Users/x/b.txt"]
-        assert spawn.await_args.args[0] == "osascript"
+        assert spawn.await_args.args[0] == "/usr/bin/osascript"
 
     @pytest.mark.asyncio
-    async def test_upload_cancelled_dialog_returns_no_paths(self, mock_sel):
+    async def test_upload_cancelled_dialog_returns_no_paths(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(stdout=b"\n  \n")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -987,7 +1040,7 @@ class TestNativePickers:
                 assert await resp.json() == {"paths": []}
 
     @pytest.mark.asyncio
-    async def test_upload_timeout_kills_dialog_and_returns_504(self, mock_sel):
+    async def test_upload_timeout_kills_dialog_and_returns_504(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(fail_first=True, kill_raises=True)
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -1010,7 +1063,8 @@ class TestNativePickers:
                 assert "only available on macOS" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
-    async def test_screenshot_returns_captured_path(self, tmp_path, mock_sel, monkeypatch):
+    async def test_screenshot_returns_captured_path(self, tmp_path, mock_sel, monkeypatch,
+                                                    trusted_dialog_bin):
         shots = tmp_path / "screenshots"
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", shots)
         captured: dict[str, tuple] = {}
@@ -1029,13 +1083,13 @@ class TestNativePickers:
                 resp = await client.post("/api/screenshot")
                 assert resp.status == 200
                 path = (await resp.json())["path"]
-        assert captured["argv"][:2] == ("screencapture", "-i")
+        assert captured["argv"][:2] == ("/usr/bin/screencapture", "-i")
         assert Path(path).parent == shots
         assert Path(path).read_bytes().startswith(b"\x89PNG")
 
     @pytest.mark.asyncio
     async def test_screenshot_user_cancel_returns_empty_path(self, tmp_path, mock_sel,
-                                                             monkeypatch):
+                                                             monkeypatch, trusted_dialog_bin):
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_FakeProc())):
@@ -1047,7 +1101,8 @@ class TestNativePickers:
                 assert await resp.json() == {"path": ""}
 
     @pytest.mark.asyncio
-    async def test_screenshot_timeout_returns_504(self, tmp_path, mock_sel, monkeypatch):
+    async def test_screenshot_timeout_returns_504(self, tmp_path, mock_sel, monkeypatch,
+                                                  trusted_dialog_bin):
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
         proc = _FakeProc(fail_first=True)
         with patch("sys.platform", "darwin"), \

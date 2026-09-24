@@ -194,6 +194,41 @@ def parse_session_modes(resp: dict[str, Any]) -> tuple[list[str], str, bool]:
     return ids, current_id, True
 
 
+def advertised_mode_origin(resp: dict[str, Any], mode_id: str) -> str:
+    """Who supplied the definition behind an advertised mode, or ``""``.
+
+    kiro-cli's v3 engine stamps each ``availableModes`` entry with
+    ``_meta.kiro.resource.source.origin``: ``"client"`` for a definition that
+    arrived as a ``_meta.kiro.customAgents`` entry on this session, ``"bundled"``
+    for one of its own built-in agents (and for an agent it read from disk).
+    That stamp is the only place the wire says whether an injected id was
+    REGISTERED or silently shadowed: when a client entry collides with a
+    built-in id the engine keeps its own definition and advertises the mode
+    under that id anyway, so ``id in availableModes`` alone reads as success.
+    Returns ``""`` when the mode is absent or carries no such stamp (an older
+    engine, kiro-cli, the offline fake), so a caller can only ever fail closed
+    on a POSITIVE non-client stamp. Never raises.
+    """
+    modes = resp.get("modes")
+    if not isinstance(modes, dict):
+        return ""
+    advertised_raw = modes.get("availableModes")
+    if not isinstance(advertised_raw, list):
+        return ""
+    for m in advertised_raw:
+        if not isinstance(m, dict):
+            continue
+        if str(m.get("id") or m.get("modeId") or m.get("value") or "") != mode_id:
+            continue
+        meta = m.get("_meta")
+        kiro = meta.get("kiro") if isinstance(meta, dict) else None
+        resource = kiro.get("resource") if isinstance(kiro, dict) else None
+        source = resource.get("source") if isinstance(resource, dict) else None
+        origin = source.get("origin") if isinstance(source, dict) else None
+        return origin if isinstance(origin, str) else ""
+    return ""
+
+
 def set_model_params(session_id: str, model_id: str) -> dict[str, Any]:
     """Params for ``session/set_model`` (override the model on a session)."""
     return {"sessionId": session_id, "modelId": model_id}
@@ -942,6 +977,16 @@ class ToolCallIdentity:
     tool_name: str
     identity_trusted: bool
 
+    @property
+    def tool_identity_trusted(self) -> bool:
+        """Whether ``tool_name`` came from an adapter-authored identity channel.
+
+        ``classify_tool_call`` never populates ``tool_name`` from display titles
+        or inline permission payloads, so non-emptiness is provenance at this
+        classifier boundary. MCP pair provenance remains ``identity_trusted``.
+        """
+        return bool(self.tool_name)
+
 
 def _str_field(mapping: object, key: str) -> str:
     if not isinstance(mapping, dict):
@@ -1656,6 +1701,7 @@ def _build_tool_call_event(
         # Earned only when an identity pair was actually extracted from such a
         # source: a frame with no marker populates nothing and asserts no
         # provenance.
+        tool_identity_trusted=identity.tool_identity_trusted,
         mcp_identity_trusted=identity.identity_trusted,
         diff_old_text=_diff_old_text,
         diff_path=_diff_path,

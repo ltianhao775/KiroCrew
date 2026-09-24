@@ -569,7 +569,7 @@ test("every showInactive reveal uses the shared hidden/error policy", () => {
   assert.equal(guarded.length, reveals.length, "every showInactive reveal must use the shared policy");
   assert.match(
     fsSrc,
-    /return !petWindowsHidden && !overlayBlanked\.has\(win\)/,
+    /return !petWindowsHidden && !overlayErrorLatch\.isBlanked\(win\)/,
     "the shared policy must preserve hide-all and the error-page latch",
   );
 });

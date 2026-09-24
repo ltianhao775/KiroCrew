@@ -180,7 +180,7 @@ class TestDriftPrevention:
         before = time.time()
         # Patch jitter to a known value so we can verify drift prevention
         with patch.object(CronService, "_compute_jitter", return_value=0.1):
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
         after = time.time()
 
         # last_run_ts should be ~before (scheduled time), not after+jitter
@@ -206,7 +206,7 @@ class TestDriftPrevention:
         svc._on_job = None
 
         with patch.object(CronService, "_compute_jitter", return_value=0.0):
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
 
         # Cron jobs set last_run_ts in _execute (post-execution)
         assert job.last_run_ts is not None
@@ -232,20 +232,21 @@ class TestReaperJitterAllowance:
         """Job running for less than timeout+jitter should NOT be reaped."""
         import time as time_mod
 
-        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS, _RunClaim
 
         svc = CronService()
         svc._sessions = None
         # Job started 100s ago with 1200s jitter — well within threshold
-        svc._job_start_times["j1"] = time_mod.time() - 100
-        svc._job_jitter["j1"] = 1200.0
+        claim = svc._claims["j1"] = _RunClaim(
+            trigger="scheduled", claimed_at=time_mod.time() - 100, jitter=1200.0
+        )
 
         # Run one reaper sweep
         await svc._reaper_loop_once() if hasattr(svc, "_reaper_loop_once") else None
         # Since there's no _reaper_loop_once, test the threshold logic directly
         now = time_mod.time()
-        elapsed = now - svc._job_start_times["j1"]
-        jitter_allowance = svc._job_jitter.get("j1", 0.0)
+        elapsed = now - claim.claimed_at
+        jitter_allowance = claim.jitter or 0.0
         assert elapsed <= _JOB_TIMEOUT_SECS + jitter_allowance
 
     @pytest.mark.asyncio
@@ -253,17 +254,20 @@ class TestReaperJitterAllowance:
         """Job running longer than timeout+jitter should be reaped."""
         import time as time_mod
 
-        from kiro_crew.cron import _JOB_TIMEOUT_SECS
+        from kiro_crew.cron import _JOB_TIMEOUT_SECS, _RunClaim
 
         svc = CronService()
         svc._sessions = None
         # Job started (timeout + jitter + 100)s ago — exceeds threshold
         jitter = 1200.0
-        svc._job_start_times["j2"] = time_mod.time() - (_JOB_TIMEOUT_SECS + jitter + 100)
-        svc._job_jitter["j2"] = jitter
+        claim = svc._claims["j2"] = _RunClaim(
+            trigger="scheduled",
+            claimed_at=time_mod.time() - (_JOB_TIMEOUT_SECS + jitter + 100),
+            jitter=jitter,
+        )
 
         now = time_mod.time()
-        elapsed = now - svc._job_start_times["j2"]
-        jitter_allowance = svc._job_jitter.get("j2", 0.0)
+        elapsed = now - claim.claimed_at
+        jitter_allowance = claim.jitter or 0.0
         # This job EXCEEDS the threshold — reaper would kill it
         assert elapsed > _JOB_TIMEOUT_SECS + jitter_allowance

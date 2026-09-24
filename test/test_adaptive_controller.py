@@ -11,6 +11,8 @@ the ``resource_status`` rendering and the config keys.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
@@ -27,10 +29,25 @@ from kiro_crew.adaptive.controller import (
     HostSample,
     classify_run_outcome,
 )
-from kiro_crew.adaptive.policy import ACTION_DECREASE, ACTION_PAUSE, MODE_FIXED
+from kiro_crew.adaptive.policy import (
+    ACTION_DECREASE,
+    ACTION_FIXED,
+    ACTION_HOLD,
+    ACTION_INCREASE,
+    ACTION_PAUSE,
+    ACTION_PROBE,
+    ACTION_RESUME,
+    MODE_FIXED,
+    Decision,
+)
 from kiro_crew.adaptive.signals import Sample
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.mcp_gateway.admission import SpawnGate
+from kiro_crew.metrics.events import (
+    LOOP_LAG_MS,
+    PROCESS_CPU_UTILIZATION,
+    PROCESS_RSS_SAMPLED,
+)
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -47,11 +64,11 @@ async def test_long_running_stream_can_recover_from_one_without_completion():
         manager,
         cfg=_cfg(adaptive_initial=1),
         clock=clock,
-        host_probe=lambda: HostSample(free_mem_mb=32768, subagent_host_cap=64),
+        host_probe=lambda: HostSample(free_mem_mb=32768),
     )
     await ctl.tick()
     clock.advance(5)
-    await ctl.step(_clean(clock.t, running=1, queued=63, loop_lag_ms=400, host_cap=64))
+    await ctl.step(_clean(clock.t, running=1, queued=63, loop_lag_ms=400))
     assert manager.effective == 1
     clock.advance(31)
     info.last_activity = 102.0
@@ -304,179 +321,55 @@ class TestTick:
         assert ctl._samples[-1].completions == 1
 
     @pytest.mark.asyncio
-    async def test_host_cap_reaches_the_sample_and_bounds_the_climb(self) -> None:
-        """The probe's host figure is what an increase climbs toward.
+    async def test_the_climb_is_bounded_by_the_user_ceiling_alone(self, monkeypatch) -> None:
+        """No static host prediction sits between the cap and ``max_subagents``.
 
-        The user's ``max_subagents`` is a ceiling, not a promise: this is the
-        number that answers "how many does the memory and CPU on THIS host
-        actually allow", and the cap stops there instead of at the ceiling.
+        The probe reads memory, RSS and fds -- live signals the policy judges
+        each tick -- and never a p90-peak "how many fit" figure: that figure
+        pinned a 32-core host with tens of GB free at its fresh-start cap. A
+        clear host with demand climbs to the user's ceiling, and the sizing
+        helpers are not consulted on the way.
         """
-        mgr = FakeManager(user_max=64)
-        host = HostSample(
-            free_mem_mb=16_000.0, rss_mb=300.0, fd_count=50, fd_limit=1000, subagent_host_cap=8
-        )
-        ctl, clock = _controller(mgr, host=host, cfg=_cfg(adaptive_initial=4))
-        mgr.running_count = 4
-        mgr._queue = [{"task": str(i)} for i in range(50)]
-        await ctl.tick(loop_lag_ms=5.0)
-        assert ctl._samples[-1].host_cap == 8
-        assert ctl.state()["last_sample"]["host_cap"] == 8
-        for i in range(6):
-            clock.advance(5)
-            mgr._agents[f"done-{i}"] = SimpleNamespace(done=True, error="", stalled=False)
-            mgr.running_count = max(4, mgr.effective or 4)
-            await ctl.tick(loop_lag_ms=5.0)
-        assert ctl.state()["applied_exec_cap"] == 8, ctl.state()
 
-    @pytest.mark.asyncio
-    async def test_an_unreadable_host_cap_never_tightens_anything(self) -> None:
-        """A failed probe reports 0, and 0 means "use the user's ceiling"."""
-        mgr = FakeManager(user_max=64)
-        ctl, clock = _controller(mgr, cfg=_cfg(adaptive_initial=4))  # default probe: no host cap
-        await ctl.tick(loop_lag_ms=5.0)
-        assert ctl._samples[-1].host_cap == 0
-        assert ctl.policy._growth_ceiling(ctl._samples[-1]) == 64
+        def _boom(*_a: object, **_kw: object) -> int:  # pragma: no cover - must never be called
+            raise AssertionError("the sizing helper must not bound the climb")
 
-    @pytest.mark.asyncio
-    async def test_an_unreadable_memory_probe_still_lets_the_cap_climb(self, monkeypatch) -> None:
-        """The REAL probe on a host whose memory read fails hands the climb 0.
-
-        The sizing helper's fail-open figure is the floor, 3, which sits UNDER
-        the fresh-start cap of 4: a controller handed 3 for a host it could not
-        measure has ``4 < 3`` as its increase condition and stays at 4 for the
-        life of the process. So an unreadable host must report "not measured"
-        (0), and the cap must climb toward the user's ceiling exactly as it does
-        with no host figure at all.
-        """
-        monkeypatch.setattr("kiro_crew.subagent._available_memory_gb", lambda: -1.0)
-        ctl_mod._host_cap_cache = (0.0, 0)
-        host = HostSample(
-            free_mem_mb=16_000.0,
-            rss_mb=300.0,
-            fd_count=50,
-            fd_limit=1000,
-            subagent_host_cap=ctl_mod._host_cap_cached(),
-        )
+        monkeypatch.setattr("kiro_crew.subagent.compute_max_subagents", _boom)
+        host = HostSample(free_mem_mb=16_000.0, rss_mb=300.0, fd_count=50, fd_limit=1000)
         mgr = FakeManager(user_max=64)
         ctl, clock = _controller(mgr, host=host, cfg=_cfg(adaptive_initial=4))
         mgr.running_count = 4
         mgr._queue = [{"task": str(i)} for i in range(70)]
         await ctl.tick(loop_lag_ms=5.0)
+        assert "host_cap" not in ctl.state()["last_sample"]
+        assert ctl.policy._growth_ceiling(ctl._samples[-1]) == 64
         for i in range(6):
             clock.advance(5)
             mgr._agents[f"done-{i}"] = SimpleNamespace(done=True, error="", stalled=False)
             mgr.running_count = max(4, mgr.effective or 4)
             await ctl.tick(loop_lag_ms=5.0)
-        assert ctl.state()["applied_exec_cap"] > 4, ctl.state()
         assert ctl.state()["applied_exec_cap"] == 64, ctl.state()
-        assert host.subagent_host_cap == 0
-        # The 0 is cached like a measured figure: an unreadable host is not a
-        # reason to re-read config and the learned-cost store every tick.
+
+    def test_probe_host_reads_only_live_signals(self, monkeypatch) -> None:
+        """``probe_host`` is the ONE blocking read and it reads the host, not config.
+
+        Config and the learned-cost store are sizing inputs, not live signals,
+        so the worker thread must not touch either.
+        """
         monkeypatch.setattr(
-            "kiro_crew.subagent.host_terms_subagent_cap",
-            lambda _c, **_kw: pytest.fail("cached 0 must not be recomputed inside the TTL"),
+            KiroCrewConfig,
+            "load",
+            lambda *_a, **_kw: pytest.fail("probe_host must not load config"),
         )
-        assert ctl_mod._host_cap_cached() == 0
-
-    def test_probe_host_reports_the_hosts_own_cap_figure(self) -> None:
-        """``probe_host`` is the ONE blocking read, so the cap figure rides it.
-
-        ``host_terms_subagent_cap`` loads config and the learned-cost store; it
-        belongs on the worker thread with the memory read, not on the loop.
-        """
-        ctl_mod._host_cap_cache = (0.0, 0)
         sample = ctl_mod.probe_host()
-        assert sample.subagent_host_cap >= 3  # the sizing floor
-
-    def test_the_host_cap_is_cached_not_recomputed_every_tick(self, monkeypatch) -> None:
-        """A 5 s tick must not re-read config and the learned-cost store.
-
-        It is not free, it moves on the scale of minutes, and the clamped
-        sibling ``compute_max_subagents`` logs a sizing line at INFO on every
-        call -- one tick per 5 s would be ~17k gateway log lines a day.
-        """
-        calls: list[int] = []
-
-        def _counted(_cfg: object, **_kw: object) -> int:
-            calls.append(1)
-            return 11
-
-        monkeypatch.setattr("kiro_crew.subagent.host_terms_subagent_cap", _counted)
-        ctl_mod._host_cap_cache = (0.0, 0)
-        assert [ctl_mod._host_cap_cached() for _ in range(5)] == [11] * 5
-        assert len(calls) == 1
-        # Past the TTL it is read again -- a cache, not a one-shot.
-        ctl_mod._host_cap_cache = (
-            ctl_mod._host_cap_cache[0] - ctl_mod._HOST_CAP_TTL_SECS - 1.0,
-            11,
-        )
-        assert ctl_mod._host_cap_cached() == 11
-        assert len(calls) == 2
-
-    def test_the_climb_is_not_bounded_by_the_auto_size_ceiling(self, monkeypatch) -> None:
-        """``host_terms_subagent_cap`` and NOT ``compute_max_subagents``.
-
-        The latter clamps to ``subagent_auto_max`` (default 32), documented as
-        applying to the auto-sized cap only. Reading it here would stop an
-        explicit ``max_subagents=64`` at 32 on a host that can carry it -- the
-        precise failure this controller change exists to remove.
-        """
-        monkeypatch.setattr("kiro_crew.subagent.host_terms_subagent_cap", lambda _c, **_kw: 48)
-
-        def _boom(_c: object) -> int:  # pragma: no cover - must never be called
-            raise AssertionError("the clamped sizing helper must not bound the climb")
-
-        monkeypatch.setattr("kiro_crew.subagent.compute_max_subagents", _boom)
-        ctl_mod._host_cap_cache = (0.0, 0)
-        assert ctl_mod.probe_host().subagent_host_cap == 48
-
-    @pytest.mark.asyncio
-    async def test_resident_headroom_is_cached_as_a_total_not_recredited(self, monkeypatch) -> None:
-        cfg = _cfg(
-            adaptive_initial=8,
-            subagent_mem_buffer_pct=0,
-            subagent_cost_gb=1.0,
-            subagent_cpu_cost_cores=1.0,
-        )
-        cfg.session.pool_size = 0
-        clock = Clock()
-        monkeypatch.setattr(ctl_mod, "time", SimpleNamespace(monotonic=clock))
-        monkeypatch.setattr(ctl_mod, "_host_cap_cache", (0.0, 0))
-        monkeypatch.setattr(KiroCrewConfig, "load", lambda: cfg)
-        monkeypatch.setattr("kiro_crew.subagent.read_learned_cost", lambda _key: None)
-        monkeypatch.setattr("kiro_crew.subagent.os.cpu_count", lambda: 64)
-        available = [6.0]
-        monkeypatch.setattr("kiro_crew.subagent._available_memory_gb", lambda: available[0])
-        monkeypatch.setattr("kiro_crew.resource_status._read_available_gb", lambda: available[0])
-        mgr = FakeManager(user_max=64)
-        mgr.running_count = 8
-        mgr._queue = [{"task": str(i)} for i in range(64)]
-        mgr._agents = {str(i): SimpleNamespace(_pid=100 + i) for i in range(8)}
-        # A yielded parent still consumes memory; queued/terminal rows and a
-        # cold start without a process do not. running_count misses the parent.
-        mgr._agents["0"]._slot_released = True
-        mgr._agents.update(
-            queued=SimpleNamespace(queued=True, _pid=200),
-            terminal=SimpleNamespace(done=True, _pid=201),
-            unstarted=SimpleNamespace(_pid=None),
-        )
-        ctl = AdaptiveController(mgr, cfg=cfg, clock=clock)
-        await ctl.tick()
-        assert ctl._samples[-1].host_cap == 14
-        clock.advance(5)
-        ctl.record_completion(ok=True)
-        await ctl.tick()
-        assert mgr.effective == 14
-        # Three new residents consumed three GB. A live occupancy + cached
-        # headroom implementation would incorrectly raise the total to 17.
-        mgr._agents.update({str(i): SimpleNamespace(_pid=100 + i) for i in range(8, 11)})
-        available[0] = 3.0
-        clock.advance(5)
-        await ctl.tick()
-        assert ctl._samples[-1].host_cap == 14
-        clock.advance(ctl_mod._HOST_CAP_TTL_SECS)
-        await ctl.tick()
-        assert ctl._samples[-1].host_cap == 14
+        assert set(vars(sample)) == {
+            "free_mem_mb",
+            "rss_mb",
+            "fd_count",
+            "fd_limit",
+            "cpu_seconds",
+            "cpu_clock",
+        }
 
     @pytest.mark.asyncio
     async def test_hooks_feed_the_sample(self) -> None:
@@ -554,6 +447,323 @@ class TestTick:
             "applied_exec_cap",
         ):
             assert key in state
+
+    @pytest.mark.asyncio
+    async def test_run_emits_loop_lag_histogram(self, monkeypatch) -> None:
+        mgr = FakeManager()
+        clock = Clock()
+        emitted: list[tuple[str, float, dict[str, Any], str]] = []
+
+        def _capture(name: str, value: float, attrs: dict[str, Any], *, unit: str = "1") -> None:
+            emitted.append((name, value, attrs, unit))
+
+        monkeypatch.setattr(ctl_mod, "emit_histogram", _capture)
+
+        async def _sleep(secs: float) -> None:
+            clock.advance(secs + 0.3)  # the timer fired 300 ms late
+
+        ctl = AdaptiveController(
+            mgr,  # type: ignore[arg-type]
+            cfg=_cfg(controller_sample_secs=5),
+            host_probe=lambda: HostSample(),
+            clock=clock,
+            sleep=_sleep,
+        )
+        await ctl._sample_and_tick()
+        assert len(emitted) == 1
+        name, value, attrs, unit = emitted[0]
+        assert name == LOOP_LAG_MS
+        assert value == pytest.approx(300.0, abs=1.0)
+        assert attrs == {"process": "gateway"}
+        assert unit == "ms"
+
+    @pytest.mark.asyncio
+    async def test_reconfigured_sample_period_is_not_reported_as_lag(self, monkeypatch) -> None:
+        mgr = FakeManager()
+        clock = Clock()
+        emitted: list[tuple[str, float, dict[str, Any], str]] = []
+
+        def _capture(name: str, value: float, attrs: dict[str, Any], *, unit: str = "1") -> None:
+            emitted.append((name, value, attrs, unit))
+
+        monkeypatch.setattr(ctl_mod, "emit_histogram", _capture)
+        holder: dict[str, AdaptiveController] = {}
+
+        async def _sleep(secs: float) -> None:
+            # A hot-reload shortens the period while the timer is pending;
+            # the timer itself fired exactly on the period it was armed with.
+            holder["ctl"]._sample_secs = 1.0
+            clock.advance(5.0)
+
+        ctl = AdaptiveController(
+            mgr,  # type: ignore[arg-type]
+            cfg=_cfg(controller_sample_secs=5),
+            host_probe=lambda: HostSample(),
+            clock=clock,
+            sleep=_sleep,
+        )
+        holder["ctl"] = ctl
+        assert ctl._sample_secs == 5.0
+        await ctl._sample_and_tick()
+        assert len(emitted) == 1
+        assert emitted[0][0] == LOOP_LAG_MS
+        assert emitted[0][1] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_decrease_is_logged_at_warning_and_increase_at_info(self, caplog) -> None:
+        mgr = FakeManager(user_max=10)
+        ctl, clock = _controller(mgr, cfg=_cfg(adaptive_initial=10))
+        await ctl.step(_clean(clock.t))
+        clock.advance(5)
+        with caplog.at_level(logging.INFO, logger=ctl_mod.__name__):
+            d = await ctl.step(_clean(clock.t, loop_lag_ms=400.0, running=10, healthy_in_flight=6))
+            assert d.action == ACTION_DECREASE
+            clock.advance(31)  # past the clean window; slow start was retired by the cut
+            d = await ctl.step(_clean(clock.t, running=6, queued=1, completions=6))
+            assert d.action == ACTION_INCREASE
+            # The remaining actions are applied directly: a pause needs a
+            # memory or severe-lag sample the policy fakes above do not carry.
+            for action, paused in (
+                (ACTION_PAUSE, True),
+                (ACTION_RESUME, False),
+                (ACTION_PROBE, False),
+            ):
+                await ctl.apply(
+                    Decision(
+                        effective_exec_cap=6,
+                        spawn_gate_capacity=4,
+                        paused=paused,
+                        probing=action == ACTION_PROBE,
+                        action=action,
+                        reason=f"synthetic {action}",
+                        changed=True,
+                    )
+                )
+        records = [r for r in caplog.records if r.getMessage().startswith("adaptive concurrency")]
+        by_action = {r.getMessage().split()[2].rstrip(":"): r.levelno for r in records}
+        assert by_action == {
+            ACTION_DECREASE: logging.WARNING,
+            ACTION_PAUSE: logging.WARNING,
+            ACTION_RESUME: logging.WARNING,
+            ACTION_INCREASE: logging.INFO,
+            ACTION_PROBE: logging.INFO,
+        }
+
+    @pytest.mark.asyncio
+    async def test_recent_decisions_is_bounded_and_carries_reason(self) -> None:
+        mgr = FakeManager(user_max=64)
+        gate = FakeGate()
+        ctl, clock = _controller(mgr, gate, cfg=_cfg(adaptive_initial=1))
+        await ctl.step(_clean(clock.t))
+        assert ctl.state()["recent_decisions"] == []
+        changed = 0
+        holds = 0
+        while changed < 40:
+            clock.advance(5)
+            # Alternate a clean sample (demand at the cap, one completion
+            # landed) with a corroborated lag sample; the cooldowns between
+            # cap changes are what produce the holds.
+            cap = ctl.policy.exec_cap
+            sample = _clean(
+                clock.t,
+                running=cap,
+                queued=1,
+                completions=changed + 1,
+                loop_lag_ms=400.0 if changed % 2 else 5.0,
+                healthy_in_flight=0,
+            )
+            # ``tick`` appends the sample it built before deciding on it; the
+            # entry's ``loop_lag_ms`` is read from that ring.
+            ctl._samples.append(sample)
+            d = await ctl.step(sample)
+            if d.action == ACTION_HOLD:
+                holds += 1
+            else:
+                changed += 1
+        recent = ctl.state()["recent_decisions"]
+        assert holds > 0
+        assert len(recent) == 32
+        assert all(entry["action"] and entry["reason"] for entry in recent)
+        assert all(entry["action"] != ACTION_HOLD for entry in recent)
+        assert [entry["at"] for entry in recent] == sorted(entry["at"] for entry in recent)
+        newest = recent[-1]
+        assert set(newest) == {
+            "at",
+            "action",
+            "reason",
+            "exec_cap",
+            "gate_cap",
+            "paused",
+            "loop_lag_ms",
+        }
+        # Wall-clock so the entry can be lined up with gateway.log; the
+        # injected controller clock started at 1000 and would not be.
+        assert isinstance(newest["at"], float)
+        assert abs(newest["at"] - time.time()) < 60.0
+        assert newest["action"] == d.action
+        assert newest["reason"] == d.reason
+        # The caps are the confirmed ones: the fake gate answers every update,
+        # so they equal the decision's; see the unanswered-gate test for the
+        # other case.
+        assert newest["exec_cap"] == d.effective_exec_cap == mgr.effective
+        assert newest["gate_cap"] == d.spawn_gate_capacity == gate.gate.capacity
+        assert isinstance(newest["exec_cap"], int) and isinstance(newest["gate_cap"], int)
+        assert newest["paused"] is d.paused
+        assert isinstance(newest["paused"], bool)
+        assert newest["loop_lag_ms"] == pytest.approx(400.0 if (changed - 1) % 2 else 5.0)
+
+    @pytest.mark.asyncio
+    async def test_history_records_the_confirmed_gate_cap_not_the_requested_one(self) -> None:
+        """A gate update the daemon does not answer stays pending; the entry
+        must show the gate cap actually in force, not the one asked for."""
+        mgr = FakeManager(user_max=10)
+        gate = FakeGate()
+        ctl, clock = _controller(mgr, gate, cfg=_cfg(adaptive_initial=10))
+        await ctl.step(_clean(clock.t))
+        confirmed_gate = gate.gate.capacity
+        gate.answer = False  # daemon stops answering; the update stays pending
+        clock.advance(5)
+        d = await ctl.step(_clean(clock.t, loop_lag_ms=400.0, running=10, healthy_in_flight=6))
+        assert d.action == ACTION_DECREASE
+        newest = ctl.state()["recent_decisions"][-1]
+        assert newest["exec_cap"] == d.effective_exec_cap == mgr.effective
+        assert newest["gate_cap"] == confirmed_gate
+        assert ctl.state()["gate_pending"] == d.spawn_gate_capacity
+        if d.spawn_gate_capacity != confirmed_gate:
+            assert newest["gate_cap"] != d.spawn_gate_capacity
+
+    @pytest.mark.asyncio
+    async def test_a_live_ceiling_drop_that_clamps_the_cap_is_in_the_history(self) -> None:
+        """Lowering ``agent.max_subagents`` live makes ``step()`` re-read the
+        ceiling and the policy clamp its cap; the decision that follows is a
+        hold with ``changed=True``. It moves the confirmed cap, so it is the one
+        hold that belongs in the history."""
+        mgr = FakeManager(user_max=10)
+        ctl, clock = _controller(mgr, cfg=_cfg(adaptive_initial=8))
+        await ctl.step(_clean(clock.t))
+        assert mgr.effective == 8
+        assert ctl.state()["recent_decisions"] == []
+
+        mgr._user = 2  # the live ceiling drop (agent.max_subagents hot-reload)
+        clock.advance(5)
+        d = await ctl.step(_clean(clock.t))
+        assert d.action == ACTION_HOLD and d.changed
+        assert mgr.effective == 2
+        newest = ctl.state()["recent_decisions"][-1]
+        assert newest["action"] == ACTION_HOLD
+        assert newest["exec_cap"] == 2
+
+        # An ordinary hold (nothing moved) still appends nothing.
+        clock.advance(5)
+        d = await ctl.step(_clean(clock.t))
+        assert d.action == ACTION_HOLD and not d.changed
+        assert len(ctl.state()["recent_decisions"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_clamped_gate_cap_is_recorded_as_the_daemon_applied_it(self) -> None:
+        """An adopted daemon launched under narrower bounds clamps the request
+        and answers with what took effect; the applied value and the history
+        must carry that answer, not the request."""
+        mgr = FakeManager(user_max=10)
+        gate = FakeGate()
+        gate.gate = SpawnGate(4, floor=1, ceiling=6)  # the daemon's bounds: narrower
+        clock = Clock()
+        ctl = AdaptiveController(
+            mgr,  # type: ignore[arg-type]
+            cfg=_cfg(adaptive_initial=8),
+            set_gate_capacity=gate.set_capacity,
+            read_gate_stats=gate.stats,
+            host_probe=lambda: HostSample(
+                free_mem_mb=16_000.0, rss_mb=300.0, fd_count=50, fd_limit=1000
+            ),
+            clock=clock,
+            sleep=AsyncMock(),
+            gate_initial=8,  # the controller's bounds: what an older daemon never learned
+        )
+        d = await ctl.step(_clean(clock.t))
+        assert d.spawn_gate_capacity == 8
+        assert gate.gate.capacity == 6
+        assert ctl.state()["applied_gate_cap"] == 6
+        clock.advance(5)
+        d = await ctl.step(_clean(clock.t, loop_lag_ms=400.0, running=8, healthy_in_flight=6))
+        assert d.action == ACTION_DECREASE
+        newest = ctl.state()["recent_decisions"][-1]
+        assert newest["gate_cap"] == gate.gate.capacity == ctl.state()["applied_gate_cap"]
+        assert newest["gate_cap"] != 8
+
+    @pytest.mark.asyncio
+    async def test_a_restarted_daemon_accepting_a_pending_gate_cap_is_in_the_history(self) -> None:
+        """The decision does not change when a restarted daemon with wider bounds
+        finally accepts the capacity the controller kept asking for, but the
+        confirmed gate cap moves, and that move is what the history is for."""
+        mgr = FakeManager(user_max=10)
+        gate = FakeGate()
+        gate.gate = SpawnGate(4, floor=1, ceiling=6)
+        clock = Clock()
+        ctl = AdaptiveController(
+            mgr,  # type: ignore[arg-type]
+            cfg=_cfg(adaptive_initial=8),
+            set_gate_capacity=gate.set_capacity,
+            read_gate_stats=gate.stats,
+            host_probe=lambda: HostSample(
+                free_mem_mb=16_000.0, rss_mb=300.0, fd_count=50, fd_limit=1000
+            ),
+            clock=clock,
+            sleep=AsyncMock(),
+            gate_initial=8,
+        )
+        await ctl.step(_clean(clock.t))
+        assert ctl.state()["applied_gate_cap"] == 6
+        before = len(ctl.state()["recent_decisions"])
+
+        gate.gate = SpawnGate(6, floor=1, ceiling=8)  # daemon restarted under the current bounds
+        clock.advance(5)
+        d = await ctl.step(_clean(clock.t))
+        assert d.action == ACTION_HOLD and not d.changed
+        assert ctl.state()["applied_gate_cap"] == 8
+        recent = ctl.state()["recent_decisions"]
+        assert len(recent) == before + 1
+        assert recent[-1]["action"] == ACTION_HOLD and recent[-1]["gate_cap"] == 8
+
+    @pytest.mark.asyncio
+    async def test_starting_in_fixed_mode_records_no_cap_change(self) -> None:
+        """The first decision in fixed mode pins caps that were never anything
+        else; it is not a cap change and must not seed the history."""
+        mgr = FakeManager(user_max=10)
+        ctl, clock = _controller(mgr, cfg=_cfg(adaptive_concurrency_mode=MODE_FIXED))
+        for _ in range(3):
+            clock.advance(5)
+            d = await ctl.step(_clean(clock.t))
+            assert d.action == ACTION_FIXED
+        assert ctl.state()["recent_decisions"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_fixed_mode_switch_that_restores_the_cap_is_in_the_history(self) -> None:
+        """A hot-reload to fixed mode pins the caps at their start values. From a
+        reduced AIMD cap that is a cap change, and the history must show it even
+        though the decision counter and the log skip fixed-mode decisions."""
+        mgr = FakeManager(user_max=10)
+        ctl, clock = _controller(mgr, cfg=_cfg(adaptive_initial=10))
+        await ctl.step(_clean(clock.t))
+        clock.advance(5)
+        d = await ctl.step(_clean(clock.t, loop_lag_ms=400.0, running=10, healthy_in_flight=6))
+        assert d.action == ACTION_DECREASE
+        reduced = d.effective_exec_cap
+        assert reduced < 10
+
+        ctl.apply_config(_cfg(adaptive_initial=10, adaptive_concurrency_mode=MODE_FIXED))
+        clock.advance(5)
+        d = await ctl.step(_clean(clock.t, running=reduced))
+        assert d.action == ACTION_FIXED and d.changed
+        assert d.effective_exec_cap == 10
+
+        newest = ctl.state()["recent_decisions"][-1]
+        assert newest["action"] == ACTION_FIXED
+        assert newest["exec_cap"] == 10
+        assert [e["action"] for e in ctl.state()["recent_decisions"]] == [
+            ACTION_DECREASE,
+            ACTION_FIXED,
+        ]
 
 
 class TestRunOutcomeClassifier:
@@ -716,11 +926,11 @@ class TestVisibilityAndConfig:
         assert rs.adaptive_summary_lines() == []
         assert rs.adaptive_state() is None
 
-    def test_resource_status_names_the_host_cap_and_the_growth_regime(self) -> None:
+    def test_resource_status_names_the_growth_regime(self) -> None:
         """ "Execution cap: 4/64" alone reads as an unexplained throttle.
 
-        The host figure is the bound the climb is heading for, so a cap far
-        below the user's max is only actionable next to it.
+        The regime says how the cap is heading for the user's ceiling, so a cap
+        below the max reads as headroom not yet earned rather than a host limit.
         """
         from kiro_crew import resource_status as rs
 
@@ -733,20 +943,67 @@ class TestVisibilityAndConfig:
                     "exec_ceiling": 64,
                     "spawn_gate_capacity": 4,
                     "gate_ceiling": 8,
-                    "host_cap": 14,
                     "slow_start": True,
                     "last": {"action": "increase", "reason": "clean window earned x2 (slow start)"},
                 }
             )
         )
         assert "Execution cap: 8/64" in joined
-        assert "Host cap (memory+CPU): 14" in joined
-        assert "Growth: slow start (x2/window)" in joined
-        # An unmeasured host figure prints no line rather than a bare 0.
+        assert "Growth toward ceiling: slow start (x2/window)" in joined
+        assert "Host cap" not in joined
+        # A state without a regime prints no growth line rather than a guess.
         quiet = rs.adaptive_summary_lines(
-            {"enabled": True, "effective_exec_cap": 4, "exec_ceiling": 64, "host_cap": 0}
+            {"enabled": True, "effective_exec_cap": 4, "exec_ceiling": 64}
         )
-        assert not any("Host cap" in line for line in quiet)
+        assert not any("Growth" in line for line in quiet)
+
+    def test_summary_lists_recent_cap_changes(self) -> None:
+        from kiro_crew import resource_status as rs
+
+        base = {
+            "enabled": True,
+            "mode": "aimd",
+            "effective_exec_cap": 3,
+            "exec_ceiling": 64,
+            "spawn_gate_capacity": 2,
+            "gate_ceiling": 8,
+            "last": {"action": "decrease", "reason": "loop_lag corroborated"},
+        }
+        recent = [
+            {
+                "at": 1_000_000_000.0 + i,
+                "action": "decrease" if i % 2 else "increase",
+                "reason": f"r{i}",
+                "exec_cap": 10 - i,
+                "gate_cap": 8 - i,
+                "paused": False,
+                "loop_lag_ms": None if i == 6 else float(i * 100),
+            }
+            for i in range(7)
+        ]
+        lines = rs.adaptive_summary_lines({**base, "recent_decisions": recent})
+        header = lines.index("  Recent cap changes (newest last):")
+        # ``at`` renders as the ``%H:%M:%S`` local-time stamp gateway.log
+        # carries, so a line here can be matched against the log by eye.
+        # Post-epoch base: a near-epoch value goes pre-epoch in any west-of-UTC
+        # zone and Windows' ``localtime`` rejects it (see test_portability.py).
+        stamp = [time.strftime("%H:%M:%S", time.localtime(1_000_000_000.0 + i)) for i in range(7)]
+        assert lines[header + 1 : header + 6] == [
+            f"    {stamp[2]} increase -> exec 8 gate 6 lag 200.0ms (r2)",
+            f"    {stamp[3]} decrease -> exec 7 gate 5 lag 300.0ms (r3)",
+            f"    {stamp[4]} increase -> exec 6 gate 4 lag 400.0ms (r4)",
+            f"    {stamp[5]} decrease -> exec 5 gate 3 lag 500.0ms (r5)",
+            f"    {stamp[6]} increase -> exec 4 gate 2 lag -ms (r6)",
+        ]
+        assert not any("r0" in line or "r1" in line for line in lines)
+        missing_at = rs.adaptive_summary_lines(
+            {**base, "recent_decisions": [{**recent[-1], "at": None}]}
+        )
+        assert any(line.startswith("    --:--:-- increase") for line in missing_at)
+        # Without the key the block is absent and the other lines are unchanged.
+        without = rs.adaptive_summary_lines(base)
+        assert not any("Recent cap changes" in line for line in without)
+        assert without == lines[:header]
 
     def test_registry_round_trip(self) -> None:
         mgr = FakeManager()
@@ -863,3 +1120,254 @@ async def test_disabled_controller_never_starts_or_probes() -> None:
         stats.assert_not_awaited()
     finally:
         await ctl.stop()
+
+
+class TestSampledProcessHistograms:
+    """The two resource distributions the controller records on its own tick.
+
+    Recorded here because a histogram is RECORDED and not observed: OTEL has no
+    observable histogram, so the series need a caller on a timer, and this loop
+    already probes both readings for its own decisions.
+    """
+
+    @staticmethod
+    def _capture(store: list) -> Any:
+        def _emit(name: str, value: float, attrs: dict[str, Any], *, unit: str = "1") -> None:
+            store.append((name, value, attrs, unit))
+
+        return _emit
+
+    @staticmethod
+    def _only(store: list, name: str) -> list:
+        return [row for row in store if row[0] == name]
+
+    def _controller_for(
+        self,
+        probe: Any,
+        clock: Clock,
+        monkeypatch: Any,
+        store: list,
+        cores: Optional[int] = 4,
+    ) -> AdaptiveController:
+        monkeypatch.setattr(ctl_mod, "emit_histogram", self._capture(store))
+        monkeypatch.setattr(ctl_mod, "read_logical_cores", lambda: cores)
+        return AdaptiveController(
+            FakeManager(),  # type: ignore[arg-type]
+            cfg=_cfg(),
+            host_probe=probe,
+            clock=clock,
+        )
+
+    @pytest.mark.asyncio
+    async def test_resident_set_is_recorded_in_bytes(self, monkeypatch) -> None:
+        """The probe reads megabytes; the instrument publishes bytes, because the
+        boundary array and the declared unit are both bytes."""
+        store: list = []
+        clock = Clock()
+        ctl = self._controller_for(
+            lambda: HostSample(
+                free_mem_mb=16_000.0, rss_mb=300.0, cpu_seconds=10.0, cpu_clock=clock()
+            ),
+            clock,
+            monkeypatch,
+            store,
+        )
+        await ctl.tick()
+        (row,) = self._only(store, PROCESS_RSS_SAMPLED)
+        name, value, attrs, unit = row
+        assert value == pytest.approx(300.0 * 1024 * 1024)
+        assert attrs == {"process": "gateway"}
+        assert unit == "By"
+
+    @pytest.mark.asyncio
+    async def test_the_first_tick_publishes_no_cpu_share(self, monkeypatch) -> None:
+        """A share is a RATE and the probe returns a lifetime TOTAL, so one
+        reading is not a sample. Publishing anything here would be invented."""
+        store: list = []
+        clock = Clock()
+        ctl = self._controller_for(
+            lambda: HostSample(rss_mb=300.0, cpu_seconds=10.0, cpu_clock=clock()),
+            clock,
+            monkeypatch,
+            store,
+        )
+        await ctl.tick()
+        assert self._only(store, PROCESS_CPU_UTILIZATION) == []
+        assert len(self._only(store, PROCESS_RSS_SAMPLED)) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_second_tick_publishes_the_measured_share(self, monkeypatch) -> None:
+        """Five CPU seconds burned over twenty wall seconds on four cores."""
+        store: list = []
+        clock = Clock()
+        reading = {"cpu": 10.0}
+        ctl = self._controller_for(
+            lambda: HostSample(rss_mb=300.0, cpu_seconds=reading["cpu"], cpu_clock=clock()),
+            clock,
+            monkeypatch,
+            store,
+        )
+        await ctl.tick()
+        clock.advance(20)
+        reading["cpu"] = 15.0
+        await ctl.tick()
+        (row,) = self._only(store, PROCESS_CPU_UTILIZATION)
+        name, value, attrs, unit = row
+        assert value == pytest.approx(5.0 / (20.0 * 4))
+        assert attrs == {"process": "gateway"}
+        assert unit == "1"
+
+    @pytest.mark.asyncio
+    async def test_an_unmeasured_resident_set_publishes_nothing(self, monkeypatch) -> None:
+        """``-1`` is the sample's "not measured"; a zero-byte process is not a
+        thing, so publishing one would be a fake reading."""
+        store: list = []
+        ctl = self._controller_for(lambda: HostSample(), Clock(), monkeypatch, store)
+        await ctl.tick()
+        assert self._only(store, PROCESS_RSS_SAMPLED) == []
+
+    @pytest.mark.asyncio
+    async def test_a_zero_resident_set_publishes_nothing(self, monkeypatch) -> None:
+        """The reachable failure, distinct from the ``-1`` sentinel above.
+
+        ``proc_rss_bytes`` answers 0 on failure rather than raising, so the probe's
+        own ``except`` never runs and the sample carries a plain ``0.0``. A live
+        process never has a true resident set of zero, and a histogram is cumulative,
+        so admitting one would leave a fabricated bucket in the series for the rest of
+        the process's life.
+        """
+        store: list = []
+        ctl = self._controller_for(
+            lambda: HostSample(free_mem_mb=16_000.0, rss_mb=0.0, fd_count=50, fd_limit=1000),
+            Clock(),
+            monkeypatch,
+            store,
+        )
+        await ctl.tick()
+        assert self._only(store, PROCESS_RSS_SAMPLED) == []
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_core_count_publishes_no_share(self, monkeypatch) -> None:
+        """Without a core count there is no machine to be a share OF."""
+        store: list = []
+        clock = Clock()
+        reading = {"cpu": 10.0}
+        ctl = self._controller_for(
+            lambda: HostSample(rss_mb=300.0, cpu_seconds=reading["cpu"], cpu_clock=clock()),
+            clock,
+            monkeypatch,
+            store,
+            cores=None,
+        )
+        await ctl.tick()
+        clock.advance(20)
+        reading["cpu"] = 15.0
+        await ctl.tick()
+        assert self._only(store, PROCESS_CPU_UTILIZATION) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_cpu_probe_does_not_become_the_next_baseline(self, monkeypatch) -> None:
+        """``proc_cpu_seconds`` reads 0.0 when the probe fails. Keeping the older
+        pair differences a longer interval against the reading it was taken with,
+        which stays correct arithmetic; adopting 0.0 would report a huge share.
+        """
+        store: list = []
+        clock = Clock()
+        reading = {"cpu": 10.0}
+        ctl = self._controller_for(
+            lambda: HostSample(rss_mb=300.0, cpu_seconds=reading["cpu"], cpu_clock=clock()),
+            clock,
+            monkeypatch,
+            store,
+        )
+        await ctl.tick()
+        clock.advance(10)
+        reading["cpu"] = 0.0  # the probe failed
+        await ctl.tick()
+        assert self._only(store, PROCESS_CPU_UTILIZATION) == []
+        clock.advance(10)
+        reading["cpu"] = 18.0
+        await ctl.tick()
+        (row,) = self._only(store, PROCESS_CPU_UTILIZATION)
+        # 8 seconds burned across the whole 20, not 8 across the last 10.
+        assert row[1] == pytest.approx(8.0 / (20.0 * 4))
+
+    @pytest.mark.asyncio
+    async def test_a_restarted_process_reading_publishes_no_share(self, monkeypatch) -> None:
+        """A lifetime total cannot decrease, so a drop means the two readings came
+        from different processes and their difference describes neither."""
+        store: list = []
+        clock = Clock()
+        reading = {"cpu": 90.0}
+        ctl = self._controller_for(
+            lambda: HostSample(rss_mb=300.0, cpu_seconds=reading["cpu"], cpu_clock=clock()),
+            clock,
+            monkeypatch,
+            store,
+        )
+        await ctl.tick()
+        clock.advance(10)
+        reading["cpu"] = 4.0
+        await ctl.tick()
+        assert self._only(store, PROCESS_CPU_UTILIZATION) == []
+
+    @pytest.mark.asyncio
+    async def test_the_share_divides_by_the_probe_interval_not_the_resume_interval(
+        self, monkeypatch
+    ) -> None:
+        """The CPU total is read in a worker thread; the loop resumes later. Both
+        endpoints of the division come from the probe, so the resumption delay is
+        outside the measured interval.
+
+        The delay is five seconds here to keep the arithmetic unambiguous. It
+        varies from tick to tick, so it does not cancel, and the mechanism is the
+        same at the few hundred milliseconds a busy loop actually shows.
+        """
+        store: list = []
+        clock = Clock()
+        reading = {"cpu": 10.0, "resume_delay": 0.0}
+
+        def probe() -> HostSample:
+            instant = clock()  # the worker thread read the total at this moment
+            clock.advance(reading["resume_delay"])  # the loop resumed this much later
+            return HostSample(rss_mb=300.0, cpu_seconds=reading["cpu"], cpu_clock=instant)
+
+        ctl = self._controller_for(probe, clock, monkeypatch, store)
+        await ctl.tick()
+        clock.advance(20)
+        reading["cpu"] = 15.0
+        reading["resume_delay"] = 5.0
+        await ctl.tick()
+        (row,) = self._only(store, PROCESS_CPU_UTILIZATION)
+        # Five CPU seconds across the twenty between the two probes, on four
+        # cores. Pairing the total with the loop's post-resume instant would
+        # divide by twenty-five and under-report the share by a fifth.
+        assert row[1] == pytest.approx(5.0 / (20.0 * 4))
+        assert row[1] != pytest.approx(5.0 / (25.0 * 4))
+
+    @pytest.mark.asyncio
+    async def test_a_total_with_no_instant_publishes_no_share(self, monkeypatch) -> None:
+        """``cpu_clock`` is the probe's own reading of when it took the total. A
+        sample carrying one without the other is not a measurement, and no instant
+        this loop could substitute belongs to that total."""
+        store: list = []
+        clock = Clock()
+        reading = {"cpu": 10.0, "paired": True}
+        ctl = self._controller_for(
+            lambda: HostSample(
+                rss_mb=300.0,
+                cpu_seconds=reading["cpu"],
+                cpu_clock=clock() if reading["paired"] else -1.0,
+            ),
+            clock,
+            monkeypatch,
+            store,
+        )
+        await ctl.tick()
+        clock.advance(20)
+        reading["cpu"] = 15.0
+        reading["paired"] = False
+        await ctl.tick()
+        assert self._only(store, PROCESS_CPU_UTILIZATION) == []
+        # The resident set is a single reading, so it needs no pair and still publishes.
+        assert len(self._only(store, PROCESS_RSS_SAMPLED)) == 2

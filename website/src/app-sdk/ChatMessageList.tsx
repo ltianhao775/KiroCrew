@@ -26,6 +26,7 @@ import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import {
   type MessageRenderer,
   type MessageRenderContext,
+  type ThreadHooks,
   GROUPED_ROLES,
   mergeRenderers,
   resolveRenderer,
@@ -68,6 +69,9 @@ export interface ChatMessageListProps {
    *  hides its action (see chat-core/composer/selectionActions). */
   onQuote?: (text: string, rect: DOMRect) => void
   onAsk?: (text: string) => void
+  /** Reply threads on this transcript's messages (a crewmate's chat): footer
+   *  data per `mid` and the open action. Absent on every other surface. */
+  threads?: ThreadHooks
   /** Optional host-injected renderer for tool messages (role 'tool'/'tool_call'/
    *  'tool_result'). Lets a Redux-connected host (e.g. the dashboard's split-view
    *  ChatPane) render the full slot-aware ToolCallLine while this component stays
@@ -127,6 +131,11 @@ export interface TranscriptMount {
   aboveRows?: React.ReactNode
   belowRows?: React.ReactNode
   earlier?: TranscriptEarlierPaging
+  /** Level-triggered older-history walk (an alternative to `earlier` for a host
+   *  that drives an automatic walk). Supply one older-history model, not both. */
+  onTopReached?: () => void
+  /** Prefetch lead for the older-history walk; only meaningful with `onTopReached`. */
+  prefetchStartIndex?: number
   /** Pin to the bottom on appends. Default true. */
   followOutput?: boolean
   /** Where the list opens with no saved anchor. Default 'bottom'. */
@@ -153,6 +162,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
   onFileOpen,
   onQuote,
   onAsk,
+  threads,
   renderTool,
   hideCardOwnedOAuth = false,
   renderers,
@@ -268,6 +278,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
       onFileOpen,
       onQuote,
       onAsk,
+      threads,
       hideCardOwnedOAuth,
       autoDeniedIds,
       renderTool,
@@ -275,7 +286,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
       row,
     }
     return entry.render(m, ctx)
-  }, [messages, running, contentWidth, onFileOpen, onQuote, onAsk, renderTool, autoDeniedIds, hideCardOwnedOAuth, activeRenderers])
+  }, [messages, running, contentWidth, onFileOpen, onQuote, onAsk, threads, renderTool, autoDeniedIds, hideCardOwnedOAuth, activeRenderers])
 
 
   // Render a TurnItem (single or group)
@@ -414,6 +425,8 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
         aboveRows={transcript.aboveRows}
         belowRows={transcript.belowRows}
         earlier={transcript.earlier}
+        onTopReached={transcript.onTopReached}
+        prefetchStartIndex={transcript.prefetchStartIndex}
         isRowHidden={hiddenRow != null ? isRowHidden : undefined}
       />
     )

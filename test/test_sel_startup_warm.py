@@ -240,7 +240,7 @@ def test_audit_denied_hops_off_the_loop_only_when_the_warm_failed(monkeypatch):
     monkeypatch.setattr(server_mod, "sel", lambda: _Log())
     monkeypatch.setattr(server_mod.asyncio, "to_thread", _fake_to_thread)
     monkeypatch.setattr(server_mod, "mark_audit_claimed", lambda request: None)
-    request = SimpleNamespace(method="POST", path="/api/x")
+    request = SimpleNamespace(method="POST", path="/api/x", headers={})
     loop_ident = threading.get_ident()
 
     # Warm succeeded: enqueue inline, no hop.

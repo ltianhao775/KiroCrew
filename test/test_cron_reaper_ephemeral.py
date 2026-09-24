@@ -44,7 +44,8 @@ class TestReaperUsesActiveSessionKey:
 
         import asyncio
 
-        asyncio.run(svc._force_reap(job.id, elapsed=1801.0))
+        claim = svc._claim_run(job.id, "scheduled")
+        asyncio.run(svc._force_reap(job.id, elapsed=1801.0, claim=claim))
 
         # reset must have been called with the ephemeral key, NOT f"cron:{job.id}".
         assert mock_sessions.reset.await_count == 1
@@ -65,7 +66,8 @@ class TestReaperUsesActiveSessionKey:
 
         import asyncio
 
-        asyncio.run(svc._force_reap(job.id, elapsed=1801.0))
+        claim = svc._claim_run(job.id, "scheduled")
+        asyncio.run(svc._force_reap(job.id, elapsed=1801.0, claim=claim))
 
         assert mock_sessions.reset.await_count == 1
         called_key = mock_sessions.reset.await_args.args[0]
@@ -86,7 +88,8 @@ class TestReaperUsesActiveSessionKey:
 
         import asyncio
 
-        asyncio.run(svc._force_reap(job.id, elapsed=1801.0))
+        claim = svc._claim_run(job.id, "scheduled")
+        asyncio.run(svc._force_reap(job.id, elapsed=1801.0, claim=claim))
 
         called_key = mock_sessions.reset.await_args.args[0]
         assert called_key == f"cron:{job.id}"

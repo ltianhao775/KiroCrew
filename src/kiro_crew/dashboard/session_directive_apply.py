@@ -58,6 +58,7 @@ from kiro_crew.autonudge import (
     is_channel_key,
 )
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.probes.gh_pr import wake_set_phrase
 from kiro_crew.session_surface import has_dashboard_surface
 
 logger = logging.getLogger(__name__)
@@ -75,14 +76,37 @@ _USER_SURFACE_DIRECTIVES = frozenset({"set_project", "reset_conversation", "chat
 # runs, and the model's turn is over -- so a refusal that stays in the log
 # leaves a session that believes it armed a loop and is never woken again.
 _ARMING_DIRECTIVES = frozenset({"monitor_start", "monitor_watch"})
+# Directives that REVISE the loop this session already has. A refusal of one is
+# unobservable in the same way and for the same reason: the tool has already
+# answered "update requested" over its own pipe, so a denial that stays in the
+# log leaves the agent reporting a revision that never landed while the loop
+# keeps waking on its OLD instruction. The distinction from an arm is what the
+# reader must be told -- automation is still running here, it is
+# just running the previous text -- so the two share the mechanism and not the
+# wording.
+_REVISION_DIRECTIVES = frozenset({"monitor_update"})
 
 # Transcript row prefix for a refused arm. Fixed text so the frontend and tests
 # can match on it; the authorizer's reason follows the colon.
 ARM_REFUSAL_NOTICE_PREFIX = "⚠️ Automation loop NOT armed: "
 ARM_SUCCESS_NOTICE_PREFIX = "✅ Automation loop armed: "
+# Same contract for a refused revision. Deliberately NOT the arm wording: a
+# denied monitor_update leaves a loop in place, so "NOT armed" would report the
+# wrong state, and the fact the reader acts on is which instruction the next
+# wake will run.
+REVISION_REFUSAL_NOTICE_PREFIX = (
+    "⚠️ Automation loop NOT updated — it kept its previous instruction: "
+)
 
 
-def _surface_arm_refusal(state: Any, slot: Any, kind: str, reason: str) -> None:
+def _surface_arm_refusal(
+    state: Any,
+    slot: Any,
+    kind: str,
+    reason: str,
+    *,
+    prefix: str = ARM_REFUSAL_NOTICE_PREFIX,
+) -> None:
     """Append a ``notice`` row so a refused arm is VISIBLE where the session lives.
 
     The directive consumer runs AFTER the model received the tool's own
@@ -93,6 +117,11 @@ def _surface_arm_refusal(state: Any, slot: Any, kind: str, reason: str) -> None:
     thread's reader, the next turn's transcript replay) is a row of its own, so
     a refusal gets one. Slot-less callers (a channel transport's TurnDriver)
     have no transcript window; the returned string is their only surface.
+
+    ``prefix`` selects the wording for the class of directive that was refused
+    (an arm by default, a revision for ``monitor_update``). Only the leading
+    text differs: the redaction, the row role and the best-effort contract are
+    the same guarantees either way, which is why this is one helper.
 
     Best-effort: a notice is telemetry about a refusal that has already been
     audited, so it must never turn a clean denial into an exception.
@@ -108,7 +137,7 @@ def _surface_arm_refusal(state: Any, slot: Any, kind: str, reason: str) -> None:
         # The reason interpolates the authorizer's message, which can echo an
         # LLM-derived value (a target, a slot key), so scrub it like every other
         # transcript egress before it is persisted or broadcast.
-        text, _ = redact_exfiltration_urls(f"{ARM_REFUSAL_NOTICE_PREFIX}{reason}")
+        text, _ = redact_exfiltration_urls(f"{prefix}{reason}")
         text, _ = redact_credentials(text)
         append_and_surface(state, slot, "notice", text, "msg msg-info")
     except Exception:
@@ -326,6 +355,14 @@ async def apply_session_directive(
         )
         if kind in _ARMING_DIRECTIVES:
             _surface_arm_refusal(state, slot, kind, str(exc))
+        elif kind in _REVISION_DIRECTIVES:
+            _surface_arm_refusal(
+                state,
+                slot,
+                kind,
+                str(exc),
+                prefix=REVISION_REFUSAL_NOTICE_PREFIX,
+            )
         return str(exc)
     except Exception as exc:  # never propagate into the turn loop
         logger.warning("apply_session_directive(%s) failed", kind, exc_info=True)
@@ -398,6 +435,10 @@ async def _monitor_start(
         # rather than erroring. The authorizer owns the cap and both redaction
         # passes, so nothing is validated twice by routing through it.
         banner=str(args.get("banner") or ""),
+        # Named explicitly for the reason the comment above gives: this call has no
+        # splat, so a brief the tool accepted and this line omitted would be dropped
+        # without a word -- the loop would arm with no judge and nothing would say so.
+        judge=args.get("judge") if isinstance(args.get("judge"), dict) else None,
         source="mcp-directive",
         caller="session-directive",
         gate=gate,
@@ -438,7 +479,10 @@ async def _monitor_start(
     if armed_monitor is not None and getattr(loop, "gate", False):
         cadence = (
             f"observing {armed_monitor.target} every {idle_secs}s and re-injecting the "
-            "message only when it changes, so quiet cycles cost no turn"
+            "message only on a wake from it -- "
+            f"{wake_set_phrase()} -- so a lane finishing while others still "
+            "run costs no turn, and a raised wake lands up to about one "
+            "interval after the tick that saw it"
         )
     else:
         cadence = f"the message re-injects every {idle_secs}s"
@@ -748,6 +792,9 @@ async def _monitor_update(
         # as "leave unchanged", while an explicit "" reaches it as a clear -- the
         # distinction the handler preserved by keeping a blank banner in the patch.
         banner=patch.get("banner"),
+        # Absent leaves the brief alone; ``{}`` clears it. Same absent-vs-explicit
+        # distinction as ``banner`` above, preserved by the tool surface.
+        judge=patch.get("judge"),
         # A message write with NO baseline SKIPS the stale check rather than failing it, so
         # hand it the token read above -- scoped to the message case, as the handler's 409 is.
         expect_fingerprint=(baseline_token if patch.get("message") is not None else None),
@@ -822,7 +869,14 @@ async def _structured_monitor_update(
     # objective as the transcript row), so it belongs with the legacy fields the
     # structured path refuses. Without it here, ``monitor_update`` would accept a
     # banner into the patch, drop it, and report success -- a silent no-op.
-    legacy_only = sorted(set(patch) & {"message", "max_cycles", "active", "banner"})
+    #
+    # ``judge`` is the same class and reaches this path the same way: the schema
+    # offers it on EVERY ``monitor_update``, so arming a structured monitor and then
+    # sending a brief is two ordinary steps. A structured monitor is probe-first and
+    # holds no brief, so the field has nowhere to go here -- and an owner who is told
+    # their criterion was armed, while every tick keeps firing on the typed probe
+    # alone, has no way to discover that from the acknowledgement.
+    legacy_only = sorted(set(patch) & {"message", "max_cycles", "active", "banner", "judge"})
     if legacy_only:
         raise _DirectiveDenied(
             "monitor_update cannot apply legacy fields to a structured monitor: "

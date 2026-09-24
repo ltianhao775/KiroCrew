@@ -32,16 +32,26 @@ from typing import TextIO
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import fsync_dir
+from kiro_crew.crew_log.checkpoint import PrefixWitness, witness_mapping
 from kiro_crew.crew_log.schema import KIND_MEMBER
 from kiro_crew.eventlog import members_projections, types
 from kiro_crew.eventlog.log import MemberLog
 from kiro_crew.eventlog.members_projections import all_units
-from kiro_crew.eventlog.projection import ProjectionRegistry
 from kiro_crew.eventlog.types import Event
+from kiro_crew.projection import EMPTY_WATERMARK, DirectoryCheckpointStore, ProjectionRegistry
 
 logger = logging.getLogger(__name__)
 
 Broadcast = Callable[[str, object], None]
+
+#: Events a prime must have folded past its savepoint before a new one is written.
+#: A savepoint is allowed to LAG -- resuming from an older one replays more tail and
+#: reaches the same value -- so a write is spent only when it saves a meaningful
+#: replay. Without this every load of every member would rewrite one file per
+#: registered unit, which is the cost savepoints exist to remove rather than move,
+#: and a short-lived member would leave files behind that folding from the start
+#: already handles for free. Matches the crew log's own ``MIN_ADVANCE_ENTRIES``.
+_SAVEPOINT_MIN_ADVANCE = 256
 
 
 def _redact_projection_value(value: object) -> object:
@@ -74,12 +84,12 @@ def _redact_projection_value(value: object) -> object:
     return value
 
 
-#: The unit kind this service serves. A second kind registers alongside it
-#: rather than forking this module.
-#: Suffix that marks a member's legacy activity file as already folded. Its mere
-#: EXISTENCE is the completion record: the fold dedupes by counting matching rows,
-#: which cannot tell a row the migration has not reached from one written after it
-#: finished, so without a marker every later write would be imported as trusted.
+#: Suffix the legacy activity file is renamed to once the fold has run. Hygiene
+#: rather than the protection: the completion record is the fenced
+#: :data:`LEGACY_FOLDED_MARKER`, because the member directory is writable by the
+#: party that record defends against. Renaming keeps a member's own rows readable
+#: under a retired name instead of deleting them, and keeps the byte budget off a
+#: file already folded.
 LEGACY_MIGRATED_SUFFIX = ".migrated"
 
 #: Records, inside the member's own FENCED log directory, that the legacy activity
@@ -132,8 +142,6 @@ def _legacy_fold_completed(slug: str) -> bool:
 #: agent-writable and the fold runs on every ``ensure``, which the roster
 #: projection calls, so an unbounded read sits on a request path.
 MAX_LEGACY_ACTIVITY_BYTES = 8 * 1024 * 1024
-
-UNIT_KIND = "member"
 
 _singleton: "MemberEventLogService | None" = None
 _singleton_lock = threading.Lock()
@@ -258,8 +266,6 @@ def _read_legacy_activity_files(slug: str) -> tuple[list[dict], bool]:
     are skipped — the legacy writer was best-effort and never fsync'd, so a
     torn tail is expected, not corruption.
     """
-    import json
-
     from kiro_crew import members
 
     rows: list[dict] = []
@@ -515,24 +521,162 @@ class MemberEventLogService:
             if log.refresh_if_changed():
                 self._fold_gap_locked(slug, log)
             return log
-        if log is None:
-            log = MemberLog(slug)
-            if not log.exists():
-                return None
-            log.load()
-            events = log.iter_events()
-            if log.header is not None:
-                header_name = log.header.get("name")
-                self._names[slug] = header_name if isinstance(header_name, str) else slug
-            self._registry.prime(slug, events)
-            with self._map_lock:
-                # Another thread may have primed concurrently; last writer wins
-                # the map slot but priming is idempotent.
-                existing = self._logs.get(slug)
-                if existing is not None:
-                    return existing
-                self._logs[slug] = log
+        log = MemberLog(slug)
+        if not log.exists():
+            return None
+        log.load()
+        if log.header is not None:
+            header_name = log.header.get("name")
+            self._names[slug] = header_name if isinstance(header_name, str) else slug
+        self._prime_checkpointed(slug, log)
+        with self._map_lock:
+            # Another thread may have primed concurrently. The FIRST primer into
+            # this lock installs its instance and every later one adopts it, so a
+            # loser's own fold is wasted rather than wrong: priming is idempotent.
+            existing = self._logs.get(slug)
+            if existing is not None:
+                return existing
+            self._logs[slug] = log
         return log
+
+    def _prime_checkpointed(self, slug: str, log: MemberLog) -> None:
+        """Prime *slug* from its savepoints, folding only the tail past the watermark.
+
+        Falls back to the full fold whenever the shortcut cannot be trusted -- no
+        identity to compare, or no usable savepoint -- because a cold fold reaches the
+        same value at more cost, and that is the whole posture of a savepoint.
+
+        TWO conditions decide that, not one. The identity block covers what is fixed
+        once a fold is done and is compared by equality. The prefix digest covers what
+        equality cannot reach: that the bytes the state was folded from are still the
+        bytes in the file. This log needs the second one on its own terms -- a damaged
+        committed line is skipped on load, so a cold fold omits what it contributed
+        while a savepoint written before the damage keeps it, and a resumed fold never
+        revisits the region below its watermark. Without the digest those two reads
+        disagree for the life of the member, which is the one thing a savepoint may
+        not do.
+
+        WHAT THIS SAVES, stated honestly: the FOLD, not the read. ``MemberLog``
+        materialises its event list on load, so the file is parsed either way; what
+        the watermark removes is one ``apply`` per definition per skipped event, which
+        with four registered units is the dominant cost of priming a long-lived
+        member. Removing the read cost too needs a windowed reader that starts at a
+        seq, which is a separate change to the log rather than to the fold.
+        """
+        identity = log.checkpoint_identity()
+        admit = log.checkpoint_admit(identity["first_seq"]) if identity is not None else None
+        if identity is None or admit is None:
+            self._registry.prime(slug, log.iter_events())
+            return
+
+        # The witness for the prefix this pass trusts, read in ``tail_from`` below and
+        # held here for the post-fold recheck and the write.
+        witness: list = []
+
+        def tail_from(watermark: int):
+            # ``prime_checkpointed`` calls this ONCE with the floor and then consumes
+            # what it returns, so this is the only moment that knows the floor and is
+            # still ahead of the pass -- and a witness is evidence only when it was
+            # read before the bytes were folded.
+            #
+            # A resume needs one whatever it intends to write: the restored state
+            # stands on a prefix this pass never revisits, so without a digest read
+            # here nothing afterwards can say that prefix is still in the file. A pass
+            # that resumed nothing asks only whether a write is owed, which keeps the
+            # boundary walk off the reads that could not spend it either way.
+            if watermark != EMPTY_WATERMARK or self._write_may_be_owed(log, watermark):
+                prefix = log.checkpoint_witness(log.last_seq())
+                if prefix is not None:
+                    witness.append(prefix)
+            return (ev for ev in log.iter_events() if ev["seq"] > watermark)
+
+        floor = self._registry.prime_checkpointed(
+            slug, self._checkpoints(slug), identity, tail_from, admit=admit
+        )
+        prefix = witness[0] if witness else None
+        if floor != EMPTY_WATERMARK and not self._resumed_prefix_still_holds(log, prefix):
+            # The bytes below the watermark moved while the tail was folding, so the
+            # restored state carries an entry the file does not yield any more -- and a
+            # resumed fold never returns to that region to notice. Refusing the write
+            # is not enough here: the state is already in the registry and would be
+            # served for the life of this instance while disagreeing with every cold
+            # fold. Fold from the start instead, which is what the file now says.
+            self._registry.prime(slug, log.iter_events())
+            return
+        self._maybe_save_savepoints(slug, log, identity, floor, prefix)
+
+    @staticmethod
+    def _resumed_prefix_still_holds(log: MemberLog, prefix: PrefixWitness | None) -> bool:
+        """Whether a resumed pass can still vouch for the prefix it stood on.
+
+        No witness is not a pass: a boundary the file does not resolve leaves nothing
+        to compare, and a resume that cannot be checked is the one case that must fall
+        back rather than be trusted.
+        """
+        if prefix is None:
+            return False
+        return log.checkpoint_prefix_unchanged(prefix)
+
+    def _checkpoints(self, slug: str) -> DirectoryCheckpointStore:
+        """This member's savepoint store, inside the directory its own log lives in.
+
+        The kernel owns no path, so the directory is chosen here. It is the log's own
+        store directory, which is already fenced from a sandboxed process and from the
+        agent's file tools -- so a savepoint inherits that protection by living there
+        and needs no fence entry of its own. It also means removing the member
+        removes its savepoints, with no second place to clean up.
+        """
+        from kiro_crew.crew_log.store import crew_log_dir
+
+        return DirectoryCheckpointStore(crew_log_dir(KIND_MEMBER, slug) / "projections")
+
+    @staticmethod
+    def _write_may_be_owed(log: MemberLog, floor: int) -> bool:
+        """Whether a fold reaching this log's end from *floor* could owe a write.
+
+        The same threshold :meth:`_maybe_save_savepoints` enforces, asked BEFORE the
+        pass so the witness read can be skipped on a load that cannot write anything.
+        It is an upper bound on that decision and not a second copy of it: the fold
+        can end below the log's current end, and the write is refused there.
+        """
+        return log.last_seq() - max(floor, 0) >= _SAVEPOINT_MIN_ADVANCE
+
+    def _maybe_save_savepoints(
+        self,
+        slug: str,
+        log: MemberLog,
+        identity: dict,
+        floor: int,
+        prefix: PrefixWitness | None,
+    ) -> None:
+        """Write savepoints when the tail just folded was long enough to be worth it.
+
+        A savepoint is allowed to LAG, so a write is spent only when it saves a
+        meaningful replay. Without a threshold this would rewrite every unit's file on
+        every load of every member, which is the cost savepoints exist to remove
+        rather than relocate -- and a short-lived member would leave files behind that
+        folding from the start already handles for free.
+
+        *prefix* is the digest read before the pass. Nothing is written without one,
+        and nothing is written if the bytes it covers moved while the pass ran: either
+        way nothing here could say which bytes produced this state, and a savepoint
+        that cannot say so is the one thing worse than none. It certifies ONE
+        boundary, so a unit standing at another seq waits for a pass whose witness
+        covers it.
+        """
+        reached = log.last_seq()
+        if reached - max(floor, 0) < _SAVEPOINT_MIN_ADVANCE:
+            return
+        if prefix is None:
+            return
+        if not log.checkpoint_prefix_unchanged(prefix):
+            return
+        store = self._checkpoints(slug)
+        witness = witness_mapping(prefix)
+        for savepoint in self._registry.savepoints(slug, identity, witness=witness):
+            if savepoint.watermark != prefix.seq:
+                continue
+            store.save(slug, savepoint)
 
     # ---- units ------------------------------------------------------------
     def ensure(self, slug: str, name: str, config=None) -> None:

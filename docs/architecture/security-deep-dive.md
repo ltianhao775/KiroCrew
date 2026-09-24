@@ -71,7 +71,7 @@ Layer 4  Output ....... credential redaction + URL exfil scan + streaming redact
 Layer 3  Validation ... typed MCP tool schemas, unicode normalization, length caps
 Layer 2  Command ...... denied-command rules + sensitive-bash + exfil shapes
 Layer 1  Filesystem ... resolved-path gate (read block + wider write block)
-Layer 0  OS sandbox ... namespace (Linux) / Seatbelt (macOS), opt-in
+Layer 0  OS sandbox ... namespace (Linux) / Seatbelt (macOS), default auto where supported
 
 Across all layers: request auth (dashboard tokens, CSRF, Host allowlist),
                    Slack owner lock + workspace origin check,
@@ -337,8 +337,8 @@ granted).
 
 ## Layer 3: Input validation (`validation.py`)
 
-Every MCP tool call is checked against a declarative `FieldSpec` + `ToolSchema`
-before the handler sees it: NFC unicode normalization with hidden-character
+Every Kiro Crew-owned MCP tool call is checked against a declarative
+`FieldSpec` + `ToolSchema` before the handler sees it: NFC unicode normalization with hidden-character
 stripping (control, format and surrogate code points, preserving `\n`/`\r`/`\t`
 plus the four shaping marks in `_ALLOWED_FORMAT` when they sit next to non-ASCII
 text; private-use code points are deliberately kept, because Nerd Font and
@@ -422,6 +422,25 @@ records the run as ok either way. Such a child refuses instead of proceeding
 in the child's environment AND on that errno). Everything else, including the
 gateway's own spawns and any other audit failure, keeps the log-and-proceed
 posture above. `test_sandbox_cron_child_audit.py` pins both halves.
+
+The converse rule covers refusals, and it runs the other way: **a denial's audit
+is best-effort**. Once a guard has refused -- a sensitive canonical target, a
+project directory inside a protected tree -- the refusal already stands on its
+own, so a failed SEL write must never be allowed to turn it into permission.
+Denial sites therefore pass no `critical=True` and degrade to a WARNING naming
+the operation, because for some surfaces the refusal is the process's first SEL
+use and an unwritable log would otherwise abort the caller on exactly the hostile
+path the guard exists to handle. `agent_discovery._audit_denied` is the pattern;
+`test_agent_spec_hardened_reads.py` pins that every denial path in that module
+keeps its never-raise promise under a broken SEL.
+
+Best-effort does not excuse the row's absence when SEL is healthy, which is the
+other half of the rule. Every refusal path emits one, and the caller names itself
+through `operation`/`source` so the trail attributes the probe to the request
+that made it rather than to the helper that caught it; a call-site ratchet
+enumerates those labels so a new caller cannot land silently behind the callee's
+defaults. A refusal that emits no audit call at all is the defect this rule
+names. A refusal whose audit call failed is the rule working.
 
 ## Governance: the enterprise ceiling
 
@@ -557,10 +576,10 @@ text is framed as explicitly untrusted data with a SEL event on every drop.
 
 | Control | Implementation |
 |---|---|
-| XSS prevention | DOMPurify on all rendered HTML content |
-| Safe DOM APIs | `createElement` + `textContent` for error fallbacks |
-| Mermaid | `securityLevel: 'strict'` (iframe sandbox), so an injected diagram cannot execute JS |
-| No `innerHTML` | React text children rather than HTML string construction |
+| HTML/SVG sanitization | Model-authored Markdown, highlighted code, Mermaid, SVG and icon markup pass through DOMPurify before a controlled HTML sink |
+| Executable document isolation | Widgets and other executable `srcdoc` content use sandboxed iframes plus restrictive CSP rather than DOMPurify, which would strip their scripts |
+| Safe DOM APIs | Ordinary text and error fallbacks use React text children or `createElement` + `textContent` |
+| Mermaid | `securityLevel: 'strict'`, followed by sanitization, so an injected diagram cannot execute JS |
 | No regex linkification | React elements via `.split()` |
 
 ## Credential file handling
@@ -620,11 +639,12 @@ credential stores, and blocking the whole home directory would make the agent
 useless for its normal work. An agent write there is therefore a real persistence
 vector, mitigated only by the approval gate and the destructive-command rules.
 
-**Resource ceilings depend on the platform.** The cgroup v2 scope that bounds
-fork bombs and memory balloons requires Linux with cgroup delegation; where it is
-unavailable (macOS, older Linux, no user session) it is a no-op with a loud
-warning and only the file-descriptor limit applies. See
-[`resource-protection.md`](resource-protection.md).
+**Resource ceilings depend on the platform.** Linux uses cgroup v2 for
+subtree process and memory ceilings when delegation is available. Windows ACP
+agent trees instead use Job Object process-count and memory limits (with process,
+not thread, semantics). macOS and Linux hosts without delegation have no hard
+per-subtree process/memory ceiling; they retain the file-descriptor cap and
+post-failure reapers. See [`resource-protection.md`](resource-protection.md).
 
 **Launcher self-poisoning by the same user is accepted, not defended (CWE-345;
 tracked as CWE-778 by

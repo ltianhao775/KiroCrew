@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import stat
 import threading
 import time
@@ -58,14 +59,20 @@ _PROJECTION_LEASE_MAX_BYTES = 65536
 # here rather than recomputed from the writer, because widening the writer must
 # not silently widen what the reclaim is willing to delete.
 _LEGACY_ALIAS_NAME_RE = re.compile(re.escape(NATIVE_SKILL_ALIAS_PREFIX) + r"[0-9a-f]{24}")
-# Reclaims PER RUN, not candidates examined. The first prune after an upgrade
-# faces the whole accumulated backlog -- thousands of files on the hosts that
-# motivated this -- and it runs while the publication lock is held, whose own
-# acquisition ceiling is 2s. Draining it in one sweep would make a concurrent
-# spawn in a worktree-per-task pipeline fail to acquire and fall back to authored
-# agents. The backlog is bounded and shrinking, so spreading it over successive
-# spawns reclaims it just as completely without ever holding the lock long.
+# A CEILING on reclaims per run, never a floor: the time budget below can end a
+# call having reclaimed none at all. It is headroom over the aliases one run
+# publishes, so a call that does reach them covers the steady-state orphan rate
+# as well as some backlog. It bounds no part of the critical section: a candidate
+# that is kept, active or leased costs a full classification and never increments
+# it, which is why the section carries its own budget below.
 _PRUNE_MAX_RECLAIMS_PER_RUN = 64
+# The budget for one call's classification work, and a BETWEEN-candidate one: it
+# bounds how many candidates are walked, not how long any single one takes, and
+# the directory enumeration that precedes the walk is outside it. Sized well under
+# _PROJECTION_LOCK_TIMEOUT_SECS and sharing that ceiling with the publication
+# writes in the same section -- two atomic writes per alias plus the settings
+# commit -- so it has to leave room for those, not merely fit under the ceiling.
+_PRUNE_MAX_SECONDS_PER_RUN = 0.4
 # The ONE window the re-preparation contract does not cover, and the only thing
 # this age excludes. A publisher from a build that predates the lease holds no
 # lease, so between its write and kiro-cli reading `--agent` its alias looks
@@ -327,6 +334,44 @@ def _acquire_projection_lease(directory: Path, aliases: set[str]) -> ExitStack:
     return stack
 
 
+def _read_lease_record(lease_path: Path) -> list[str] | None:
+    """The alias list one lease record names, or ``None`` when it cannot be trusted.
+
+    The ONE parse of the record shape, shared by the liveness probe and the
+    census so the two cannot disagree. Bounded by the writer's own limits
+    (:data:`_PROJECTION_LEASE_MAX_BYTES`, :data:`_PROJECTION_LEASE_MAX_ALIASES`):
+    an oversized, malformed, or non-list record is ``None``, and so is any read
+    error. A plain bounded read, not the hardened one: this runs once per lease
+    on EVERY spawn and every set_mode, and the hardened reader adds path
+    validation and an audit write per call, which is measurable on the
+    projected-MCP E2E -- it passes at 288s against a 300s ceiling, so a few
+    percent decides it. No lock is ever taken on this file, so the read cannot
+    collide with a holder the way the pre-split single-file lease did.
+    """
+    try:
+        record_fd = os.open(lease_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            raw = os.read(record_fd, _PROJECTION_LEASE_MAX_BYTES + 1)
+        finally:
+            os.close(record_fd)
+        if len(raw) > _PROJECTION_LEASE_MAX_BYTES:
+            return None
+        body = json.loads(raw)
+    except (OSError, ValueError, TypeError, RecursionError):
+        # RecursionError is a RuntimeError, not a ValueError: a hand-authored
+        # record nested past the interpreter limit must read as untrusted, not
+        # abort the caller. No writer in this module produces one.
+        return None
+    listed = body.get("aliases") if isinstance(body, dict) else None
+    if (
+        not isinstance(listed, list)
+        or len(listed) > _PROJECTION_LEASE_MAX_ALIASES
+        or any(not isinstance(value, str) for value in listed)
+    ):
+        return None
+    return listed
+
+
 def _alias_has_external_lease(directory: Path, alias: str) -> bool:
     """Return whether another process may still use *alias*; uncertainty is live.
 
@@ -361,27 +406,10 @@ def _alias_has_external_lease(directory: Path, alias: str) -> bool:
             if record_info is None or not stat.S_ISREG(record_info.st_mode):
                 return True
             record_identity = (record_info.st_dev, record_info.st_ino)
-            # A plain bounded read, not the hardened one: this runs once per
-            # lease on EVERY spawn and every set_mode, and the record is already
-            # identity-checked and non-link above. The hardened reader adds path
-            # validation and an audit write per call, which is measurable on the
-            # projected-MCP E2E -- it passes at 288s against a 300s ceiling, so a
-            # few percent decides it. No lock is ever taken on this file, so the
-            # read cannot collide with a holder the way the pre-split one did.
-            record_fd = os.open(lease_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            try:
-                raw = os.read(record_fd, _PROJECTION_LEASE_MAX_BYTES + 1)
-            finally:
-                os.close(record_fd)
-            if len(raw) > _PROJECTION_LEASE_MAX_BYTES:
-                return True
-            body = json.loads(raw)
-            listed = body.get("aliases") if isinstance(body, dict) else None
-            if (
-                not isinstance(listed, list)
-                or len(listed) > _PROJECTION_LEASE_MAX_ALIASES
-                or any(not isinstance(value, str) for value in listed)
-            ):
+            # The record is already identity-checked and non-link above; the
+            # bounded parse itself is shared with the census (see the helper).
+            listed = _read_lease_record(lease_path)
+            if listed is None:
                 return True
             holder_fd = stack.enter_context(platform_compat.open_lock_file(holder_path))
             opened = os.fstat(holder_fd)
@@ -454,64 +482,6 @@ def _restore_inheritance(path: Path, local: dict[str, Any]) -> None:
 def _managed_marker(spec: object) -> bool:
     """Return whether a generated spec carries this lifecycle's marker."""
     return isinstance(spec, dict) and spec.get(_MANAGED_MARKER) == _MANAGED_MARKER_VALUE
-
-
-def _managed_metadata_path_is_safe(path: Path) -> bool:
-    """Return whether untrusted managed metadata is safe to probe on this host."""
-    if not platform_compat.IS_WINDOWS:
-        return True
-    try:
-        # Ask only about the volume root first. Unlike is_dir/is_file, this does
-        # not resolve the attacker-controlled path or initiate SMB authentication.
-        if platform_compat.path_volume_is_remote(path) is not False:
-            return False
-        return platform_compat.first_linked_ancestor(
-            path
-        ) is None and not platform_compat.is_link_or_junction(path)
-    except (OSError, ValueError):
-        return False
-
-
-def _managed_alias_is_stale(spec: dict[str, Any]) -> bool:
-    """Return whether a managed view's authored source cannot regenerate it."""
-    work_dir_raw = spec.get(_MANAGED_WORK_DIR)
-    agent = spec.get(_MANAGED_AGENT)
-    source_raw = spec.get(_MANAGED_SOURCE)
-    if (
-        not isinstance(work_dir_raw, str)
-        or not work_dir_raw
-        or not isinstance(agent, str)
-        or not agent
-        or not isinstance(source_raw, str)
-        or not source_raw
-    ):
-        return False
-    try:
-        work_dir = Path(work_dir_raw)
-        if not _managed_metadata_path_is_safe(work_dir):
-            return False
-        if not work_dir.is_dir():
-            return True
-        source = Path(source_raw)
-        expected_parents = {
-            project_agents_dir(str(work_dir)).absolute(),
-            kiro_agents_dir().absolute(),
-        }
-        if source.absolute().parent not in expected_parents or source.suffix not in {
-            ".json",
-            ".md",
-        }:
-            return False
-        if not _managed_metadata_path_is_safe(source):
-            return False
-        if not source.is_file():
-            return True
-        authored = _read_agent_spec(source, operation="native_skill_projection", source="acp")
-    except (OSError, ValueError):
-        return False
-    # Read/parse uncertainty is fail-safe. A valid source naming a different
-    # agent proves this recorded pair cannot be regenerated.
-    return isinstance(authored, dict) and authored.get("name") != agent
 
 
 def _unlink_alias_if_unchanged(path: Path, identity: tuple[int, int]) -> bool:
@@ -651,22 +621,67 @@ def _managed_metadata_for_alias(
     return None
 
 
+def _prune_start_offset(count: int) -> int:
+    """Where this call begins its bounded walk over *count* candidates.
+
+    A bounded walk over a stable directory order examines the same prefix every
+    call, so a prefix of entries that are kept, active or leased hides the whole
+    reclaimable remainder behind it -- permanently, because the walk never gets
+    past its own budget to see it. Moving the start makes every entry reachable
+    across calls. It cannot be a cursor in memory: the workload this bound exists
+    for spawns a fresh process per cron run, so a process-local cursor restarts at
+    zero every time and rotates nothing.
+    """
+    if count <= 0:
+        return 0
+    return secrets.randbelow(count)
+
+
 def _prune_stale_managed_aliases(directory: Path, crew_home_id: str, *, keep: set[str]) -> None:
-    """Remove stale aliases owned by this Kiro Crew data home while its lock is held."""
+    """Remove aliases owned by this Kiro Crew data home that no projection uses.
+
+    Runs while the publication lock is held, so a deletion cannot land on an alias
+    a publisher that takes that lock is writing; a build predating the lease takes
+    no part in it, and the minimum age is what covers that one. A time budget keeps
+    the held lock down to a slice of the walk rather than all of it. An alias is
+    kept when this run publishes it, a projection in this process holds it, or a
+    held lease in any process names it. Everything else this data home
+    recorded is a cache entry for a projection that has ended: every consumer
+    re-prepares before it sends an alias, so removing one costs the next spawn
+    for that work directory one rewrite and nothing else. Whether the recorded work directory still exists
+    is not consulted: a per-run work directory outlives its run, so keying on
+    it keeps one alias per agent for every run ever spawned.
+    """
     try:
         candidates = list(directory.glob(f"{NATIVE_SKILL_ALIAS_PREFIX}*.json"))
     except OSError:
         logger.debug("skill projection: cannot list %s to prune aliases", directory, exc_info=True)
         return
     active = _active_aliases()
+    # Each run publishes len(keep) aliases and leaves that many behind when it
+    # ends, so the cap covers that steady-state rate plus bounded backlog drain.
+    cap = _PRUNE_MAX_RECLAIMS_PER_RUN + len(keep)
+    offset = _prune_start_offset(len(candidates))
+    candidates = candidates[offset:] + candidates[:offset]
+    deadline = time.monotonic() + _PRUNE_MAX_SECONDS_PER_RUN
     reclaimed = 0
+    examined = 0
     for path in candidates:
-        if reclaimed >= _PRUNE_MAX_RECLAIMS_PER_RUN:
+        if reclaimed >= cap:
             logger.info(
                 "skill projection: reclaim cap reached (%d); the rest drains on later spawns",
-                _PRUNE_MAX_RECLAIMS_PER_RUN,
+                cap,
             )
-            return
+            break
+        if time.monotonic() >= deadline:
+            logger.info(
+                "skill projection: prune budget spent after %d candidate(s); the rest drains on later spawns",
+                examined,
+            )
+            break
+        # Counted for EVERY candidate, not only the reclaimed ones: what the budget
+        # has to cover is the classification, which a skip pays in full.
+        examined += 1
         if (
             path.stem in keep
             or path.stem in active
@@ -710,15 +725,13 @@ def _prune_stale_managed_aliases(directory: Path, crew_home_id: str, *, keep: se
                     # between the two reads; that owner decides its lifetime.
                     continue
                 if _unlink_alias_if_unchanged(path, identity):
-                    logger.info("skill projection: pruned unrecorded legacy alias %s", path.name)
+                    logger.debug("skill projection: pruned unrecorded legacy alias %s", path.name)
                     reclaimed += 1
                 else:
                     logger.debug("skill projection: legacy alias changed before removal: %s", path)
             continue
         metadata, metadata_path, metadata_identity, metadata_raw = managed
         if metadata.get(_MANAGED_CREW_HOME) != crew_home_id:
-            continue
-        if not _managed_alias_is_stale(metadata):
             continue
 
         # Re-open and revalidate the exact alias and ownership sidecar at
@@ -745,16 +758,144 @@ def _prune_stale_managed_aliases(directory: Path, crew_home_id: str, *, keep: se
             or current_metadata_identity != metadata_identity
             or current_metadata_raw != metadata_raw
             or current_metadata.get(_MANAGED_CREW_HOME) != crew_home_id
-            or not _managed_alias_is_stale(current_metadata)
         ):
             continue
         if _unlink_alias_if_unchanged(path, identity):
             if metadata_path is not None and metadata_identity is not None:
                 _unlink_projection_lease_if_unchanged(metadata_path, metadata_identity)
-            logger.info("skill projection: pruned stale managed alias %s", path.name)
+            logger.debug("skill projection: pruned unused managed alias %s", path.name)
             reclaimed += 1
         else:
-            logger.debug("skill projection: stale alias changed before removal: %s", path)
+            logger.debug("skill projection: unused alias changed before removal: %s", path)
+    if reclaimed > 0:
+        logger.info("skill projection: reclaimed %d unused alias(es)", reclaimed)
+
+
+# Bounds on what the census RETAINS, not on what it counts: every retained
+# collection has a ceiling and the result says when one was hit. Both are the
+# diagnostic's own memory and I/O budget, nothing more: the alias ceiling is far
+# above the backlogs that motivated the census (28k on one host) and comfortably
+# below what a doctor run may hold in memory; the lease ceiling bounds how many
+# record files one run opens. The reclaim itself scans the lease directory whole
+# and caps reclaims per run, not records -- so past the lease ceiling the census
+# cannot say what the reclaim will do, and reports that instead of guessing.
+_CENSUS_MAX_ALIASES = 65536
+_CENSUS_MAX_LEASES = 4096
+
+
+def census_projected_aliases(directory: Path) -> dict[str, int]:
+    """Count the projected aliases in *directory* without touching any of them.
+
+    A read-only census for diagnostics, in this module so the lease-record and
+    sidecar shapes it reads are the ones :func:`_prune_stale_managed_aliases`
+    reclaims by. Returns plain counts:
+
+    ``total``
+        regular ``<prefix>*.json`` files directly in *directory*;
+    ``leased``
+        of those, how many a lease record names. The record is read with the
+        reclaim's own parse and NO lock is probed -- a probe would reclaim
+        residue as a side effect, which a census must not do -- so this is
+        "published by some projection", not "held right now": a crash-stale
+        record counts here until the next spawn's probe reclaims it;
+    ``foreign_home`` / ``foreign_leased``
+        of the unreferenced and of the lease-named aliases respectively, how
+        many an ownership sidecar attributes to a Kiro Crew data home other
+        than this process's own -- spelled exactly as the publisher records it,
+        so a caller cannot pass a differently normalised id. Two homes share
+        one agents directory whenever they share ``~/.kiro``, and this
+        gateway's reclaim skips the other home's aliases unconditionally, so
+        neither bucket drains here and the leased one is not "held or
+        crash-stale" from this gateway's point of view either;
+    ``unreadable_leases``
+        lease records the reclaim reads as uncertainty. While one exists
+        :func:`_alias_has_external_lease` answers "live" for EVERY alias and
+        nothing is reclaimed, so a diagnostic must not promise a drain;
+    ``truncated``
+        1 when a retention bound (:data:`_CENSUS_MAX_ALIASES`,
+        :data:`_CENSUS_MAX_LEASES`) was hit, so the other counts are floors.
+
+    Every read failure counts toward the side that claims less: an unreadable
+    directory is an empty census, an unreadable sidecar is not foreign.
+    """
+    counts = {
+        "total": 0,
+        "leased": 0,
+        "foreign_home": 0,
+        "foreign_leased": 0,
+        "unreadable_leases": 0,
+        "truncated": 0,
+    }
+    crew_home_id = data_home().absolute().as_posix()
+    stems: set[str] = set()
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if not (
+                    entry.name.startswith(NATIVE_SKILL_ALIAS_PREFIX)
+                    and entry.name.endswith(".json")
+                    and entry.is_file(follow_symlinks=False)
+                ):
+                    continue
+                if len(stems) >= _CENSUS_MAX_ALIASES:
+                    counts["truncated"] = 1
+                    break
+                stems.add(entry.name[: -len(".json")])
+    except OSError:
+        return counts
+    counts["total"] = len(stems)
+    if not stems:
+        return counts
+
+    named: set[str] = set()
+    lease_dir = directory / _PROJECTION_LEASE_DIR_NAME
+    records = 0
+    try:
+        with os.scandir(lease_dir) as entries:
+            for entry in entries:
+                if not (
+                    entry.name.endswith(_PROJECTION_LEASE_RECORD_SUFFIX)
+                    and entry.is_file(follow_symlinks=False)
+                ):
+                    continue
+                if records >= _CENSUS_MAX_LEASES:
+                    counts["truncated"] = 1
+                    break
+                records += 1
+                listed = _read_lease_record(Path(entry.path))
+                if listed is None:
+                    counts["unreadable_leases"] += 1
+                    continue
+                # Only stems this census retained: bounded by the alias ceiling.
+                named.update(stems.intersection(listed))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        counts["unreadable_leases"] += 1
+    counts["leased"] = len(named)
+
+    # Plain bounded reads, like the lease records: the hardened reader audits
+    # every call, and a backlog is tens of thousands of sidecars.
+    metadata_dir = directory / _PROJECTION_METADATA_DIR_NAME
+    for stem in stems:
+        try:
+            fd = os.open(metadata_dir / f"{stem}.json", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                raw = os.read(fd, _PROJECTION_LEASE_MAX_BYTES + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > _PROJECTION_LEASE_MAX_BYTES:
+                continue
+            metadata = json.loads(raw)
+        except (OSError, ValueError, TypeError, RecursionError):
+            continue
+        if (
+            _managed_marker(metadata)
+            and isinstance(metadata.get(_MANAGED_CREW_HOME), str)
+            and metadata[_MANAGED_CREW_HOME] != crew_home_id
+        ):
+            counts["foreign_leased" if stem in named else "foreign_home"] += 1
+    return counts
 
 
 def prepare_native_skill_projection(

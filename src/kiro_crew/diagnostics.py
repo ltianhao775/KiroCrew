@@ -120,6 +120,17 @@ class BundleResult:
     #: member name -> number of redactions applied (0 = clean)
     redaction_summary: dict[str, int] = field(default_factory=dict)
     github_issue_url: str = ""
+    #: The ONE release-provenance resolution this bundle was written from.
+    #: :func:`collect_bundle` takes it before the first member and hands it to
+    #: ``versions.txt``, ``manifest.json`` and the issue link, and keeps it here
+    #: so the terminal link ``kirocrew doctor`` prints afterwards describes the
+    #: same bundle instead of re-reading a ``channel`` record that may have
+    #: changed since (``set_release_channel`` runs on the loop while the
+    #: collector runs in a worker thread). ``None`` only on a result built
+    #: without the collector. Not in :meth:`as_dict`: the raw stamp and the
+    #: record are private bundle evidence, and the response carries the link
+    #: built from them.
+    provenance: release_channel.Provenance | None = None
 
     @property
     def total_redactions(self) -> int:
@@ -839,20 +850,25 @@ def _kiro_cli_version() -> str:
 _PEP440_PRERELEASE = release_channel._PEP440_PRERELEASE
 
 
-def _channel() -> str:
-    """This build's release channel.
+def _provenance() -> release_channel.Provenance:
+    """What this build can prove about its release identity.
 
-    Thin alias for :func:`kiro_crew.release_channel.channel`, which owns the
-    rule (and documents why it is not a one-line substring test) — the status
-    payload needs the same answer without importing this collector.
+    Thin alias for :func:`kiro_crew.release_channel.provenance`, which owns the
+    rule (and documents why a classifier over the raw version stamp is not
+    enough) — the status payload keeps its own three-valued read of
+    :func:`kiro_crew.release_channel.channel` without importing this collector.
 
     Passes this module's ``__version__`` EXPLICITLY rather than letting the
-    other module read its own: every other version-dependent field in the
-    pre-filled issue URL comes from ``diagnostics.__version__``, so a single
-    patch point keeps the URL internally consistent instead of letting the
-    channel and the version field disagree.
+    other module read its own: every version-dependent field in the pre-filled
+    issue URL and the bundle comes from ``diagnostics.__version__``, so a single
+    patch point keeps them internally consistent instead of letting the channel
+    and the version field disagree.
+
+    Called ONCE per bundle, by :func:`collect_bundle`, which keeps the answer on
+    ``BundleResult.provenance`` for every member and link built from it; a
+    second call mid-collection would read host state that may have changed.
     """
-    return release_channel.channel(__version__)
+    return release_channel.provenance(__version__)
 
 
 #: Release channel -> repository label. Owned by :mod:`release_channel` so the
@@ -881,10 +897,18 @@ _INSTALL_OPTIONS = {
 _CHANNEL_OPTIONS = release_channel.CHANNEL_FORM_OPTIONS
 
 
-def _versions_text(note: str) -> str:
+def _versions_text(note: str, identity: release_channel.Provenance) -> str:
+    # Private, so it keeps everything the public report may not: the raw stamp
+    # (a repackager's build id), the distribution metadata it was weighed
+    # against, and the channel record -- the evidence behind `channel:`.
+    # ``identity`` is the caller's one resolution for the whole bundle (see
+    # ``BundleResult.provenance``); this function must not take a second one.
     lines = [
-        f"kirocrew_version: {__version__}",
-        f"channel: {_channel()}",
+        f"kirocrew_version: {identity.version}",
+        f"release: {identity.release}",
+        f"distribution_version: {identity.distribution or 'unavailable'}",
+        f"channel: {identity.channel or 'unknown'}",
+        f"channel_record: {identity.recorded or 'absent'}",
         f"kiro_cli_version: {_kiro_cli_version()}",
         f"python: {platform.python_version()}",
         f"platform: {platform.platform()}",
@@ -909,11 +933,23 @@ def _issue_url(result: BundleResult, note: str, *, prefill: bool = True) -> str:
       ``channel: <lane>`` derived from the running build, so a nightly or
       insider report is filterable the instant it lands — no maintainer has to
       read a version string out of the body to know which lane it came from,
-      and ``issue-triage.yml``'s model never gets a chance to guess it.
+      and ``issue-triage.yml``'s model never gets a chance to guess it. Only
+      when the lane is PROVEN, though: a create-time label outlives whatever
+      the reporter picks in the dropdown, so a build that cannot prove its lane
+      (a repackager's stamp with no corroborating metadata or record, or
+      sources that contradict each other) files with the form's own
+      ``Not sure`` and no ``channel:`` label, for a human to set. Guessing
+      Stable there is how a packaged insider build's reports arrive labelled
+      as a supported build's.
     * **The form's own fields arrive filled.** A free-form body skipped the
       form entirely, so reports from this flow lacked the version / install
       answers that triage reads. Field ids double as query params, so they can
-      be prefilled from what the gateway already knows.
+      be prefilled from what the gateway already knows. The version is the
+      PUBLIC release version: a repackager's four-part build stamp is folded
+      onto the release it is a build of, because the stamp is that
+      distribution's internal identifier and the public tracker has nothing to
+      match it against. (The stamp itself stays in the bundle's private
+      ``versions.txt``.)
 
     Deliberately NOT prefilled: ``platform``. The form's own help text warns
     that a guess there becomes a wrong ``platform:`` label, and the host OS is
@@ -925,13 +961,22 @@ def _issue_url(result: BundleResult, note: str, *, prefill: bool = True) -> str:
     # import time, and this is the only place that wants it.
     from kiro_crew import beacon
 
-    channel = _channel()
+    # The bundle's own resolution, so the link explains the members it points
+    # at; a result built without the collector has none and resolves once here.
+    identity = result.provenance if result.provenance is not None else _provenance()
+    labels = ["bug"]
+    if identity.channel is not None:
+        labels.append(_CHANNEL_LABELS[identity.channel])
     params = {
         "template": "bug_report.yml",
-        "labels": ",".join(["bug", _CHANNEL_LABELS[channel]]),
+        "labels": ",".join(labels),
         "title": "[bug] ",
-        "version": __version__,
-        "channel": _CHANNEL_OPTIONS[channel],
+        "version": identity.release,
+        "channel": (
+            _CHANNEL_OPTIONS[identity.channel]
+            if identity.channel is not None
+            else release_channel.UNKNOWN_CHANNEL_FORM_OPTION
+        ),
         "what-happened": note.strip() or "",
         "context": "\n".join(
             [
@@ -1044,6 +1089,15 @@ def collect_bundle(
 
     result = BundleResult(zip_path=zip_path, filename=filename)
 
+    # Resolve the release provenance ONCE, before the first member is written.
+    # It reads two pieces of host state -- the `$KIROCREW_HOME/channel` record
+    # and the installed dist-info -- and `set_release_channel` can rewrite the
+    # record while this collector runs in a worker thread, so a per-member read
+    # could put a `channel` in versions.txt that manifest.json contradicts,
+    # beside a link that explains neither. One snapshot feeds all of them.
+    identity = _provenance()
+    result.provenance = identity
+
     # (member_name, source_path, gated_by_include_logs)
     text_sources: list[tuple[str, Path, bool]] = []
     if include_logs:
@@ -1085,7 +1139,7 @@ def collect_bundle(
     )
     with os.fdopen(_fd, "wb") as _raw, zipfile.ZipFile(_raw, "w", zipfile.ZIP_DEFLATED) as zf:
         # Generated members first.
-        versions = _versions_text(note)
+        versions = _versions_text(note, identity)
         zf.writestr("versions.txt", versions)
         result.included.append("versions.txt")
         result.redaction_summary["versions.txt"] = 0
@@ -1115,10 +1169,19 @@ def collect_bundle(
             result.redaction_summary[member] = n
 
         # Manifest last so it reflects the final included/skipped/redaction state.
+        # Its provenance keys are the machine-readable twin of ``versions.txt``,
+        # written from the SAME snapshot: the raw stamp, the distribution
+        # version and the channel record are the evidence the resolver weighed,
+        # kept here because the bundle is private. A source that was silent is
+        # JSON ``null``, not the text file's sentinel words -- a program reads
+        # this one.
         manifest = {
             "tool": "kirocrew-diagnostics",
-            "kirocrew_version": __version__,
-            "channel": _channel(),
+            "kirocrew_version": identity.version,
+            "release": identity.release,
+            "distribution_version": identity.distribution,
+            "channel": identity.channel or "unknown",
+            "channel_record": identity.recorded,
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "include_logs": include_logs,
             "note": note.strip(),

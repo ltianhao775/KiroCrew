@@ -40,6 +40,8 @@ import { REASONING_ROLES } from '../pages/chat/groupDisplayItems'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import { renderUserContent } from '../pages/chat/ChatPageMessageContent'
+import ThreadFooter from '../pages/chat/ThreadFooter'
+import type { ThreadSummary } from '../api/threads'
 import type { ChatMessage } from '../types'
 import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
 import { turnHadPolicyBlock } from './turnPolicyBlock'
@@ -47,6 +49,16 @@ import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { isRejectedDecision } from '../utils/approvalDecision'
 
 /** Everything a renderer may read. Passed per row so entries stay pure functions. */
+/** What a host that offers reply threads hands the rows: the footer data per
+ *  parent `mid`, and the open action. Both are keyed by the message's durable
+ *  `meta.mid`, the only identity a thread can hang off. */
+export interface ThreadHooks {
+  summaryOf: (mid: string) => ThreadSummary | undefined
+  onOpen: (mid: string) => void
+  /** The crewmate's display name -- the face beside its replies. */
+  crewmateName: string
+}
+
 export interface MessageRenderContext {
   /** Index of this message in `messages`. Needed by rows that look ahead. */
   index: number
@@ -67,6 +79,9 @@ export interface MessageRenderContext {
   autoDeniedIds: Set<string>
   /** Host-injected tool row, kept as a shorthand for replacing the tool entries. */
   renderTool?: (message: ChatMessage) => React.ReactNode
+  /** Reply threads on this transcript's messages (a crewmate's chat). Absent
+   *  on every other surface: no footer, no "Reply in thread" action. */
+  threads?: ThreadHooks
   /** Bubble layout used by conversational rows. `isUser` right-aligns. */
   wrapper: (children: React.ReactNode, isUser?: boolean) => React.ReactNode
   /** Full-width row layout used by cards, pills and banners. */
@@ -93,6 +108,32 @@ export interface MessageRenderer {
 export function formatTs(ts?: string): string | undefined {
   if (!ts) return undefined
   return fmtMessageTime(ts) || undefined
+}
+
+/** The durable id a thread hangs off, or `undefined` for a row that has none
+ *  (a pre-id transcript row cannot carry a thread). */
+export function threadMidOf(m: ChatMessage): string | undefined {
+  const mid = (m.meta as Record<string, unknown> | undefined)?.mid
+  return typeof mid === 'string' && mid ? mid : undefined
+}
+
+/** The footer under a bubble whose thread has replies, or null. `align` follows
+ *  the bubble: the user's sits on the right. */
+export function threadFooterFor(m: ChatMessage, ctx: MessageRenderContext, align: 'start' | 'end'): React.ReactNode {
+  const hooks = ctx.threads
+  const mid = threadMidOf(m)
+  if (!hooks || !mid) return null
+  const summary = hooks.summaryOf(mid)
+  if (!summary || summary.count <= 0) return null
+  return <ThreadFooter summary={summary} crewmateName={hooks.crewmateName} align={align} onOpen={() => hooks.onOpen(mid)} />
+}
+
+/** The row action that opens (or starts) the thread on this message, or undefined. */
+export function replyInThreadFor(m: ChatMessage, ctx: MessageRenderContext): (() => void) | undefined {
+  const hooks = ctx.threads
+  const mid = threadMidOf(m)
+  if (!hooks || !mid) return undefined
+  return () => hooks.onOpen(mid)
 }
 
 /**
@@ -317,6 +358,93 @@ function toolRow(m: ChatMessage, ctx: MessageRenderContext, autoDenied?: boolean
   )
 }
 
+/** Host overrides for `renderAssistantBubble`. */
+export interface AssistantBubbleOptions {
+  /** Draw the footer whatever the next row is. A host whose rows are grouped
+   *  into runs (a crewmate's chat) knows the run ended here — a five-minute
+   *  gap or a boundary row the user sees — even when the next drawn row is
+   *  another reply, which the SDK's own rule reads as "the turn goes on".
+   *  Streaming rows never draw a footer, whatever this says. */
+  forceFooter?: boolean
+  /** Decide the steer-chip suppression against a transcript the host holds
+   *  instead of `ctx.messages`. A host that FILTERS the list before rendering
+   *  (a crewmate's chat drops the `inject` rows) must pass the unfiltered one,
+   *  or the policy-block marker is never found and a system-forced
+   *  continuation is credited to the user. */
+  policyBlockTranscript?: { messages: ChatMessage[]; index: number }
+}
+
+/**
+ * The assistant reply as the SDK draws it, minus the row layout: the footer
+ * rule (a finished reply shows its footer once the turn is over — another user
+ * or assistant row follows, or nothing follows and the session is idle) and
+ * every prop the bubble takes off the message. Exported so a host that places
+ * the reply differently (a crewmate's chat draws it as a bordered bubble in a
+ * run) renders the SAME bubble rather than a second copy of this logic.
+ * Returns null for a say-nothing row (bare U+200B): invisible-only content
+ * would draw as an empty bubble.
+ */
+export function renderAssistantBubble(
+  m: ChatMessage,
+  ctx: MessageRenderContext,
+  bubbleClassName?: string,
+  opts: AssistantBubbleOptions = {},
+): React.ReactNode {
+  // A quiet monitor-loop cycle replies with a bare zero-width space
+  // (U+200B): invisible-only content would draw as an empty bubble.
+  // Same skip as ChatPage's inline chain — see utils/invisibleText.
+  if (isHiddenInvisibleAssistantRow(m)) return null
+  const isStreaming = m.role === 'streaming'
+  // The footer belongs to a FINISHED reply. It shows once the turn is over,
+  // which is either because another user or assistant row follows, or
+  // because nothing follows and the session has gone idle.
+  let showFooter = false
+  if (!isStreaming) {
+    let nextRelevant = false
+    for (let j = ctx.index + 1; j < ctx.messages.length; j++) {
+      if (ctx.messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
+      // A hidden invisible-only row draws nothing, so it cannot host the
+      // footer; pass over it to the row that renders.
+      if (isHiddenInvisibleAssistantRow(ctx.messages[j])) continue
+      // A system-notice row (compaction / session reload) draws a system
+      // card, not a reply, so it cannot end the turn either.
+      if (isSystemNoticeRow(ctx.messages[j])) continue
+      if (ctx.messages[j].role === 'assistant' || ctx.messages[j].role === 'streaming') { nextRelevant = true; break }
+    }
+    if (!nextRelevant) showFooter = !ctx.running
+    if (opts.forceFooter) showFooter = true
+  }
+  const bubble = (
+    <AssistantMessage
+      content={m.content}
+      isStreaming={isStreaming}
+      timestamp={formatTs(m.ts)}
+      timestampTitle={fmtMessageTimeFull(m.ts)}
+      showFooter={showFooter}
+      slotRunning={ctx.running}
+      onFileOpen={ctx.onFileOpen}
+      onQuote={ctx.onQuote}
+      onAsk={ctx.onAsk}
+      variants={m.variants}
+      variantIdx={m.variant_idx}
+      turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
+      decisionsStrip={decisionStripFieldOf(m)}
+      fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
+      suppressSteerAck={
+        opts.policyBlockTranscript
+          ? turnHadPolicyBlock(opts.policyBlockTranscript.messages, opts.policyBlockTranscript.index)
+          : turnHadPolicyBlock(ctx.messages, ctx.index)
+      }
+      bubbleClassName={bubbleClassName}
+      onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
+    />
+  )
+  // The column's child is the bubble itself unless this message has a thread
+  // footer to hang under it, so a host reading the bubble finds it in place.
+  const footer = threadFooterFor(m, ctx, 'start')
+  return <div className="flex flex-col gap-0">{footer ? <>{bubble}{footer}</> : bubble}</div>
+}
+
 /**
  * The built-in registry, in resolution order. A stop event and a sub-agent
  * completion are recognised by shape rather than by role, so they claim `'*'`
@@ -363,16 +491,22 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // `meta.files` — rendered as nothing, though the same row drew fine on
     // ChatPage. A host that opens files supplies `ctx.onFileOpen`; without it
     // the cards and chips still render, inert.
-    render: (m, ctx) => ctx.wrapper(
-      <UserMessage
-        content={m.content}
-        meta={m.meta}
-        timestamp={formatTs(m.ts)}
-        timestampTitle={fmtMessageTimeFull(m.ts)}
-        renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
-      />,
-      true,
-    ),
+    render: (m, ctx) => {
+      const bubble = (
+        <UserMessage
+          content={m.content}
+          meta={m.meta}
+          timestamp={formatTs(m.ts)}
+          timestampTitle={fmtMessageTimeFull(m.ts)}
+          renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
+          onReplyInThread={replyInThreadFor(m, ctx)}
+        />
+      )
+      // The bubble alone on every surface without a thread footer to draw, so
+      // the row's shape (and what a host reads off it) is unchanged there.
+      const footer = threadFooterFor(m, ctx, 'end')
+      return ctx.wrapper(footer ? <>{bubble}{footer}</> : bubble, true)
+    },
   },
   {
     // Refines `assistant`, so it must precede it: a gateway system notice
@@ -392,50 +526,8 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'assistant',
     roles: ['assistant', 'streaming'],
     render: (m, ctx) => {
-      // A quiet monitor-loop cycle replies with a bare zero-width space
-      // (U+200B): invisible-only content would draw as an empty bubble.
-      // Same skip as ChatPage's inline chain — see utils/invisibleText.
-      if (isHiddenInvisibleAssistantRow(m)) return null
-      const isStreaming = m.role === 'streaming'
-      // The footer belongs to a FINISHED reply. It shows once the turn is over,
-      // which is either because another user or assistant row follows, or
-      // because nothing follows and the session has gone idle.
-      let showFooter = false
-      if (!isStreaming) {
-        let nextRelevant = false
-        for (let j = ctx.index + 1; j < ctx.messages.length; j++) {
-          if (ctx.messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
-          // A hidden invisible-only row draws nothing, so it cannot host the
-          // footer; pass over it to the row that renders.
-          if (isHiddenInvisibleAssistantRow(ctx.messages[j])) continue
-          // A system-notice row (compaction / session reload) draws a system
-          // card, not a reply, so it cannot end the turn either.
-          if (isSystemNoticeRow(ctx.messages[j])) continue
-          if (ctx.messages[j].role === 'assistant' || ctx.messages[j].role === 'streaming') { nextRelevant = true; break }
-        }
-        if (!nextRelevant) showFooter = !ctx.running
-      }
-      return ctx.wrapper(
-        <div className="flex flex-col gap-0">
-          <AssistantMessage
-            content={m.content}
-            isStreaming={isStreaming}
-            timestamp={formatTs(m.ts)}
-            timestampTitle={fmtMessageTimeFull(m.ts)}
-            showFooter={showFooter}
-            slotRunning={ctx.running}
-            onFileOpen={ctx.onFileOpen}
-            onQuote={ctx.onQuote}
-            onAsk={ctx.onAsk}
-            variants={m.variants}
-            variantIdx={m.variant_idx}
-            turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
-            decisionsStrip={decisionStripFieldOf(m)}
-            fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
-            suppressSteerAck={turnHadPolicyBlock(ctx.messages, ctx.index)}
-          />
-        </div>,
-      )
+      const bubble = renderAssistantBubble(m, ctx)
+      return bubble === null ? null : ctx.wrapper(bubble)
     },
   },
   {
@@ -468,7 +560,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       return ctx.wrapper(
         <>
           {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
-          <div className="msg-content px-4 py-3 text-sm leading-6 rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+          <div className="mc-message-font-scope msg-content px-4 py-3 leading-relaxed rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
             <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} softBreaks /></MessageErrorBoundary>
           </div>
         </>,

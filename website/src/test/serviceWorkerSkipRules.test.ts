@@ -71,12 +71,18 @@ describe('service worker skip rules', () => {
     expect(intercepts('/apps/dev-fleet/api/state')).toBe(false)
   })
 
+  it('never substitutes the cached dashboard shell for an app window', () => {
+    expect(intercepts('/app-windows/mochi/pet.html')).toBe(false)
+    expect(intercepts('/app-windows/crew-companion/panel.html')).toBe(false)
+  })
+
   it('DOES take hashed assets over, so a 5xx can be retried', () => {
     // Not for caching — the immutable HTTP cache still owns them. The worker sits
     // in the path only so that one 502 on a module script does not kill the page.
-    // The shell above is served from cache, so a module graph that fails leaves a
-    // dark skeleton that no reload clears.
+    // App-window documents bypass the worker, but their /assets sub-resources
+    // still need the same retry protection.
     expect(intercepts('/assets/App-abc123.js', 'no-cors')).toBe(true)
+    expect(intercepts('/assets/app-windows/mochi/pet-abc123.js', 'no-cors')).toBe(true)
   })
 })
 
@@ -122,8 +128,8 @@ describe('the shell cache refresh is scoped to the shell', () => {
     expect(r.puts).toEqual(['/', '/index.html'])
   })
 
-  it('does NOT overwrite the shell from a standalone app-window document', async () => {
-    const r = shellPutsFor('/app-windows/mochi/panel.html') as unknown as { puts: string[]; settled: Promise<unknown> }
+  it('does NOT overwrite the shell from a handled non-shell SPA route', async () => {
+    const r = shellPutsFor('/artifacts') as unknown as { puts: string[]; settled: Promise<unknown> }
     await r.settled
     expect(r.puts).toEqual([])
   })

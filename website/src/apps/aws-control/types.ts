@@ -486,6 +486,12 @@ export interface InstallIdentity {
  * must read back as they set it, while this says whether asking for it achieves
  * anything on this host. A surface that reads only the grant shows transcripts
  * as scheduled while none are produced.
+ * `rememberedArchives` is, per kind, how many uploaded archives the install still
+ * holds a record of. A RECORD COUNT, not an inventory, and wrong in both directions:
+ * low because the record map is bounded and covers this install alone, high because
+ * retention deletes an object while its record stays. It says the one run line is not
+ * the whole list, never how many archives the drive holds. Absent from an older
+ * backend, which reads as unknown rather than zero.
  * `jobs` carries the in-flight and last-failed run per kind for this account.
  * `install` is this machine's own identity, always present.
  */
@@ -494,6 +500,7 @@ export interface BackupStatus {
   nightlySessions?: boolean
   nightlySessionsBlocked?: string | null
   runs: Partial<Record<BackupKind, BackupRun>>
+  rememberedArchives?: Partial<Record<BackupKind, number>>
   jobs?: Partial<Record<BackupKind, BackupJobState>>
   install: InstallIdentity
   remote: RemoteBackup | null

@@ -153,7 +153,25 @@ export const CHUNK_BUDGETS = {
   // ceiling left at 0.04% headroom fails on the next feature's ordinary strings
   // rather than on the new library it exists to catch. Back to the 5% convention
   // over the measured size.
-  t: 905 * KB, // measured 862.2 KB on this branch rebased onto 1c7f963706 (~5% headroom)
+  // Re-measured on this branch: with the base catalogs restored and only this
+  // branch's other code present, the chunk builds at 926,128 B (904.4 KB), which
+  // is 592 B under the 905 KB ceiling -- 0.06% headroom. The judge row's nine
+  // keys across the twelve shipped catalogs, plus the generated `en-XA`
+  // pseudo-locale that roughly doubles each string's byte cost, add 1,456 B on
+  // top, so the build lands at 927,584 B (905.8 KB) -- 607 B over the old 905 KB
+  // ceiling. Attribution is measured, not assumed: reverting ONLY the files under
+  // `website/src/i18n/` to the base and rebuilding produces the 926,128 B above,
+  // and this branch adds no dependency to the chunk. No lazy `import()` boundary
+  // can move a catalog string out of it, same as the `all` entry's note. This is
+  // the drift the notes above already describe: a ceiling left under a tenth of a
+  // percent of headroom fails on the next feature's ordinary strings rather than
+  // on the new library it exists to catch. Back to the 5% convention over the
+  // measured size.
+  // Meet CrewMates (first-run flow) added ~60 catalog keys x 12 languages plus
+  // the regenerated `en-XA`, which all land in this chunk by construction: measured
+  // 907.7 KB on this branch before the judge row above landed on main, so the two
+  // features together sit near 909 KB; same 5% convention over that size.
+  t: 955 * KB, // measured ~909 KB on this branch (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor
@@ -220,7 +238,13 @@ export const CHUNK_BUDGETS = {
   // code with no lazy boundary available, the same shape the notes above document.
   // Back to the ~5% convention over the measurement that includes this branch,
   // matching the `all` and `t` entries.
-  App: 3711 * KB, // measured 3,624,314 B (3539.4 KB) on this branch's merge result 2026-09-21 (4.85% headroom)
+  // The memory-recall strip, its own record reader and the card's second switch
+  // add a further 5,492 B on top of that. A tree carrying all three surfaces
+  // measures 3,641,334 B, which is what the ceiling below is set against. It
+  // covers every part -- main's drift and each surface's own cost -- with the ~5%
+  // margin the lines above prescribe, so ordinary first-party growth does not
+  // re-trip this entry within days.
+  App: 3714 * KB, // measured 3,641,334 B with all three surfaces (4.25% headroom)
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)
   // -- one deliberate `codeSplitting` group, see vite.config.ts.

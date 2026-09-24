@@ -570,6 +570,76 @@ describe('MarkdownPanel — save and cancel', () => {
     await new Promise(resolve => setTimeout(resolve, 20))
     expect(onSave).not.toHaveBeenCalled()
   })
+
+  // The chord must be CLAIMED whenever the editor is active, even on a clean
+  // buffer: the editor-local capture handler in PierreEditorImpl only exists
+  // after its lazy chunk resolves, so this document-level handler is the one
+  // deterministic owner. If it lets a clean-buffer Cmd+S fall through,
+  // AppKit's default runs (the reporter saw it select the word under the
+  // cursor). It must preventDefault yet NOT issue a redundant write.
+  it('claims Cmd+S on a clean editing buffer without issuing a save', async () => {
+    const onSave = vi.fn(async () => {})
+    // A code file opens straight into the editor (editing=true) and is clean
+    // (no savedBaseline mismatch), so this is the fall-through case.
+    mountPanel({ filePath: '/tmp/module.ts', content: 'export const a = 1\n', onSave })
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('saves once on Cmd+S when the editing buffer is dirty', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  })
+
+  // Caps Lock / Shift makes the browser report `e.key` as 'S'; the old exact
+  // `=== 's'` never matched, so the chord fell through. Match case-insensitively.
+  it('treats Shift+Cmd+S (key "S") the same as Cmd+S', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 'S', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(true)
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  })
+
+  // A background (inactive) tab is mounted but hidden; its handler must not
+  // claim the chord the user aimed at the visible tab.
+  it('ignores Cmd+S when the tab is inactive', async () => {
+    const onSave = vi.fn(async () => {})
+    render(
+      <MarkdownPanel embedded active={false} filePath="/tmp/module.ts" content="export const a = 1\n"
+        onContentChange={vi.fn()} onSave={onSave} onClose={vi.fn()} />,
+      { wrapper },
+    )
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    document.dispatchEvent(evt)
+    expect(evt.defaultPrevented).toBe(false)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  // PierreEditorImpl's capture handler runs first and preventDefaults the chord
+  // when it owns it. The document handler must then stand down so onSave fires
+  // once, not twice. Simulate the already-claimed event.
+  it('does not double-save when Cmd+S was already handled (defaultPrevented)', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('Edit'))
+    const evt = new KeyboardEvent('keydown', { key: 's', metaKey: true, cancelable: true, bubbles: true })
+    evt.preventDefault()
+    document.dispatchEvent(evt)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
+  })
 })
 
 describe('MarkdownPanel — diff chrome', () => {

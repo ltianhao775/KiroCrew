@@ -2694,6 +2694,106 @@ class AppManifest:
             # so rewriting it on a signed app redirects that dispatch while every visible
             # character of the row, and the signature, stay exactly as published.
             body["contributes"] = self.contributes.to_dict()
+        setup_d = self.setup.to_dict()
+        if setup_d:
+            # `onInstall`/`onUpdate`/`onUninstall`/`onEnable`/`onDisable` are shell
+            # text `run_lifecycle_script` hands to `/bin/bash -c`. The string IS the
+            # program -- no file in the package has to exist for it to run -- so a
+            # manifest-only rewrite of a published app buys execution outright. Same
+            # reason `crons` is covered one clause up: vetting bounds the SYNTAX of
+            # what runs, only the signature authenticates PUBLISHER INTENT.
+            # Included only when non-empty so manifests signed before setup was
+            # covered keep producing the identical payload.
+            body["setup"] = setup_d
+        if self.mcpServers:
+            # Each entry's `command`/`args`/`env` is written into the agent config
+            # kiro-cli reads and SPAWNS (`bridges._register_mcp_servers`). Like
+            # `setup`, the executed argv lives in the manifest itself, so this is the
+            # one part of a signed app whose program an attacker could swap with the
+            # signature still verifying.
+            # Included only when non-empty so manifests signed before mcpServers was
+            # covered keep producing the identical payload.
+            body["mcpServers"] = dict(self.mcpServers)
+        backend_d = self.backend.to_dict()
+        if backend_d:
+            # `hooks.*` names a module:callable `module_loader.load_app_module`
+            # imports INTO THE GATEWAY PROCESS, and `entryPoint` + `type` select the
+            # file and interpreter `_start_app_backend_body` spawns. These are
+            # selectors rather than literal argv, so repointing one at a module that
+            # already sits in an otherwise untouched package is enough -- and a
+            # manifest-only tamper is precisely what the signature is the sole
+            # detector for.
+            # The whole canonical dict, not the executed keys alone: cherry-picking
+            # leaves `port`/`healthCheck`/`routes` as residue an attacker may still
+            # move, and one guard is smaller than four.
+            # Included only when non-empty so manifests signed before backend was
+            # covered keep producing the identical payload.
+            body["backend"] = backend_d
+        ui_d = self.ui.to_dict()
+        if ui_d:
+            # `entry` and every `pages[].entryPoint` name an ESM module the dashboard
+            # builds `/apps/<name>/ui/<path>` from and dynamic-`import()`s in its OWN
+            # origin (`website/src/components/AppHost.tsx`) -- the same surface
+            # `contributes.panelTabs[].entry` is covered for one clause up. Outside the
+            # payload, the derivative is signed and the original is not.
+            # The whole canonical dict, not the two executed keys alone: a
+            # `pages[].route` decides which URL serves that bundle, and a page's
+            # `label`/`icon` plus `sidebar` are the whole of what the reader sees
+            # before clicking it -- so cherry-picking the entry paths leaves the
+            # routing and the presentation of an attacker-chosen bundle as residue.
+            # Included only when non-empty so manifests signed before ui was covered
+            # keep producing the identical payload.
+            body["ui"] = ui_d
+        if self.agents:
+            # Each path names a JSON agent spec `bridges._register_agents` writes into
+            # the user's agents dir, carrying its own `tools`/`allowedTools`/`model`/
+            # `prompt`. APPENDING one entry is enough to get an attacker-authored agent
+            # materialized, and the same guard covers that: the payload is recomputed
+            # from the manifest as received, so a package that GAINS an `agents` key
+            # gains it in the signed bytes too and the signature stops matching.
+            # Included only when non-empty so manifests signed before agents was
+            # covered keep producing the identical payload. List order preserved.
+            body["agents"] = list(self.agents)
+        if self.skills:
+            # `bridges._register_skills` symlinks each directory into the skills root,
+            # both namespaced and flat, so a repointed entry puts attacker-authored
+            # skill instructions where an agent reads them as its own.
+            # Included only when non-empty so manifests signed before skills was
+            # covered keep producing the identical payload. List order preserved.
+            body["skills"] = list(self.skills)
+        if self.sops:
+            # Same shape as `skills` one clause up: the file's text becomes procedure an
+            # agent follows, and only the signature authenticates whose text it is.
+            # Included only when non-empty so manifests signed before sops was covered
+            # keep producing the identical payload. List order preserved.
+            body["sops"] = list(self.sops)
+        dependencies_d = self.dependencies.to_dict()
+        if dependencies_d:
+            # `capabilities.mcp` is an id `dependencies.resolve_dependencies` hands to
+            # `CapabilityManager.install_mcp` AT INSTALL TIME, so a swapped id installs
+            # an attacker's MCP server -- whose command an agent then spawns -- under
+            # the publisher's signature.
+            # The whole canonical dict, not `capabilities` alone: `managedBy` is the
+            # switch deciding whether the gateway installs the capability at all, and
+            # `commands`/`optionalCommands` name host executables the install chain
+            # probes and reports as missing.
+            # Included only when non-empty so manifests signed before dependencies was
+            # covered keep producing the identical payload.
+            body["dependencies"] = dependencies_d
+        platform_d = self.platform.to_dict()
+        if platform_d:
+            # `clientInstall.shell` is a one-liner the App Store hands the reader to
+            # PASTE INTO A TERMINAL -- `registry.py` returns the whole `clientInstall`
+            # dict as `needsClientInstall`, under a signature-verified publisher badge.
+            # No file in the package has to exist for it to run, which is the property
+            # that put `setup` in the payload.
+            # The whole canonical dict, not `clientInstall` alone: `installMode:
+            # "client"` is what makes that block reach the reader at all, so signing the
+            # one-liner without the switch that surfaces it is the cherry-pick this
+            # method avoids everywhere else.
+            # Included only when non-empty so manifests signed before platform was
+            # covered keep producing the identical payload.
+            body["platform"] = platform_d
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     # -----------------------------------------------------------------

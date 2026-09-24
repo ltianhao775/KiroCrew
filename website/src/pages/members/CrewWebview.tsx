@@ -386,10 +386,13 @@ export default function CrewWebview({
 
   // Null until the first expand: `useSandboxDoc` mints when it receives a
   // document, so withholding it here is what makes the docked view free.
+  // `rewriteBareLinks: false`: CREW_WEBVIEW_SANDBOX withholds `allow-popups`,
+  // so a `target="_blank"` link here would be a blocked popup (a dead click);
+  // bare links keep navigating the frame as they always have.
   const srcdoc = useMemo(
     () =>
       html && everExpanded
-        ? buildSrcdoc({ html, themeVars, mode: theme })
+        ? buildSrcdoc({ html, themeVars, mode: theme, rewriteBareLinks: false })
         : null,
     [html, everExpanded, themeVars, theme],
   );

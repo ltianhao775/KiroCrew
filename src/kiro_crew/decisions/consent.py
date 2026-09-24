@@ -22,12 +22,15 @@ What makes it un-flippable by the agent:
 * every read fails soft to ``{}`` -> **NOT CONSENTED**. A missing, unreadable,
   truncated or hand-mangled file must never mean "send".
 
-Three scopes sit on the keystone beside the switch, and each is a SEPARATE yes:
+Four scopes sit on the keystone beside the switch, and each is a SEPARATE yes:
 ``tool_args`` (the arguments of the one call about to run), ``compaction`` (a whole
-slot transcript, conversation text and every tool input in it) and
-``history_budget_chars`` (a ceiling on prior turns). Absent reads as not consented
-in every case, so a record written before a scope existed authorizes exactly the
-text its owner reviewed and never a category added later.
+slot transcript, conversation text and every tool input in it), ``memory_text``
+(the text of recalled memories) and ``nudge_evidence`` (a watched session's
+transcript tail, and a watched pull request's typed facts plus a fixed-width
+fingerprint of its comment bodies, never their text). A ceiling sits beside them --
+``history_budget_chars``, on prior turns. Absent reads as not consented in every
+case, so a record written before a scope existed authorizes exactly the text its
+owner reviewed and never a category added later.
 
 The ``decisions`` section of ``config.json`` keeps the knobs that grant nothing on
 their own -- the sampling share and the provider -- so there is exactly one place
@@ -81,6 +84,27 @@ STATE_KEY_TOOL_ARGS = "tool_args"
 #: consented, so an install that granted either of the others is inert here.
 STATE_KEY_COMPACTION = "compaction"
 
+#: Whether the owner consented to sending the TEXT OF RECALLED MEMORIES, the
+#: category ``memory.recall`` needs and no other point does. A separate leaf for
+#: exactly the reason ``tool_args`` is one, and the category is genuinely new: a
+#: message excerpt is text the owner just typed and a skill description is text this
+#: build shipped, while a recalled memory is text the AGENT wrote down turns or days
+#: ago about whatever it was working on then. Consent recorded against the first two
+#: cannot stand for the third, so absent reads as NOT consented.
+STATE_KEY_MEMORY_TEXT = "memory_text"
+
+#: Whether the owner consented to sending EVIDENCE GATHERED FROM OTHER SESSIONS
+#: AND THIRD PARTIES -- a watched worker's transcript tail, a watched pull
+#: request's typed facts plus a fixed-width FINGERPRINT of its comment bodies and
+#: never their text, a work-ledger event -- the category ``nudge.wake`` needs and no other
+#: point does. A fourth leaf for exactly the reason there is a third, and the
+#: category is again genuinely new: ``compaction`` was reviewed as the OWNING
+#: session's own transcript, text the owner was present for, while this is text
+#: from conversations the owner was not in and from a forge they do not control.
+#: Absent reads as NOT consented, so an install that granted any of the other
+#: three is inert here.
+STATE_KEY_NUDGE_EVIDENCE = "nudge_evidence"
+
 #: "Keep whatever ceiling is recorded" for :func:`save_enabled`. A distinct object,
 #: because ``0`` is a ceiling an owner may choose and no number can mean "not asked".
 #: Resolved inside the read-modify-write, so the value written comes from the same
@@ -99,8 +123,21 @@ KEEP_TOOL_ARGS: object = object()
 #: restore a scope a concurrent revoking PUT just cleared.
 KEEP_COMPACTION: object = object()
 
+#: "Keep whatever recalled-memory scope is recorded", on the same terms and for the
+#: same reason as :data:`KEEP_TOOL_ARGS`: ``False`` is a scope an owner may choose,
+#: so no boolean can also mean "not asked", and it is resolved inside the lock so an
+#: enabling PUT cannot restore a scope a concurrent revoking PUT just cleared.
+KEEP_MEMORY_TEXT: object = object()
+
+#: "Keep whatever wake-evidence scope is recorded", on the same terms and for the
+#: same reason as :data:`KEEP_MEMORY_TEXT`: ``False`` is a scope an owner may
+#: choose, so no boolean can also mean "not asked", and it is resolved inside the
+#: lock so an enabling PUT cannot restore a scope a concurrent revoking PUT just
+#: cleared.
+KEEP_NUDGE_EVIDENCE: object = object()
+
 #: "Keep whatever the keystone records" -- the switch AND the endpoint it is bound to.
-#: A distinct object for the reason the three above are: ``False`` is a state an owner
+#: A distinct object for the reason the four above are: ``False`` is a state an owner
 #: may choose, so no boolean can also mean "not asked".
 #:
 #: It exists so a write that only moves a SCOPE never carries the switch. A caller that
@@ -121,6 +158,21 @@ _STATE_FILE_MODE = 0o600
 #: egress limit by losing a race. One writer exists in-process, so a thread lock
 #: is the whole boundary.
 _SAVE_LOCK = threading.Lock()
+
+
+class ConsentEndpointMovedError(RuntimeError):
+    """A scope-only write met a keystone bound to a different endpoint.
+
+    Raised by :func:`save_enabled` under :data:`KEEP_ENABLED` when the address the
+    caller established consent for differs from the one the keystone records at
+    write time. Carries the RECORDED address, which is the one a caller has to show
+    before asking again.
+    Nothing is written.
+    """
+
+    def __init__(self, recorded: str) -> None:
+        super().__init__("the recorded consent endpoint moved since it was checked")
+        self.recorded = recorded
 
 
 class ConsentCorruptError(RuntimeError):
@@ -222,6 +274,43 @@ def consented_compaction(state: "dict | None" = None) -> bool:
     return data.get(STATE_KEY_COMPACTION) is True
 
 
+def consented_memory_text(state: "dict | None" = None) -> bool:
+    """Whether the owner consented to sending recalled-memory text. Absent reads False.
+
+    Only a literal ``True`` consents, on the same terms as
+    :func:`consented_tool_args` and for the same reason: this value decides whether a
+    new category of content leaves the machine, so a value nobody can read back as a
+    deliberate yes is a no.
+
+    The default is the whole point of the key. Every consent recorded before it
+    existed was given against a request carrying the message excerpt and the
+    candidate skill descriptions. A recalled memory is neither: it is text the agent
+    wrote down in an earlier conversation, about work the owner was not reviewing
+    when they flipped the switch. Reading those records as permission to send it
+    would widen egress with no new choice.
+    """
+    data = load_state() if state is None else state
+    return data.get(STATE_KEY_MEMORY_TEXT) is True
+
+
+def consented_nudge_evidence(state: "dict | None" = None) -> bool:
+    """Whether the owner consented to sending other sessions' evidence. Absent reads False.
+
+    Only a literal ``True`` consents, on the same terms as
+    :func:`consented_tool_args` and for the same reason: this value decides whether
+    a new category of content leaves the machine, so a value nobody can read back as
+    a deliberate yes is a no.
+
+    NOT implied by :func:`consented_compaction`, which is the nearest neighbour and
+    still a different decision. That scope was reviewed as a whole transcript of the
+    session the owner is looking at -- text they were present for. This one carries
+    the tail of a DIFFERENT session and the body of a comment written by a bot or a
+    reviewer on a forge, so consent to the first cannot stand for the second.
+    """
+    data = load_state() if state is None else state
+    return data.get(STATE_KEY_NUDGE_EVIDENCE) is True
+
+
 def permits(endpoint: object, state: "dict | None" = None) -> bool:
     """Whether the keystone consents to sending to *endpoint*, exactly.
 
@@ -267,6 +356,8 @@ def save_enabled(
     history_budget_chars: object = 0,
     tool_args: object = False,
     compaction: object = False,
+    memory_text: object = False,
+    nudge_evidence: object = False,
 ) -> dict:
     """Record *enabled* for *endpoint* atomically, owner-only; return the state written.
 
@@ -309,6 +400,12 @@ def save_enabled(
     to none, and :data:`KEEP_COMPACTION` leaves a recorded scope alone from inside
     this same lock.
 
+    *memory_text* is the RECALLED-MEMORY egress scope and behaves identically, down
+    to :data:`KEEP_MEMORY_TEXT` and the lock. The two scopes are independent fields
+    because they are independent decisions: an owner may want risky tool calls
+    flagged without the contents of their memory store leaving the machine, and
+    either order of those two answers has to be recordable.
+
     Pass :data:`KEEP_ENABLED` for a write that moves only a scope. The switch and the
     endpoint are then taken from the keystone inside this lock and written back
     unchanged, and the scopes are applied under the RECORDED switch -- so a scope write
@@ -316,9 +413,23 @@ def save_enabled(
     only meaningful while the seam is on. *endpoint* is ignored in that case rather than
     trusted: the recorded binding is the one the owner reviewed.
 
+    *nudge_evidence* is the OTHER-SESSION EVIDENCE scope ``nudge.wake`` needs, on the
+    same terms again, down to :data:`KEEP_NUDGE_EVIDENCE` and the lock. It is a fourth
+    independent field because it is a fourth independent decision: an owner may want
+    their own transcript scored for compaction without the tail of every session they
+    are watching leaving the machine.
+
     This is what makes the route safe rather than careful. A caller that must supply
     ``enabled`` can only supply what it last read, so a view read before a revoke
     re-grants egress; with the switch resolved here, no scope write can move it.
+
+    A scope-only write also has to name the endpoint it believes is in force,
+    and this function re-checks the RECORDED address against it under the lock:
+    the caller establishes that consent stands for the configured endpoint
+    before calling, and that check runs outside this lock, so a re-bind landing
+    in the window would otherwise leave the scope written onto whatever the
+    keystone records by then. A difference raises
+    :class:`ConsentEndpointMovedError` and writes nothing.
     """
     keep_enabled = enabled is KEEP_ENABLED
     if not keep_enabled and not isinstance(enabled, bool):
@@ -335,6 +446,12 @@ def save_enabled(
     keep_compaction = compaction is KEEP_COMPACTION
     if not keep_compaction and not isinstance(compaction, bool):
         raise ValueError("compaction must be a bool")
+    keep_memory = memory_text is KEEP_MEMORY_TEXT
+    if not keep_memory and not isinstance(memory_text, bool):
+        raise ValueError("memory_text must be a bool")
+    keep_nudge = nudge_evidence is KEEP_NUDGE_EVIDENCE
+    if not keep_nudge and not isinstance(nudge_evidence, bool):
+        raise ValueError("nudge_evidence must be a bool")
     target = normalize_endpoint(endpoint)
     if enabled is True and not target:
         raise ValueError("consent needs the endpoint it is given for")
@@ -345,17 +462,36 @@ def save_enabled(
             # and writing the switch from the record while re-deriving the address from
             # a caller's argument would rebind a consent nobody re-reviewed.
             enabled = is_enabled(state)
-            target = consented_endpoint(state)
+            recorded = consented_endpoint(state)
+            # And the caller's own endpoint-in-force has to still BE that address. The
+            # caller establishes consent stands for the configured endpoint before
+            # calling; that check ran outside this lock, so a re-bind landing in between
+            # would leave the scope written onto whatever the keystone now records --
+            # authorizing a wider egress category for an address the owner never
+            # reviewed. Comparing the two here closes that window: the write is refused
+            # and the caller re-reads, which is the same answer it would have got had
+            # the re-bind landed one moment earlier. Only meaningful while the switch is
+            # on; a recorded-off keystone has no address, and the clearing branch below
+            # writes the fail-closed values.
+            if enabled and recorded != target:
+                raise ConsentEndpointMovedError(recorded)
+            target = recorded
         if keep:
             history_budget_chars = consented_history_budget(state)
         if keep_scope:
             tool_args = consented_tool_args(state)
         if keep_compaction:
             compaction = consented_compaction(state)
+        if keep_memory:
+            memory_text = consented_memory_text(state)
+        if keep_nudge:
+            nudge_evidence = consented_nudge_evidence(state)
         state[STATE_KEY_ENABLED] = enabled
         state[STATE_KEY_ENDPOINT] = target if enabled else ""
         state[STATE_KEY_HISTORY_BUDGET] = history_budget_chars if enabled else 0
         state[STATE_KEY_TOOL_ARGS] = tool_args is True if enabled else False
         state[STATE_KEY_COMPACTION] = compaction is True if enabled else False
+        state[STATE_KEY_MEMORY_TEXT] = memory_text is True if enabled else False
+        state[STATE_KEY_NUDGE_EVIDENCE] = nudge_evidence is True if enabled else False
         atomic_write(consent_path(), json.dumps(state, indent=2) + "\n", mode=_STATE_FILE_MODE)
     return state

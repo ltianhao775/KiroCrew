@@ -586,7 +586,9 @@ async def _run_tts_subprocess(
                 "%s failed (rc=%d): %s",
                 label,
                 proc.returncode,
-                stderr.decode(errors="replace")[:500],
+                # Redact the whole stream, then keep the tail: the TTS backend
+                # prints its failure reason last.
+                redact_log_via_context(stderr.decode(errors="replace"))[-500:],
             )
             return False
         # Both stats go off-loop in ONE hop: the output lives under TMPDIR, which

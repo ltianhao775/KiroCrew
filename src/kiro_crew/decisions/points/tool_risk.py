@@ -51,13 +51,26 @@ Everything is a refusal back to "no badge"
 ------------------------------------------
 :func:`risk_record` returns ``None`` for: the seam off, the session unsampled, the
 tool-argument scope not consented to, the turn cap reached, a scrubbed or failed
-call, an unusable answer, and a ``safe`` verdict. So an ordinary tool card is byte-identical to the one this
-build appends today, and a caller needs no try/except and no feature check.
+call, an unusable answer, a ``safe`` verdict, and a ``caution`` or ``risky``
+verdict the provider was not confident about. So an ordinary tool card is
+byte-identical to the one this build appends today, and a caller needs no
+try/except and no feature check.
 
 ``safe`` is a refusal to BADGE, not a refusal to record: the row is written with
 ``tier="safe"``, because "the seam looked and thought it was fine" is the answer
 that makes the other two readable, and a badge on every card would cost the
 annotation its meaning.
+
+An unconvinced answer in EITHER flagged tier is refused the same way and recorded
+the same way. The tier is not the flag on its own: ``p`` is the probability the
+provider assigned to the option it CHOSE, so an answer at 0.5 is a coin flip about
+which tier the call is even in, and :data:`CAUTION_CONFIDENCE_THRESHOLD` and
+:data:`RISKY_CONFIDENCE_THRESHOLD` are where this build stops printing one. The row
+still carries the tier it was given, so the suppressed answers stay countable --
+which is how both thresholds were measured and the only way the next ones can be.
+
+The two bars are equal in value and separate in identity, because they are read off
+two different populations and the next reading may move one without the other.
 
 Two bounds, because a turn can call many tools
 ---------------------------------------------
@@ -81,6 +94,7 @@ from typing import Any
 
 from kiro_crew import decisions as core
 from kiro_crew.decisions import log as _log
+from kiro_crew.decisions.points import as_text
 from kiro_crew.decisions.types import Answer, Choice, Question
 
 logger = logging.getLogger(__name__)
@@ -99,9 +113,70 @@ TIER_RISKY = "risky"
 #: rows needs to know which way severity runs without consulting prose.
 TIERS = (TIER_SAFE, TIER_CAUTION, TIER_RISKY)
 
-#: The tiers that earn a badge. ``safe`` is absent deliberately -- see the module
-#: docstring -- so "a record exists" and "this call was flagged" are one fact.
-FLAGGED_TIERS = (TIER_CAUTION, TIER_RISKY)
+#: Confidence a ``risky`` answer needs before it reaches the card.
+#:
+#: 0.80, and measured rather than picked. Over this build's own day-files -- 40
+#: answered ``risky`` calls, median 0.795, so the tier does NOT arrive confident --
+#: every answer at or above 0.80 named a push, a force-push, an upload or an
+#: opened pull request, which is what the rubric's own sentence asks for. The
+#: answers below 0.62 were a queued monitor edit, a message to another session and
+#: a comment posted on a pull request: none of those destroy data, touch
+#: credentials or leave the workspace, and a badge that fires on them is the
+#: failure mode a badge has. 0.90 was measured too and REJECTED -- it drops eleven
+#: of the true ones, force-pushes and a credential fix among them, and a flag that
+#: misses a force-push is worse than no flag. The clean part of the reading is the
+#: gap: nothing was answered between 0.62 and 0.76.
+#:
+#: n was 40, so this is a floor with evidence rather than a tuned optimum, and the
+#: suppressed rows are what a later reading re-derives it from.
+#:
+#: A CONSTANT, not a setting, for the reason ``memory_recall.KEEP_THRESHOLD`` is
+#: one: it is the meaning of the answer rather than a knob, and a configurable
+#: threshold would be a second, undocumented way to make the point a no-op
+#: (``1.0`` badges nothing) without turning the seam off.
+RISKY_CONFIDENCE_THRESHOLD = 0.80
+
+#: Confidence a ``caution`` answer needs before it reaches the card.
+#:
+#: 0.80, and measured the same way -- but over a LATER and separate window from the
+#: 40-call reading above, so the two paragraphs' counts are not meant to reconcile:
+#: two day-files of this build's log, carrying 79 answered ``caution`` calls and 47
+#: answered ``risky`` ones.
+#:
+#: This build shipped ``caution`` badging on its tier alone, on the argument that
+#: the mild word is cheap to be wrong about. The log says the argument was about
+#: the wrong cost. In that window every one of the 79 ``caution`` calls drew a
+#: badge, while 13 of the 47 ``risky`` ones cleared the bar above -- so 86 % of
+#: every badge the seam drew came from the tier that had no bar, and a reader
+#: scanning a transcript met the alarming word buried in six of the mild one. That
+#: is the same "costs every other badge its meaning" failure the bar above exists
+#: for, arriving through the tier that was exempted from it.
+#:
+#: The reading has no gap to cut at: ``caution`` runs continuously from 0.41 to
+#: 0.98 with its median at 0.80, unlike ``risky``'s empty 0.62..0.76. So this bar is
+#: chosen on what sits on each side rather than on a discontinuity. BELOW it the
+#: answers are dominated by calls that only read -- six poll cycles reading PR
+#: status, four ``Check ...`` reads, three ``monitor_start`` arms -- which the
+#: tier's own rubric sentence excludes, and a badge on a read is the failure mode a
+#: badge has. ABOVE it they are what the rubric asks for: rebases, amends,
+#: squashes, conflict resolutions, worktree creation.
+#:
+#: One miss is accepted knowingly, and it is worth naming rather than rounding off:
+#: an "undo the bad squash" at 0.57 rewrote history and now goes unbadged. The
+#: honest reading of that case is that the ANSWER was wrong, not that the call was
+#: harmless -- a history rewrite is what the ``risky`` sentence describes, and the
+#: provider put it in the mild tier at barely better than a coin flip. So the trade
+#: this bar accepts is: below it the tier is not evidence about the call, and a call
+#: the provider could not place goes unannotated. What makes that affordable here
+#: and not above is the CEILING on being wrong -- an unbadged ``caution`` is capped
+#: by what the mild tier claims, while the answers 0.90 would have dropped from
+#: ``risky`` were force-pushes the provider was confident about.
+#:
+#: n was 79, so this is a floor with evidence rather than a tuned optimum, and the
+#: suppressed rows are what a later reading re-derives it from.
+#:
+#: A CONSTANT and not a setting, for the reason the bar above is one.
+CAUTION_CONFIDENCE_THRESHOLD = 0.80
 
 #: The rubric, sent as the question's prompt. One sentence per tier, because the
 #: tiers are the answer domain and a domain nobody defined is a domain every
@@ -156,6 +231,40 @@ LOG_BUDGET_SECS = 0.05
 ERROR_TURN_CAP = "turn-cap"
 
 
+def earns_badge(tier: str, p: float) -> bool:
+    """Whether this answer reaches the tool card. The ONE place that is decided.
+
+    Each flagged tier must clear its own bar: ``caution``
+    :data:`CAUTION_CONFIDENCE_THRESHOLD`, ``risky``
+    :data:`RISKY_CONFIDENCE_THRESHOLD`. ``safe`` clears nothing at any confidence.
+    The reason is one sentence and it is the same for both: an alarm nobody
+    believes costs every other badge its meaning, and a tier exempted from that
+    rule becomes the alarm nobody believes -- which is what the log recorded when
+    ``caution`` badged on its tier alone.
+
+    The two bars are read separately even while they hold the same number. They
+    describe different populations, so a later reading that moves one has no
+    business moving the other, and a single shared constant would make that
+    impossible to express.
+
+    Reading an unconvinced ``risky`` DOWN to ``caution`` remains the alternative
+    this does NOT take: it would put "easy to put back" on a call the provider was
+    describing as a force-push, which is a claim nobody made. An unconvinced answer
+    draws nothing in the tier it was actually given.
+
+    One arm per flagged tier, and each arm reads its bar at CALL time, so a test
+    can move one bar and leave the other where it was; a mapping built at import
+    would capture both values and make that untestable. The last line is the
+    answer for every other tier -- ``safe``, and anything no arm names -- and it
+    refuses rather than guessing a bar.
+    """
+    if tier == TIER_RISKY:
+        return p >= RISKY_CONFIDENCE_THRESHOLD
+    if tier == TIER_CAUTION:
+        return p >= CAUTION_CONFIDENCE_THRESHOLD
+    return False
+
+
 def wait_budget() -> float:
     """How long one call may take, clamped into a sane window. Never raises."""
     try:
@@ -183,7 +292,7 @@ def scrubbed(text: object, limit: int) -> str:
     Clipped AFTER redaction, never before: clipping first can cut a secret in
     half, and a half is a fragment neither redactor matches.
     """
-    raw = text if isinstance(text, str) else ("" if text is None else str(text))
+    raw = as_text(text)
     if not raw:
         return ""
     try:
@@ -361,6 +470,12 @@ async def _record_outcome(
     cannot say how often the seam is wrong. The RETURN is the badge, so the
     transcript is quiet about a call the oracle thought was fine.
 
+    ``flagged`` on the row is what a reader was SHOWN, so it is
+    :func:`earns_badge` and not the tier: a row saying ``flagged`` beside a card
+    that drew nothing would be the two-descriptions-of-one-call failure the
+    ``policy`` field's own paragraph refuses. The tier stays on the row either
+    way, so a suppressed ``risky`` is still countable.
+
     A row that was not written returns ``None`` whatever the tier: a badge whose
     durable row was refused carries a ``turn_id`` no verdict could be filed
     against, which is the rule ``skills.select`` publishes its strip by. A write
@@ -376,6 +491,7 @@ async def _record_outcome(
     for. The bound on top is the shape ``gate._write`` already uses for the same
     write on the same loop.
     """
+    badge = earns_badge(tier, p)
     row = _log.build_row(
         point=POINT,
         session_key=session_key,
@@ -386,7 +502,7 @@ async def _record_outcome(
             "tier": tier,
             "p": p,
             "policy": policy,
-            "flagged": tier in FLAGGED_TIERS,
+            "flagged": badge,
         },
     )
     try:
@@ -401,7 +517,7 @@ async def _record_outcome(
     if not written:
         logger.debug("tool.risk: outcome row was not written; leaving the card alone")
         return None
-    return row if tier in FLAGGED_TIERS else None
+    return row if badge else None
 
 
 async def _record_turn_cap(*, session_key: str | None, calls: int) -> None:

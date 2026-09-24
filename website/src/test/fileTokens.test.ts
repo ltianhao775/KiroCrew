@@ -502,6 +502,86 @@ describe('restoreQueuedContent (cancel-queued parser fallback)', () => {
   })
 })
 
+describe('restoreQueuedContent with the entry\'s own attachment list', () => {
+  // The server echoes each queue entry's ORDERED non-image list (the same
+  // `meta.files` a user row carries) on the slot-detail queue, the queue_push
+  // frame and the cancel reply. Marker N names files[N-1], so the parser can
+  // claim an own-line marker by EXACT text — the one thing the wire text
+  // alone could never prove for a path with a space.
+
+  const spaced = '/Users/me/Desktop/My Report.pdf'
+
+  it('claims a spaced bare-upload path whole when the list names it', () => {
+    const { txt, filePaths } = prepareSendPayload('summarize this', [spaced])
+    expect(txt).toBe(`summarize this\n[attached_file 1] ${spaced}`)
+    const r = restoreQueuedContent(txt, filePaths)
+    expect(r.text).toBe('summarize this')
+    expect(r.files).toEqual([spaced])
+  })
+
+  it('the same content without a list stays verbatim — the list is what proves the boundary', () => {
+    const { txt } = prepareSendPayload('summarize this', [spaced])
+    const r = restoreQueuedContent(txt)
+    expect(r.text).toBe(txt)
+    expect(r.files).toEqual([])
+  })
+
+  it('claims several spaced paths in list order and re-stages them all', () => {
+    const paths = ['/tmp/q3 report/final draft.docx', '/tmp/q4 report/final draft.docx']
+    const { txt, filePaths } = prepareSendPayload('compare these two', paths)
+    const r = restoreQueuedContent(txt, filePaths)
+    expect(r.text).toBe('compare these two')
+    expect(r.files).toEqual(paths)
+  })
+
+  it('restores a leading image block together with a listed spaced document', () => {
+    const { txt, filePaths } = prepareSendPayload('caption', ['/tmp/pic.png', spaced])
+    const r = restoreQueuedContent(txt, filePaths)
+    expect(r.text).toBe('caption')
+    expect(r.files).toEqual(['/tmp/pic.png', spaced])
+  })
+
+  it('leaves marker-shaped paste text verbatim when the list does not name it', () => {
+    // A pasted transcript can contain producer-looking lines. The list is the
+    // entry's own; a marker it does not account for is foreign text.
+    const pasted = 'from the log:\n[attached_file 1] /var/log/app 2026.log\nis that right'
+    const r = restoreQueuedContent(pasted, ['/tmp/other.txt'])
+    expect(r.text).toBe(pasted)
+    expect(r.files).toEqual([])
+  })
+
+  it('leaves marker-shaped paste text verbatim with no list at all', () => {
+    const pasted = 'from the log:\n[attached_file 1] /var/log/app 2026.log\nis that right'
+    const r = restoreQueuedContent(pasted)
+    expect(r.text).toBe(pasted)
+    expect(r.files).toEqual([])
+  })
+
+  it('still leaves an inline mention verbatim — its @rel spelling is not on the list', () => {
+    const { txt, filePaths } = prepareSendPayload('see @My Report.pdf for details', [spaced])
+    const r = restoreQueuedContent(txt, filePaths)
+    expect(r.text).toBe(txt)
+    expect(r.files).toEqual([])
+  })
+
+  it('a list whose path disagrees with the marker text claims nothing', () => {
+    // The arbiter holds: an exact-text claim that fails to match leaves the
+    // content whole rather than staging a path the text never carried.
+    const txt = 'summarize this\n[attached_file 1] /tmp/My Report.pdf'
+    const r = restoreQueuedContent(txt, ['/tmp/My Other Report.pdf'])
+    expect(r.text).toBe(txt)
+    expect(r.files).toEqual([])
+  })
+
+  it('escapes regex metacharacters in a listed path', () => {
+    const odd = '/tmp/report (final) [v2].pdf'
+    const { txt, filePaths } = prepareSendPayload('read', [odd])
+    const r = restoreQueuedContent(txt, filePaths)
+    expect(r.text).toBe('read')
+    expect(r.files).toEqual([odd])
+  })
+})
+
 describe('restoreUnreferencedImages (legacy pane rows: image only on meta.files)', () => {
   it('prepends a producer-form image line for each image the text never names', () => {
     expect(restoreUnreferencedImages('look', { files: ['/tmp/a.png', '/tmp/b.jpg'] }))

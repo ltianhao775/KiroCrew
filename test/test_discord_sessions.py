@@ -243,7 +243,7 @@ class _Sessions:
         self.targeted.append(("try_acquire", key))
         return False
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.targeted.append(("clear_queue", key))
 
     async def get_or_create(self, key: str, **kwargs: Any) -> tuple[Any, bool, bool]:

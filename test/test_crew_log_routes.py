@@ -316,6 +316,41 @@ async def test_a_read_addressed_by_slot_key_folds_that_slot_s_unit():
 
 
 @pytest.mark.asyncio
+async def test_the_projection_routes_refuse_a_slot_keyed_fold_its_owner_serves(monkeypatch):
+    """A slot-keyed fold its OWNER serves (the radar fold: its owner orders the slot's
+    units by what the crew recorded and pins the live unit last) is refused by both
+    projection routes the way an unregistered name is, so a client cannot be handed a
+    part of the record as the whole. The slot-keyed fold this route DOES serve, and
+    the per-unit folds, still answer."""
+    handle = _log()
+    _opened(handle)
+    assert crew_log.OWNER_SERVED_SLOT_PROJECTION == "radar"
+    assert crew_log.OWNER_SERVED_SLOT_PROJECTION in crew_log.SLOT_PROJECTION_NAMES
+    assert crew_log.SLOT_PROJECTION_NAMES != (crew_log.OWNER_SERVED_SLOT_PROJECTION,)
+    for name in (crew_log.OWNER_SERVED_SLOT_PROJECTION,):
+        response = await routes.api_session_crew_log_projection(
+            _request_with_sessions("fold", "chat-7", {"chat-7": SESSION}, name=name)
+        )
+        assert response.status == 400
+        assert _body(response)["code"] == "unknown_projection"
+        _flag_on(monkeypatch)
+        request = _internal_request(
+            f"/api/crew-log/units/{SESSION}/projection/{name}",
+            slots={"chat-owner": _Slot(restricted=False)},
+            match={"unit": SESSION, "name": name},
+        )
+        unit_route = await routes.api_crew_log_unit_projection(request)
+        assert unit_route.status == 400
+        assert json.loads(unit_route.text)["code"] == "unknown_projection"
+    # The slot-keyed fold this route serves, and a per-unit fold, still answer.
+    for name in ("ledger", "status"):
+        fold = await routes.api_session_crew_log_projection(
+            _request_with_sessions("fold", "chat-7", {"chat-7": SESSION}, name=name)
+        )
+        assert fold.status == 200, name
+
+
+@pytest.mark.asyncio
 async def test_the_batch_read_answers_every_fold_from_one_resolution():
     """Every fold, resolved once and folded once, so they cannot disagree.
 
@@ -3599,3 +3634,49 @@ class TestTheListingCarriesTheWorkspaceBoundary:
         assert (
             "changed workspace while this listing was built" in json.loads(response.text)["error"]
         )
+
+
+# --- the work fold on the two projection routes ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_session_route_serves_the_work_fold_through_the_slot():
+    """`GET .../projection/work` on a session resolves the slot its unit's header
+    names and folds every unit of that slot -- the same path `ledger` takes."""
+    handle = CrewLog.create(
+        lg.KIND_SESSION, "s-conductor", owner="raymond", agent="kirocrew", slot="chat-9"
+    )
+    handle.append(
+        "work/recorded",
+        {
+            "slot": "chat-9",
+            "actor": "conductor",
+            "by": "chat-9",
+            "action": "goal",
+            "goal": "ship it",
+            "round": 1,
+            "depth": 0,
+            "event": "goal set",
+            "event_kind": "decision",
+        },
+        src="gateway",
+    )
+    fold = await routes.api_session_crew_log_projection(
+        _request_with_sessions("fold", "chat-9", {"chat-9": "s-conductor"}, name="work")
+    )
+    assert fold.status == 200, fold.text
+    body = _body(fold)
+    assert body["value"]["conductor"]["goal"] == "ship it"
+    assert body["value"]["conductor"]["entries"] == 1
+
+
+def test_the_unit_route_refuses_a_slot_keyed_fold(monkeypatch):
+    _flag_on(monkeypatch)
+    _opened(_log())
+    request = _internal_request(
+        f"/api/crew-log/units/{SESSION}/projection/work",
+        match={"unit": SESSION, "name": "work"},
+    )
+    response = asyncio.run(routes.api_crew_log_unit_projection(request))
+    assert response.status == 400
+    assert json.loads(response.text)["code"] == "slot_projection"

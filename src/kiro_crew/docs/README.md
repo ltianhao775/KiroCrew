@@ -23,7 +23,7 @@ organized for someone browsing the repository.
 |---|---|
 | [agents.md](agents.md) | Switching between specialized agents per conversation, thread, or cron job. |
 | [crew-members.md](crew-members.md) | Named crewmates, their standing DM threads, and routing work to one with `select_crew` / `route_crew`. |
-| [remote-instances.md](remote-instances.md) | Reaching other machines running their own Kiro Crew gateway: the transports, the pane switcher, sessions that run on one, and federated history search. |
+| [remote-crew.md](remote-crew.md) | Reaching other machines running their own Kiro Crew gateway: the transports, the pane switcher, sessions that run on one, and federated history search. Formerly [remote-instances.md](remote-instances.md), which now points here. |
 | [agent-spec-fields.md](agent-spec-fields.md) | Every agent-spec field, what it does, and how that differs per ACP backend. |
 | [skills.md](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows. |
 | [steering-and-hooks.md](steering-and-hooks.md) | Steering files and their inclusion modes, the prompt library, and chat lifecycle hooks. |
@@ -48,7 +48,7 @@ organized for someone browsing the repository.
 | [secrets-vault.md](secrets-vault.md) | Storing credentials encrypted where the agent cannot read them. |
 | [monitor-loops.md](monitor-loops.md) | Keeping one session checking something on an interval until an exit condition fires. |
 | [session-ledger.md](session-ledger.md) | The durable per-session work record that survives context compaction. |
-| [session-control.md](session-control.md) | Opening, seeding, watching, stopping and closing another session, and the sidebar folders and tags that file them. |
+| [session-control.md](session-control.md) | Opening, forking, seeding, watching, stopping and closing another session, and the sidebar folders and tags that file them. |
 | [work-ledger.md](work-ledger.md) | The conductor/worker record: work items, acceptance conditions, and how a dispatched worker reports. |
 | [artifacts.md](artifacts.md) | Saving, versioning, and reverting generated UI and documents. |
 | [computer-use.md](computer-use.md) | Reading and driving native desktop applications; opt-in and off by default. |

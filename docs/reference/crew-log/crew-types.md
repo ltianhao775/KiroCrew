@@ -3,12 +3,13 @@
 **Local page, not a mirror.** Part of the [crew log reference](README.md), which is
 marked as a named exception in [the Reference index](../README.md).
 
-> **No crew emitter exists.** The families and the two contracts on this page are
-> the specified shape a crew writer must produce. The `crew/dispatch` and
-> `crew/report` contracts are defined here and in
-> [`crew-log-core.md`](../../system-specs/modules/crew-log-core.md); a validator that
-> refuses a malformed one is pending. Treat every field rule below as the
-> agreement, not as something the code enforces today.
+> **Two of these types have a writer; the rest do not.** `crew/dispatch` and
+> `crew/report` are declared in `kiro_crew.crew_log.entry_types` as
+> `CREW_ENTRY_TYPES`, the append path checks every entry of those two types
+> against the declaration, and `crew_log.emit` writes them: the conductor work
+> board's `bind` records a dispatch into the dispatching crew's log, and a
+> worker's report records the answer. A field rule under any OTHER family is the
+> agreement, not something the code enforces or produces.
 
 A crew's log uses the same file layout, the same header rules and the same eight
 envelope fields as a session's log — [envelope.md](envelope.md) covers all of
@@ -17,20 +18,23 @@ may write them, and the fact that `thread` and `ref` are actually used.
 
 ## The layering rule
 
-There is one base envelope, then two disjoint sets of types on top of it. A type
-belongs to exactly one kind, and the kind of the crew log decides whether a type may
-be written to it at all. Writing a crew-owned type into a session's log is refused
+There is one base envelope, then one kind-owned type set for each of `crew`,
+`session`, and `member`. This page covers the crew set; the
+[member event log specification](../../system-specs/modules/member-event-log.md)
+owns the member vocabulary. The kind of a crew log decides whether a built-in type
+may be written to it. Writing a crew-owned type into a session's log is refused
 with [`event_type_not_owned`](errors.md#event_type_not_owned), and the reverse is
 refused the same way.
 
 The crew kind owns eight `type` domains: `member`, `activity`, `slot`, `patrol`,
 `message`, `crew`, `item`, `memory`.
 
-Two overlaps between the kinds are deliberate rather than accidental. The
-`message` domain exists in **both** kinds, carrying different `data` in each:
-ownership answers "does this kind have such events", and a crew and a session both
-do. And `ref` **crosses** kinds — a crew entry citing a span of a session's file is
-the one intended cross-kind pointer.
+The overlaps between kinds are deliberate rather than accidental. The `message`
+domain exists in both the crew and session kinds, carrying different `data`; the
+`member`, `activity`, `slot`, and `patrol` domains exist in both the crew and member
+kinds. Ownership answers "does this kind have such events", not "is this domain
+globally unique". A `ref` may cite any crew log kind; `crew/report` specifically
+uses it to cite the relevant span of a session log.
 
 A type name never carries the writer's identity. Who wrote a line is `src`, not
 part of `type`, so a dispatch written by one crew and a dispatch written by another
@@ -47,7 +51,7 @@ A crew entry is written by one of:
 | `patrol` | A patrol pass. |
 | `gateway` | The gateway itself. |
 | `crew:<name>` | A named crew, writing into its own crew log. |
-| `app:<name>` | A named app, writing only its own `app:<name>/…` types, and only into a crew log. |
+| `app:<name>` | A named app, writing only its own `app:<name>/…` types. The member kind also accepts this guest form under the same namespace rule. |
 
 `dashboard` and `patrol` are crew-side values: a session entry is written with
 `gateway` or `acp` and nothing else.
@@ -123,7 +127,7 @@ A dispatched party reported back on one work item.
 | Field | Type | Required | Meaning | Enum |
 |---|---|---|---|---|
 | `item` | string | required | The work item's id, matching the dispatch. | |
-| `status` | string | required | Where the item stands. | `done`, `blocked`, `failed`, `progress` |
+| `status` | string | required | Where the item stands. | `done`, `blocked`, `failed`, `progress`, `question` |
 | `credits` | number | optional | What the work cost. | |
 | `summary` | string | optional | What was done. | |
 
@@ -138,6 +142,15 @@ constrains the envelope as well as `data`:
 
 **Invariants** — A report without a `ref` is invalid. `status: "progress"` may
 appear several times for one dispatch; a terminal status appears once.
+
+**Where the status vocabulary comes from** — The enum is the four statuses this
+page names plus every status the conductor work board's worker half can commit,
+read off that writer's own tuple (`work_vocab.WORK_WORKER_STATUSES`) rather than
+restated. A closed enum narrower than its writer would turn a status the board
+gains into a refused entry counted as a write loss, which destroys a record
+instead of catching a mistake. `question` is therefore carried under its own name
+rather than folded into `blocked`: the two differ by WHICH party must act, and a
+conductor reading the fold acts on that difference.
 
 ```json
 {"type":"crew/report","seq":58,"time":1789000004000,"src":"crew:qa","thread":41,"ref":{"unit":"session","id":"s-7f3a","from":12,"to":40},"data":{"item":"WI-4","status":"done","credits":1.42,"summary":"six pages and a test"}}

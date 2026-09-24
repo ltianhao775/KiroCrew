@@ -28,9 +28,11 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_CLIENT_META_SETTINGS,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
+    ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
+    ACP_BACKENDS_HOOKS_LIST,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
@@ -41,6 +43,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_DISPATCH,
+    ACP_BACKENDS_MEMBER_PANEL,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_POD_HOME_REMAP,
@@ -55,6 +58,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
     ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY,
     effort_config_option_id,
+    effort_config_option_value,
     model_registry_namespace,
     overlay_project_scope,
     selectable_backends,
@@ -694,10 +698,29 @@ def _command_from_tool_params(params: dict) -> str | None:
             parts.append(f"--region {region}")
         parameters = params.get("parameters")
         if isinstance(parameters, dict) and parameters:
-            try:
-                parts.append(json.dumps(parameters, sort_keys=True))
-            except (TypeError, ValueError):
-                parts.append(str(parameters))
+            # The backend chooses this shape, so the encoder can be pushed past
+            # its recursion ceiling, and ``RecursionError`` is a
+            # ``RuntimeError``: unguarded it escapes into the hook gate and the
+            # skill-read note, which read this property while the turn runs, and
+            # kills the turn. The helper carries the unencodable-value arm
+            # verbatim: a value whose repr still holds the real bytes stays
+            # scannable. Imported here rather than at module scope because
+            # ``_dispatch`` imports THIS module.
+            from kiro_crew.acp._dispatch import (
+                UNSERIALISABLE_SIBLING_VALUE,
+                _dumps_degraded,
+            )
+
+            rendered = _dumps_degraded(parameters, sort_keys=True)
+            # A refusal leaves a placeholder where the payload was, and the
+            # parameters tail is the only place a smuggled command
+            # (``ssm send-command`` and its ``commands``) appears. Returning the
+            # command without it would hand the security checks a string that
+            # reads as complete, so fail closed instead: no command means the
+            # caller's deny-by-default arm refuses the call.
+            if rendered == UNSERIALISABLE_SIBLING_VALUE:
+                return None
+            parts.append(rendered)
         positional = params.get("positional_args")
         if isinstance(positional, list) and positional:
             parts.append(" ".join(str(p) for p in positional))
@@ -833,6 +856,10 @@ class AcpEvent:
     #: classification (cache hit), not the miss-default False.
     raw_params_trusted: bool = False
     shell_classified: bool = False
+    #: tool_identity_trusted: tool_name below came from a provenance-verified
+    #: adapter-authored identity channel, never a title or inline fallback.
+    #: Security gates must require this flag in addition to a recognized name.
+    tool_identity_trusted: bool = False
     #: mcp_identity_trusted: mcp_server_name/tool_name below were populated
     #: from a provenance-verified source — the origin-scoped tool_call caches
     #: (permission path) or ``_meta.kiro`` on the tool_call frame itself —
@@ -842,14 +869,15 @@ class AcpEvent:
     #: fails CLOSED (identity not counted as verified) instead of silently
     #: passing on non-emptiness alone.
     mcp_identity_trusted: bool = False
-    # Canonical, NON-model-authored tool identity from ``_meta.kiro`` (see
-    # ``_dispatch._kiro_tool_name``). ``title`` is LLM-authored prose — for shell
-    # tools ``select_tool_title`` even prefers the model's ``description`` — so a
-    # security gate MUST key on these, never on ``title``. ``mcp_server_name`` is
-    # populated ONLY for MCP-served tools (empty for built-ins/shell), so a
-    # non-empty value is the trusted signal "a real MCP tool call" rather than a
-    # forged shell result. Empty when the backend does not emit ``_meta.kiro``
-    # (fail-closed: callers that gate on these get no match).
+    # Canonical, NON-model-authored tool identity from adapter-authored
+    # ``_meta.kiro`` or ``_meta.goose`` (see ``_dispatch._kiro_tool_name``).
+    # ``title`` is LLM-authored prose — for shell tools ``select_tool_title``
+    # even prefers the model's ``description`` — so a security gate MUST key on
+    # these, never on ``title``. ``mcp_server_name`` is populated ONLY for
+    # MCP-served tools (empty for built-ins/shell), so a non-empty value is the
+    # trusted signal "a real MCP tool call" rather than a forged shell result.
+    # Empty when the backend emits neither trusted harness channel (fail-closed:
+    # callers that gate on these get no match).
     tool_name: str = ""
     mcp_server_name: str = ""
     # Diff content block fields — authoritative before/after text from kiro-cli

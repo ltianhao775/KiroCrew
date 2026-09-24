@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import { InstantTip, useInstantTip, OPEN_DELAY_MS } from '../components/InstantTip'
+import { InstantTip, useInstantTip, OPEN_DELAY_MS, scrollMovesAnchor } from '../components/InstantTip'
 
 /** Minimal consumer: one anchor button + the shared bubble. */
 function Harness() {
@@ -73,12 +73,63 @@ describe('InstantTip', () => {
     expect(screen.queryByRole('tooltip')).toBeNull()
   })
 
-  it('any scroll dismisses — the captured rect is stale after a scroll', () => {
+  it('a page scroll dismisses — the captured rect is stale once the window moves', () => {
     render(<Harness />)
     fireEvent.focus(screen.getByRole('button', { name: 'anchor' }))
     expect(screen.getByRole('tooltip')).toBeInTheDocument()
     fireEvent.scroll(window)
     expect(screen.queryByRole('tooltip')).toBeNull()
+  })
+
+  it('a scroll of a container the anchor sits in dismisses', () => {
+    render(<BoundaryHarness />)
+    fireEvent.focus(screen.getByRole('button', { name: 'anchor' }))
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    // Scroll events do not bubble; the window listener is capture-phase, and
+    // fireEvent dispatches on the target itself just as a real strip would.
+    fireEvent.scroll(screen.getByTestId('boundary'))
+    expect(screen.queryByRole('tooltip')).toBeNull()
+  })
+
+  it('a scroll elsewhere in the document leaves the bubble open — the anchor did not move', () => {
+    // The transcript re-pinning, a sidebar lane re-sorting, a side panel
+    // following its tail: all fire `scroll` on elements the anchor is not in.
+    // Without the ancestor check every one of them closes the bubble under a
+    // resting pointer.
+    const elsewhere = document.createElement('div')
+    document.body.appendChild(elsewhere)
+    try {
+      render(<Harness />)
+      fireEvent.focus(screen.getByRole('button', { name: 'anchor' }))
+      expect(screen.getByRole('tooltip')).toBeInTheDocument()
+      fireEvent.scroll(elsewhere)
+      expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    } finally {
+      elsewhere.remove()
+    }
+  })
+
+  it('scrollMovesAnchor: window, document and a detached anchor count; an unrelated node does not; no anchor fails closed', () => {
+    const anchor = document.createElement('button')
+    const parent = document.createElement('div')
+    const sibling = document.createElement('div')
+    parent.appendChild(anchor)
+    document.body.append(parent, sibling)
+    try {
+      expect(scrollMovesAnchor(window, anchor)).toBe(true)
+      expect(scrollMovesAnchor(document, anchor)).toBe(true)
+      expect(scrollMovesAnchor(parent, anchor)).toBe(true)
+      expect(scrollMovesAnchor(sibling, anchor)).toBe(false)
+      expect(scrollMovesAnchor(anchor, anchor)).toBe(false)
+      expect(scrollMovesAnchor(sibling, null)).toBe(true)
+      // The anchor's element was replaced while the bubble stayed open (a chip
+      // changing shape on a pick): nothing contains a detached node, so the
+      // ancestor test alone would keep a stranded bubble open on every scroll.
+      const detached = document.createElement('button')
+      expect(scrollMovesAnchor(parent, detached)).toBe(true)
+    } finally {
+      parent.remove(); sibling.remove()
+    }
   })
 
   it('blur hides the focus-shown bubble', () => {

@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path, PurePath, PurePosixPath
 
-from kiro_crew import pinned_fs, platform_compat
+from kiro_crew import crew_teams, pinned_fs, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.config.paths import config_dir
 from kiro_crew.mcp_cron import _log_cron_denial, _vet_shell_command
@@ -62,8 +62,8 @@ EXPORT_EXCLUDE = frozenset(
         # skills/ trees, so an entry here would silently drop any USER file that
         # happens to share the name. They need no entry: root-level export is a
         # hard-coded allowlist (config.json, hooks.json, crons.json,
-        # notifications.jsonl, project_dir, workspace_dir), so a root beacon file is
-        # never selected in the first place.
+        # notifications.jsonl, project_dir, workspace_dir, crew-teams/teams.json), so a
+        # root beacon file is never selected in the first place.
         "session_map.json",
         "kiro_session_pids.txt",
         "kiro_pids.txt",
@@ -449,6 +449,14 @@ def create_export_zip() -> tuple[bytes, dict]:
                 zf.write(str(src), f"{prefix}/{fname}")
                 contents_summary[fname] = src.stat().st_size
 
+        # The crewmate team list: one document in its own directory. Written by name like
+        # the core files above -- the directory holds nothing else that rides (its lock
+        # file is this host's runtime state), so the pinned tree walk below is not needed.
+        teams_src = mc / "crew-teams" / "teams.json"
+        if teams_src.is_file() and not teams_src.is_symlink():
+            zf.write(str(teams_src), f"{prefix}/crew-teams/teams.json")
+            contents_summary["crew-teams/teams.json"] = teams_src.stat().st_size
+
         # SQLite databases via backup API
         for db_name in ("memory.db", "memory_index.db"):
             src = mc / db_name
@@ -626,6 +634,17 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     dropped job is gone; a paused one is fully restored and simply waiting to be
     switched on. Rewrites *crons_path* in place. A missing file is left alone.
 
+    The store is read and written as UTF-8, never through the locale codepage.
+    Cron job names are operator-authored text and routinely non-ASCII — the same
+    reason ``snapshot._merge_crons``, which merges this very file a few lines
+    later in ``apply_import_zip``, pins ``encoding="utf-8"`` on both ends. A bare
+    ``read_text()`` here decodes the archive's UTF-8 with the host codepage, and
+    both outcomes are wrong: a codepage that cannot decode the bytes raises
+    ``UnicodeDecodeError``, which IS a ``ValueError`` and therefore lands in the
+    recovery arm below — replacing a perfectly good backup with an empty store
+    and reporting it as unreadable — while a codepage that decodes most bytes
+    (cp1252) yields mojibake that the rewrite below then persists to disk.
+
     Three rules, each closing a different way an archive can act on the host:
 
     1. A job that is not an object, or whose ``schedule`` is not one, is DROPPED.
@@ -654,12 +673,12 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     if not crons_path.is_file():
         return [], []
     try:
-        data = json.loads(crons_path.read_text())
+        data = json.loads(crons_path.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         # Unparseable bytes are not installable as a cron store either, but they
         # are also not something this function can reason about — an empty store
         # is the only safe thing to hand the loader.
-        crons_path.write_text(json.dumps({"jobs": []}, indent=2))
+        crons_path.write_text(json.dumps({"jobs": []}, indent=2), encoding="utf-8")
         return [_UNREADABLE_STORE], []
     # A store whose top level is not an object, or whose `jobs` is not a list, is
     # REPLACED rather than left alone. `CronService._load` treats such a document
@@ -667,7 +686,7 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     # user is TOLD the store was unreadable at import time, instead of the
     # gateway silently starting with an empty schedule later.
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
-        crons_path.write_text(json.dumps({"jobs": []}, indent=2))
+        crons_path.write_text(json.dumps({"jobs": []}, indent=2), encoding="utf-8")
         return [_UNREADABLE_STORE], []
     jobs = data["jobs"]
 
@@ -733,7 +752,7 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
 
     if changed:
         data["jobs"] = kept
-        crons_path.write_text(json.dumps(data, indent=2))
+        crons_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return dropped, paused
 
 
@@ -896,8 +915,11 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
         # would otherwise install a torn `memory_stores/<name>/memory.db` verbatim, and
         # the member fails at its next open with the archive long gone. Refused here,
         # nothing has been written; the exception reaches the handler as a refusal.
+        # `crew-teams` rides the same check: replace copies the tree whole through
+        # `_do_replace`, merge copies the document where the destination has none, and
+        # both would otherwise install a document the team store's reader refuses.
         _refuse_corrupt_source_databases(
-            snap, ["memory"], mc_for_merge=None if mode == "replace" else mc
+            snap, ["memory", "crew-teams"], mc_for_merge=None if mode == "replace" else mc
         )
 
         if mode == "replace":
@@ -949,6 +971,16 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                 else:
                     shutil.copy2(str(snap / "crons.json"), str(mc / "crons.json"))
                     summary["items"].append("crons (copied)")
+
+            # The team list, like hooks.json: installed only where the destination has
+            # none -- decided and written under the store's own lock, document only, so
+            # a concurrent team write neither loses to the import nor overwrites it.
+            # Validated above by the team store's own reader, before anything moved.
+            teams_snap = snap / crew_teams.TEAMS_DIR_NAME / crew_teams.TEAMS_FILE_NAME
+            if teams_snap.is_file() and crew_teams.install_document(
+                teams_snap, mc / crew_teams.TEAMS_DIR_NAME, only_if_absent=True
+            ):
+                summary["items"].append("crew-teams (copied)")
 
             if (snap / "hooks.json").is_file():
                 if not (mc / "hooks.json").is_file():

@@ -244,9 +244,20 @@ export default function ThemeExperienceLayer() {
   // it without a re-read hack. A stored grant is honoured ONLY if it matches the
   // current consentToken — so a changed persona (new sha256) re-prompts, and
   // legacy '1' grants (which never equal the token) re-prompt once.
+  //
+  // Level-2 only. The render cache (themeRenderCache.ts) seeds a Level-1
+  // projection of the active pack before the server detail arrives: level is
+  // capped to 1 and personaInfo is stripped, so on that seed consentToken is
+  // the sentinel while the stored grant is the persona sha256. Consent is read,
+  // honoured and revoked only against the server-confirmed Level-2 detail, so a
+  // seed can neither validate a grant (GPT, head 6856a77997) nor revoke one
+  // (Opus, head 1d002b0c7b). When the real detail lands, isL2 flips true and
+  // consentToken becomes the real sha256 in the same commit, and this effect
+  // then compares the stored grant against that hash.
   const [consented, setConsented] = useState(false)
   useEffect(() => {
-    if (!slug) {
+    if (!slug || !isL2) {
+      // A Level-1 entry (incl. a render-cache seed) has no consent to read or revoke.
       setConsented(false)
       return
     }
@@ -263,7 +274,7 @@ export default function ThemeExperienceLayer() {
       revokeConsent(slug)
     }
     setConsented(stored !== null && stored === consentToken)
-  }, [slug, consentToken])
+  }, [slug, isL2, consentToken])
   const featuresOn = anyExperience && (!needsConsent || consented)
 
   const reduced = useReducedMotion()

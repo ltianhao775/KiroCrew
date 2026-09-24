@@ -113,10 +113,12 @@ class RosterProjection:
             return state
         if etype == types.MEMBER_MESSAGE:
             ts = data.get("ts")
-            preview = data.get("preview")
             new = dict(state)
             new["last_active_ts"] = ts
-            new["last_message"] = preview
+            # A machinery row (tool call, patrol turn) bumps recency but carries
+            # no preview; the last thing SAID stays on the row.
+            if "preview" in data:
+                new["last_message"] = data.get("preview")
             return new if new != state else state
         return state
 

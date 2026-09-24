@@ -356,7 +356,7 @@ try {
   $env:PYTHONUTF8 = "1"
   $env:PYTHONIOENCODING = "utf-8:backslashreplace"
   $gatewayProcess = Start-Process -FilePath $bundledPython -ArgumentList @(
-    "-s", "-m", "kiro_crew", "gateway", "--no-open", "--port", "$gatewayPort"
+    "-s", "-P", "-m", "kiro_crew", "gateway", "--no-open", "--port", "$gatewayPort"
   ) -WorkingDirectory $installLocation -RedirectStandardOutput $gatewayStdout `
     -RedirectStandardError $gatewayStderr -WindowStyle Hidden -PassThru
 

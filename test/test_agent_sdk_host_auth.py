@@ -455,7 +455,7 @@ def test_an_own_leaf_from_its_own_declaration_is_accepted() -> None:
 
 @pytest.mark.parametrize(
     "source",
-    [host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE],
+    [host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE, host_auth.ENTITLEMENT_HOST_VAULT],
 )
 def test_logout_recycling_is_refused_off_the_host_store(source: str) -> None:
     """A host logout says nothing about a store the harness never reads, so
@@ -826,3 +826,49 @@ def test_every_entitlement_source_has_an_operator_facing_label() -> None:
         assert "_" not in label, f"{source!r} labels itself with a code identifier"
     for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
         assert "_" not in host_auth.entitlement_label(declaration.backend)
+
+
+def test_the_host_vault_source_is_declared_and_labelled() -> None:
+    """The third source the module always anticipated, now that it exists.
+
+    The comment above :data:`ENTITLEMENT_LABELS` said a harness entitled some other
+    way "would add a third here, with its label, when it exists". Adding the
+    identifier without adding it to both the source set and the label map is the one
+    way to land a source that ``__post_init__`` refuses (unknown source) or that
+    doctor prints raw -- so both memberships are asserted, not just one.
+    """
+    assert host_auth.ENTITLEMENT_HOST_VAULT in host_auth.ENTITLEMENT_SOURCES
+    assert host_auth.ENTITLEMENT_HOST_VAULT in host_auth.ENTITLEMENT_LABELS
+    assert host_auth.ENTITLEMENT_HOST_VAULT not in (
+        host_auth.ENTITLEMENT_HOST_IDENTITY_STORE,
+        host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    )
+    # A harness entitled from Crew's vault signs in somewhere other than the host
+    # identity store, so the panel still shows its standing caveat: the operator has
+    # to put a key in the vault and map it, which is an action doctor has not
+    # measured.
+    for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
+        if declaration.entitlement_source != host_auth.ENTITLEMENT_HOST_VAULT:
+            continue
+        assert host_auth.signs_in_separately(declaration.backend)
+        assert declaration.backend not in host_auth.backends_retired_by_host_logout()
+
+
+def test_a_host_vault_harness_names_the_config_surface_that_feeds_it() -> None:
+    """Its remedy must send the operator to the vault, not to the harness's own file.
+
+    ``sign_in_remedy`` is rendered VERBATIM in the backend panel and printed by
+    doctor, and for this source the action is Crew's own -- store a secret, map it
+    in config. A remedy inherited from the file-based harnesses would tell the
+    operator to write a credential file that the child mask now hides, which is
+    advice that cannot work.
+    """
+    declarations = [
+        d
+        for d in host_auth.AGENT_AUTH_DECLARATIONS
+        if d.entitlement_source == host_auth.ENTITLEMENT_HOST_VAULT
+    ]
+    assert declarations, "no harness declares the host-vault source; this would be vacuous"
+    for declaration in declarations:
+        for text in (declaration.sign_in_remedy, declaration.signed_out_message):
+            assert "Secrets" in text, declaration.backend

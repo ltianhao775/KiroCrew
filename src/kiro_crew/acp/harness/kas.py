@@ -24,7 +24,12 @@ from typing import Any
 # compared by identity, never substituted.
 from kiro_crew import agent as agent_mod
 from kiro_crew.acp import kas_agents as kas_agents_mod
-from kiro_crew.acp.harness._common import KIRO_FAMILY_ALIASES, MembershipHarness
+from kiro_crew.acp._dispatch import advertised_mode_origin
+from kiro_crew.acp.harness._common import (
+    KIRO_FAMILY_ALIASES,
+    MembershipHarness,
+    apply_mandatory_mcps_env,
+)
 from kiro_crew.acp.harness.base import (
     NotificationAliases,
     SessionExtras,
@@ -32,7 +37,7 @@ from kiro_crew.acp.harness.base import (
     SpawnPlan,
     TeardownPolicy,
 )
-from kiro_crew.acp.kas_agents import KasAgentTranslationError
+from kiro_crew.acp.kas_agents import KasAgentTranslationError, KasReservedAgentIdError
 from kiro_crew.acp.kas_host_auth import answer_get_access_token, vault_holds_identity_off_loop
 from kiro_crew.acp.kas_transport import METHOD_KAS_AUTH_GET_ACCESS_TOKEN, build_kas_argv
 from kiro_crew.acp.types import (
@@ -97,15 +102,27 @@ class KasHarness(MembershipHarness):
         return SpawnPlan(argv=build_kas_argv(kas_bin, host_auth=host_auth), host_auth=host_auth)
 
     def apply_spawn_env(self, env: dict[str, str]) -> None:
-        """Take the API key OUT of the child's environment.
+        """Take the API key OUT of the child's environment, and exempt Crew's own
+        MCP servers from Tool Search deferral.
 
         The relay expects an OIDC bearer from the callback, not a Crew API key,
         and an ambient key would be sent with the wrong token type. Removing it
         is the positive action here, not an omission.
+
+        The exemption applies here for the same reason this harness speaks
+        kiro-cli's notification dialect: the relay IS kiro-cli. Crew launches it as
+        ``kiro-cli acp --agent-engine v3`` (:func:`acp.kas_transport.build_kas_argv`),
+        the same ``acp`` subcommand the kiro path uses, and that subcommand reads the
+        variable unconditionally -- the read is not gated on ``--agent-engine``. KAS
+        is in fact the more exposed of the two: it takes Tool Search over the
+        ``initialize`` wire and defers every MCP spec whenever the setting is on,
+        with no token threshold to stay under. Rules and rationale:
+        :func:`apply_mandatory_mcps_env`.
         """
         from kiro_crew.config.loader import strip_kiro_cli_api_key
 
         strip_kiro_cli_api_key(env)
+        apply_mandatory_mcps_env(env)
 
     @property
     def verifies_agent_activation(self) -> bool:
@@ -134,6 +151,7 @@ class KasHarness(MembershipHarness):
         work_dir: str | Path | None,
         mcp_gateway_overlay: Any = None,
         member_dispatch: bool = False,
+        crew_panel: bool = False,
         session_key: str = "",
     ) -> SessionExtras:
         """Project the agent spec onto KAS, for both session start paths.
@@ -225,6 +243,11 @@ class KasHarness(MembershipHarness):
                 from kiro_crew.members import MEMBER_DISPATCH_SERVER
 
                 stubbed = frozenset(stubbed) | {MEMBER_DISPATCH_SERVER}
+            if crew_panel:
+                # And the panel server, for the same reason on the same path.
+                from kiro_crew.members import MEMBER_PANEL_SERVER
+
+                stubbed = frozenset(stubbed) | {MEMBER_PANEL_SERVER}
             # The snapshot travels WITH the payload it built. This payload is where the
             # spec is CONSUMED on this host -- ``set_mode`` activates what is already
             # registered and reads nothing -- so the check that proves the consumed spec
@@ -237,6 +260,7 @@ class KasHarness(MembershipHarness):
                     spec,
                     stub_server_names=stubbed,
                     member_dispatch=member_dispatch,
+                    crew_panel=crew_panel,
                     session_key=session_key,
                 ),
                 snapshot,
@@ -247,8 +271,62 @@ class KasHarness(MembershipHarness):
             return SessionExtras(custom_agents=built, derived_spec_snapshot=built_from)
         except ForkGovernanceUnresolved as exc:
             raise AcpRuntimeError(str(exc)) from exc
+        except KasReservedAgentIdError as exc:
+            # Already the whole instruction, in the dashboard's labels; the
+            # prefix below would put wire vocabulary in front of it.
+            raise AcpRuntimeError(str(exc)) from exc
         except KasAgentTranslationError as exc:
             raise AcpRuntimeError(f"cannot project agent {agent!r} onto KAS: {exc}") from exc
+
+    def activation_refusal(self, agent: str, resp: dict[str, Any]) -> str | None:
+        """Refuse an id the engine advertises as ITS OWN built-in rather than ours.
+
+        The definition Crew sent rode ``_meta.kiro.customAgents``, so the
+        advertised mode of that id should carry ``origin: client``. The stamp
+        ``bundled`` -- the one value MEASURED on kiro-cli 2.23.0 for
+        ``vibe``/``spec``/``plan``/... -- means the engine kept a built-in
+        agent under the id and discarded the client entry: the one shape the
+        is-it-advertised check cannot see, because the id IS advertised, and a
+        ``set_mode`` would succeed and run the built-in under the crewmate's
+        name. ``KAS_RESERVED_AGENT_IDS`` refuses the ids measured to do this
+        before the wire; this reads the wire itself, so a built-in a later
+        engine adds under a NEW id fails loudly instead of silently
+        substituting. Only that measured stamp refuses. An absent stamp is not
+        evidence either way, and a stamp this code has never seen (an engine
+        that renames ``client`` to, say, ``custom``) is logged and let through:
+        kiro-cli is the operator's own install, not pinned by Crew, so an
+        unmeasured value must not turn into a session-start denial of every
+        crewmate with a rename remedy that cannot help.
+        """
+        origin = advertised_mode_origin(resp, agent)
+        if not origin or origin == "client":
+            return None
+        if origin != "bundled":
+            logger.warning(
+                "agent %r: the engine stamps this advertised id with an unmeasured "
+                "origin=%r (neither 'client' nor 'bundled'); activating it unrefused",
+                agent,
+                origin,
+            )
+            return None
+        # The refusal blames the NAME; the stamp is what justified that. Logged
+        # raw so a later engine that changes its stamping (say, a disk-advertised
+        # replacement stamped ``bundled``) shows up here as the same value on
+        # every crewmate, instead of as a rename remedy that cannot help.
+        logger.warning(
+            "agent %r: the engine advertises this id as its own built-in "
+            "(origin=%r); refusing to activate it",
+            agent,
+            origin,
+        )
+        return (
+            f"Rename this crewmate's template: “{agent}” is reserved for a built-in "
+            "agent, so the crewmate's own prompt and tools would not run under it. "
+            "Both fixes are on the crewmate's Agent Template tab: for the crewmate's own "
+            "copy, 'Save as new template…' under another name (it keeps its "
+            "customizations) or 'Reset my changes'; for a shared template, the template "
+            "picker at the top of the tab."
+        )
 
     def session_mcp_servers(
         self,

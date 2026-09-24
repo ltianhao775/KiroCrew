@@ -50,6 +50,12 @@ declare global {
     setThemeMode: (pref: string) => void
     setTitleBarOverlayTheme: (mode: string) => void
     setFocusModeChrome: (visible: boolean) => void
+    /** Watch how far the cursor travels OUTSIDE this window while a focus-mode
+     *  reveal is open. Fires the callback once — `true` past the dismissal
+     *  distance, `false` if the cursor came back inside — and returns an
+     *  unsubscribe that also disarms the main-process poll. Optional: absent in a
+     *  browser and on a shell older than the feature. */
+    watchCursorAway?: (cb: (away: boolean) => void) => (() => void) | undefined
     setDevMode: (enabled: boolean) => void
     getAppMenuItems: (id: string) => Promise<ElectronAppMenuItem[]>
     executeAppMenuItem: (id: string, index: number) => void

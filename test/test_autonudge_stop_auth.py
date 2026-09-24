@@ -410,7 +410,7 @@ def test_applier_ack_discloses_the_gated_cadence(monkeypatch):
             {"message": "watch https://github.com/acme/widgets/pull/42", "idle_secs": 300},
         )
     )
-    assert "only when it changes" in result, "the ack must state the gated cadence"
+    assert "only on a wake from it" in result, "the ack must state the gated cadence"
     assert "acme/widgets#42" in result, "and name the subject it is watching"
     assert "message re-injects every 300s" not in result, "not the plain promise"
 
@@ -433,7 +433,7 @@ def test_applier_ack_keeps_the_plain_promise_for_an_ungated_loop(monkeypatch):
         )
     )
     assert "re-injects every 300s" in result
-    assert "only when it changes" not in result
+    assert "only on a wake from it" not in result
 
 
 def test_applier_monitor_start_arms_via_the_session_binding_key(monkeypatch):
@@ -1234,3 +1234,106 @@ def test_autonudge_stop_directive_does_not_read_as_confirmation(default_install)
     assert "REQUESTED" in result
     assert "not confirmation" in result.lower()
     assert "nothing was stopped" in result.lower()
+
+
+# ── The wake judge at the tool surface ────────────────────────────────────────
+#
+# These exist because the feature was unreachable while every Python-level test
+# passed. The handler read ``args.get("judge")`` and the applier stored it, so a
+# test that called the tool with a judge argument went green -- but the field was
+# absent from the model-facing ``inputSchema``, so no agent could ever send one.
+# QA found a real agent arming a loop with ``judge == {}`` and the criteria pasted
+# into ``message`` as prose. The schema assertion below is the one that fails
+# without the fix; the payload assertion guards the hop after it.
+
+
+def _schema_for(tool_name: str) -> dict:
+    """One tool's model-facing inputSchema, as advertised to the agent."""
+    from kiro_crew.mcp_tools import control
+
+    entry = next(s for s in control.schemas() if s["name"] == tool_name)
+    return entry["inputSchema"]
+
+
+@pytest.mark.parametrize("tool_name", ["monitor_start", "monitor_update"])
+def test_the_judge_is_advertised_to_the_model_on_both_monitor_tools(tool_name: str) -> None:
+    """A field the schema does not list cannot be sent, whatever the handler reads.
+
+    Asserted against the SCHEMA rather than a call, because a call-level test
+    passes while the field is invisible -- which is exactly how this shipped
+    unreachable.
+    """
+    props = _schema_for(tool_name)["properties"]
+    assert "judge" in props, f"{tool_name} does not advertise `judge`, so no agent can send one"
+    judge = props["judge"]
+    # Both shapes, because the field carries two kinds of answer: an object is the
+    # owner's own brief, and `false` is the bypass. A schema listing only the object
+    # makes the bypass unsendable, which is the same way the field itself once shipped
+    # unreachable.
+    assert judge["type"] == ["object", "boolean"]
+    assert judge.get("description", "").strip(), "an undescribed object tells the model nothing"
+    assert "false" in judge["description"], "the bypass is unusable if the model is not told"
+    assert set(judge["properties"]) == {"wake_when", "quiet_when", "targets"}
+    for field in ("wake_when", "quiet_when"):
+        assert judge["properties"][field]["type"] == "string"
+        assert judge["properties"][field].get("description", "").strip()
+    targets = judge["properties"]["targets"]
+    assert targets["type"] == "array"
+    assert targets["items"]["type"] == "string"
+    assert targets.get("description", "").strip()
+
+
+def test_monitor_start_carries_a_judge_into_the_directive_payload(default_install):
+    """The hop after the schema: a sent brief reaches the validated payload."""
+    brief = {
+        "wake_when": "a worker line starts with RULING or BLOCKED",
+        "quiet_when": "workers report WORKING with no new status",
+    }
+    result = _call_tool_inner(
+        "monitor_start",
+        {"message": "patrol chat-1751-1790052364", "judge": brief},
+    )
+    args = session_directive.decode(result, "monitor_start")
+    assert args["judge"] == brief
+
+
+def test_monitor_start_without_a_judge_emits_no_judge_key(default_install):
+    """Negative control: the payload shape is asserted by exact equality
+    elsewhere, so an unconditional ``judge`` key would break every other loop's
+    contract and give a plain timer a judge it never asked for."""
+    result = _call_tool_inner("monitor_start", {"message": "watch CI"})
+    assert "judge" not in session_directive.decode(result, "monitor_start")
+
+
+def test_monitor_start_refuses_a_malformed_judge_naming_the_field(default_install):
+    """A refusal has to name a field the owner can fix, and arm nothing."""
+    out = _call_tool_inner(
+        "monitor_start",
+        {"message": "watch", "judge": {"wake_when": "x", "not_a_real_key": "y"}},
+    )
+    assert "not_a_real_key" in out
+    assert out.startswith("monitor_start:")
+    assert (
+        session_directive.decode(out, "monitor_start") is None
+    ), "a refused brief still emitted an arming directive"
+
+
+def test_monitor_update_carries_a_judge_into_the_patch(default_install):
+    """Revising a live loop's brief reaches the patch rather than being dropped."""
+    brief = {"wake_when": "CI turns red", "quiet_when": "checks are still running"}
+    result = _call_tool_inner("monitor_update", {"judge": brief})
+    assert session_directive.decode(result, "monitor_update")["patch"]["judge"] == brief
+
+
+def test_monitor_update_can_clear_a_judge_with_an_empty_object(default_install):
+    """An empty object REMOVES the brief, which the schema promises.
+
+    ``{}`` has to survive as an explicit patch value: dropping it because it is
+    falsy would make the documented way to remove a judge silently do nothing, and
+    would also make ``judge`` alone read as an empty patch and answer "nothing to
+    change".
+    """
+    result = _call_tool_inner("monitor_update", {"judge": {}})
+    patch = session_directive.decode(result, "monitor_update")["patch"]
+    assert patch["judge"] == {}
+    assert "judge" in patch, "an empty brief was dropped, so a judge cannot be removed"

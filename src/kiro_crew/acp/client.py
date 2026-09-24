@@ -45,8 +45,10 @@ from typing import (
     Sequence,
     TypeVar,
 )
+from urllib.request import url2pathname
 
 from kiro_crew import (
+    __version__,
     acp_tool_gate,
     agent_scratch,
     agent_sdk,
@@ -59,6 +61,7 @@ from kiro_crew.acp import seed_provenance
 from kiro_crew.acp._dispatch import (
     ACP_BACKENDS_META_IDENTITY,
     DRAIN_YIELD_AFTER_S,
+    _dumps_degraded,
     _measure_tool_output,
     agent_version_from_init,
     build_permission_event,
@@ -111,6 +114,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_LOAD_WITHOUT_MODES,
     ACP_BACKENDS_MEMBER_DISPATCH,
+    ACP_BACKENDS_MEMBER_PANEL,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_POD_HOME_REMAP,
@@ -175,6 +179,7 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     JsonRpcRequest,
     effort_config_option_id,
+    effort_config_option_value,
     model_registry_namespace,
     overlay_project_scope,
 )
@@ -223,6 +228,7 @@ from kiro_crew.mcp_gateway.claim import (
     mint_stub_session_token,
     schedule_claim,
 )
+from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX, resolve_secret_uris
 from kiro_crew.mcp_gateway.session_servers import (
     attach_stub_session_token,
     injection_server_names,
@@ -241,6 +247,7 @@ from kiro_crew.sandbox import (
     SANDBOX_LAYER_HARNESS,
     BoundWorkspaceMismatch,
     _forward_ssh_auth_sock,
+    agent_env_scrub_prefixes,
     apply_windows_resource_ceiling,
     assert_voice_runtime_outside_agent_workspace,
     bind_voice_safe_agent_workspace_async,
@@ -265,7 +272,17 @@ from kiro_crew.skill_usage import get_global_skill_read_observer
 logger = logging.getLogger(__name__)
 
 CLIENT_NAME = "kirocrew"
-CLIENT_VERSION = "0.1.2"
+#: The version reported to the agent host in ``initialize``'s ``clientInfo``, and
+#: from there into the host's own telemetry (``acp_client_version``). It is the
+#: PACKAGE version, never a literal of its own: a hand-maintained literal is a
+#: second version number nobody bumps, and this one was not -- it sat at
+#: ``"0.1.2"`` from the first commit that named it while the product shipped
+#: 0.2.0 through 0.8.0, so every Crew-driven session of every release reported
+#: one indistinguishable version and no version split of Crew traffic was
+#: possible. Reading ``__version__`` also inherits what that attribute already
+#: resolves at import: a release lane's rewritten literal AND a repackager's
+#: ``BUILD_VERSION`` stamp.
+CLIENT_VERSION = __version__
 _T = TypeVar("_T")
 # kiro-cli uses a date-stamped protocol; claude-agent-acp follows the
 # upstream ACP SDK (numeric integer, currently 1).  See acp.types.
@@ -440,7 +457,37 @@ _GOOSE_BUILTIN_DEVELOPER = "developer"
 _ADAPTER_INTERPRETERS = frozenset({"node", "node.exe"})
 
 
-def _adapter_spawn_label(argv: Sequence[str], seam: str) -> str:
+def _is_adapter_package_entry(program: str, pkg_entry: Path) -> bool:
+    """Whether *program* is *pkg_entry* sitting under some node_modules root."""
+    parts = Path(program).parts
+    wanted = pkg_entry.parts
+    if len(parts) < len(wanted):
+        return False
+    return [p.casefold() for p in parts[-len(wanted) :]] == [p.casefold() for p in wanted]
+
+
+def _named_by_override(program: str, override_env: str | None) -> bool:
+    """Whether the operator's override is what supplied *program*.
+
+    The resolution ladder takes the override as its first candidate verbatim, so
+    an equality test against the resolved program is what separates a deliberate
+    override from the adapter's own installed entry.
+    """
+    if not override_env:
+        return False
+    override = os.environ.get(override_env, "").strip()
+    if not override:
+        return False
+    return os.path.normpath(os.path.expanduser(override)) == os.path.normpath(program)
+
+
+def _adapter_spawn_label(
+    argv: Sequence[str],
+    seam: str,
+    *,
+    pkg_entry: Path | None = None,
+    override_env: str | None = None,
+) -> str:
     """Keep a stable seam label while identifying the resolved program.
 
     Both ACP seams resolve their binary through a documented environment
@@ -452,8 +499,23 @@ def _adapter_spawn_label(argv: Sequence[str], seam: str) -> str:
     if not argv:
         return seam
     program = argv[0]
-    if Path(program).name.casefold() in _ADAPTER_INTERPRETERS and len(argv) > 1:
+    if Path(program).name.casefold() in _ADAPTER_INTERPRETERS:
+        # A bare interpreter identifies no adapter at all.
+        if len(argv) <= 1:
+            return seam
         program = argv[1]
+        # An adapter installed as a Node package resolves to its own
+        # `dist/index.js`, whose basename names the packaging rather than the
+        # adapter, so the seam alone is the useful identity there. That shortcut
+        # is only honest for the package's OWN entry under its own scope: a
+        # script the operator's override supplied, or any other `index.js`, is
+        # the one record of which build actually launched, so its path stays.
+        if (
+            pkg_entry is not None
+            and not _named_by_override(program, override_env)
+            and _is_adapter_package_entry(program, pkg_entry)
+        ):
+            return seam
     return f"{seam} via {program}" if program else seam
 
 
@@ -515,6 +577,35 @@ _goose_versions_noted: set[str] = set()
 # The per-session nonce the gate extension reads and echoes in its dialogs, so
 # the dispatch parser accepts only envelopes this session's own extension wrote.
 _ENV_PI_GATE_SESSION = "KIROCREW_PI_GATE_SESSION"
+# The DeepSeek Harness half of the same routing member. Its composition takes a
+# per-launch patch file (``--patch``, ``packages/boot/cmdline``) whose ``insert``
+# row names a plugin by ABSOLUTE PATH, which is how Crew's gate is composed into a
+# profile it does not own; the plugin then answers the harness's own
+# ``tools/pre-execute`` waterfall. There is no command registry to read back, so
+# the plugin reports its load through a marker file at a path named here.
+_DSH_PATCH_FLAG = "--patch"
+_ENV_DSH_GATE_SESSION = "KIROCREW_DSH_GATE_SESSION"
+_ENV_DSH_GATE_MARKER = "KIROCREW_DSH_GATE_MARKER"
+# The provider-key NAMES the probe asks the plugin to prove withheld from a harness
+# child, ``:``-joined (each is a POSIX identifier, so the separator cannot occur
+# inside one). The probe sets each such name to a canary -- this prefix plus the
+# probe's nonce -- never to the key: the property "this name does not reach the
+# harness's shells" can only be observed for a name that is SET, and the probe boots
+# a plugin host that needs no provider key.
+_ENV_DSH_GATE_SCRUB_NAMES = "KIROCREW_DSH_GATE_SCRUB_NAMES"
+_DSH_GATE_SCRUB_CANARY_PREFIX = "kirocrew-dsh-gate-scrub-canary-"
+# One harness boot, bounded like the pi and opencode read-backs; measured at ~3s
+# for this harness, which boots a plugin host rather than a single binary, plus the
+# plugin's own child spawn for the scrub proof (one ``node -e``, well under a second).
+_DSH_GATE_READBACK_TIMEOUT_S = 60.0
+# How often the probe looks for the marker while the harness is still up.
+_DSH_GATE_MARKER_POLL_S = 0.05
+# After the marker is published the harness is told to exit (stdin EOF) and given
+# this long to do so before it is killed; its own bounded shutdown is 5s.
+_DSH_GATE_PROBE_EXIT_S = 15.0
+# The plugin's real marker is a few hundred bytes. This cap bounds child-controlled
+# memory before JSON parsing while leaving ample room for the complete routing snapshot.
+_DSH_GATE_MARKER_MAX_BYTES = 64 * 1024
 # SHA-256 of the shipped gate extension. The file lives in the package tree,
 # which on a source or user install an agent's own file tools may be able to
 # write; a read-back that matched the probe by name and path alone would accept
@@ -528,6 +619,10 @@ _ENV_PI_GATE_SESSION = "KIROCREW_PI_GATE_SESSION"
 # every pi session there. ``.gitattributes`` pins the checkout LF as well; the
 # normalization here is what keeps the property from resting on a repo-config line.
 PI_GATE_EXTENSION_SHA256 = "33caa696e70e3b0c0793a705b0c6e06c372c52478e3ac4abf75f0e8d67d1e600"
+# Same seal, same reason, for the DeepSeek Harness gate plugin. Pinned by
+# ``test_acp_deepseek_backend``, so editing the plugin is a deliberate two-file
+# edit.
+DEEPSEEK_GATE_EXTENSION_SHA256 = "d95796f59d8e30f840dbb12ad4253c18f09e5b3972435e5b5f307d6b7d994351"
 # ── deepseek (ACP_BACKEND_DEEPSEEK) ──
 # DeepSeek Harness is a plugin host, and ACP is one of the profiles it boots. So the
 # argv is the harness's own binary plus the profile selector -- the plain-binary
@@ -545,6 +640,72 @@ _ENV_DEEPSEEK_PERMISSION_MODE = "DSH_PERMISSION_MODE"
 # in depth and nothing more, because it does not make this harness's tool calls reach
 # Crew's gate.
 DEEPSEEK_PERMISSION_MODE = "workspace-write"
+# ── agent.deepseek_env: the provider key, fed from Crew's vault ──
+# This harness's own credential layering resolves a provider key from the INHERITED
+# PROCESS ENVIRONMENT first, above both of its credential files
+# (``@deepseek-ai/dsh-credentials-local``'s own header: inherited environment,
+# read-only and winning, then ``$DSH_HOME/.credentials.yaml``, then ``<cwd>/.env``,
+# then ``$DSH_HOME/.env``), and a credential reference in its configuration IS an
+# environment-variable name (``@deepseek-ai/dsh-credentials``'s ``credentialRef``).
+# So handing the key to the harness PROCESS is authoritative for whichever provider
+# names it, which is what lets ``host_auth`` declare no ``adapter_own_leaves`` for this
+# harness and leave both credential files masked for its whole process tree.
+#
+# The reason an env-fed key is SAFER here than a spared file, rather than merely
+# equivalent: the harness scrubs its own children. ``@deepseek-ai/dsh-subprocess``
+# defines ``SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i`` and its
+# ``scrubbedParentEnv()`` drops every inherited variable matching it (plus every
+# ``DSH_*`` name) before ANY child spawn -- on both spawn paths, the local bash tool's
+# ``spawnSpec`` and the terminal tool's ``childEnvironment``, which both reach the same
+# ``childEnv()``. So a key whose NAME is in that class is invisible to the shells the
+# model drives. A name OUTSIDE that class is forwarded to those children, which is why
+# Crew refuses one rather than injecting it.
+#
+# This regex is a MIRROR of the harness's, observed at dsh 0.1.5-rc.2, and it is the
+# validator's first filter only -- not what the promise rests on. A harness release
+# that narrowed or dropped its scrub would forward the key with no in-band signal, so
+# the property is PROVED at every spawn instead: the read-back probe sets each
+# configured name to a canary, and the gate plugin spawns one trivial child through
+# the harness's own subprocess service and records, per name, whether it reached
+# that child (``child_env`` in the load marker). The session is refused when any
+# did (``acp_tool_gate.gate_marker_issue``).
+_DEEPSEEK_ENV_CHILD_SCRUB_CLASS = re.compile("KEY|PASSWORD|SECRET|TOKEN", re.IGNORECASE)
+# The harness's own reference grammar: a POSIX shell identifier
+# (``@deepseek-ai/dsh-credentials``'s ``credentialRef``). Matched with ``fullmatch``
+# rather than a ``$``-anchored pattern, which in Python would also accept a trailing
+# newline -- and a name with one is not the variable the operator wrote.
+_DEEPSEEK_ENV_NAME_GRAMMAR = re.compile("[A-Za-z_][A-Za-z0-9_]*")
+# Namespaces on this child that a provider-key mapping may not enter: the harness's
+# own, which it scrubs from its children itself, and Crew's own, which carries this
+# session's IDENTITY -- ``KIROCREW_SESSION_KEY`` and the signed stub token
+# (``STUB_SESSION_TOKEN_ENV``) are written by ``_apply_session_identity_env`` AFTER
+# the provider key is placed, so a mapping onto either name would be overwritten
+# by a live Crew credential and the harness would present THAT to its provider.
+# Both names are in the harness's scrub class, so nothing else here would refuse
+# them. A prefix rather than a list, because Crew's namespace grows.
+_DEEPSEEK_ENV_RESERVED_PREFIXES = ("DSH_", "KIROCREW_")
+# Names outside those namespaces that Crew still sets on this harness's child, listed
+# rather than derived because each is set at a different site and a derivation would
+# have to reach all of them: the permission pin, the harness home from
+# ``_extra_env`` (both ``DSH_``-prefixed, so already refused; kept as documentation
+# of the sites) and kiro-cli's own model credential (actively stripped for a foreign
+# backend). An operator mapping one of these would either lose their key or break
+# the gate, depending on which write landed last, so the mapping is refused instead.
+# ``test_every_scrub_class_name_crew_writes_on_the_child_is_reserved`` derives the
+# scrub-class names the spawn pipeline writes and fails when one is missing here.
+_DEEPSEEK_ENV_CREW_OWNED_NAMES = frozenset(
+    {
+        _ENV_DSH_GATE_MARKER,
+        _ENV_DSH_GATE_SESSION,
+        _ENV_DSH_GATE_SCRUB_NAMES,
+        _ENV_DEEPSEEK_PERMISSION_MODE,
+        "DSH_HOME",
+        "KIRO_API_KEY",
+        "KIROCREW_RUNTIME_PYTHON",
+        "KIROCREW_SESSION_KEY",
+        STUB_SESSION_TOKEN_ENV,
+    }
+)
 
 # High-frequency, content-free adapter stderr diagnostics that _drain_stderr()
 # drops instead of forwarding as per-line WARNINGs.  The driving case is the
@@ -1152,6 +1313,229 @@ def _pi_gate_artifact_dir() -> str:
     return expected
 
 
+def deepseek_gate_extension_path() -> str:
+    """The absolute path of the gate plugin Kiro Crew ships for the DeepSeek Harness.
+
+    Package data beside :mod:`kiro_crew.agent_sdk`, resolved the same way
+    :func:`pi_gate_extension_path` resolves its sibling. ``.mjs`` rather than the
+    ``.ts`` pi loads: this harness composes a plugin into a running Node process
+    from the published build, which resolves a module specifier and does not
+    transpile, so the shipped file is the file that runs.
+    """
+    return str(
+        Path(agent_sdk.__file__).resolve().parent
+        / "gate_extensions"
+        / "deepseek"
+        / "kiro_crew_tool_gate.mjs"
+    )
+
+
+def _seal_deepseek_gate_extension() -> str:
+    """Verify the shipped gate plugin and return the path of a sealed copy to load.
+
+    The :func:`_seal_pi_gate_extension` contract, for the other member of this
+    routing, through the same :func:`_seal_gate_extension`: refuse unless the
+    packaged bytes match :data:`DEEPSEEK_GATE_EXTENSION_SHA256`, write them into the
+    owner-only gate artifact directory, and hand back THAT path -- which is what the
+    patch file names and what the load marker must report. Blocking; callers run it
+    off the loop.
+    """
+    return _seal_gate_extension(
+        deepseek_gate_extension_path(),
+        DEEPSEEK_GATE_EXTENSION_SHA256,
+        artifact_dir=_pi_gate_artifact_dir(),
+        sealed_name=f"kirocrew_dsh_gate_{os.getpid()}.mjs",
+        stage_prefix=f"kirocrew_dsh_gate_{os.getpid()}_",
+        label="DeepSeek Harness gate plugin",
+    )
+
+
+def _write_deepseek_gate_patch(sealed_extension: str) -> str:
+    """Write the per-launch patch that composes *sealed_extension*, and return its path.
+
+    Four rows in the same owner-only gate artifact directory the sealed plugin lives
+    in. The first is one ``insert`` naming the plugin by absolute path, which is the
+    composition channel the harness's own launcher documents (its ``boot/cmdline``
+    package, and its own plugin-development guide). Emitted per process rather than
+    shipped as package data because it has to name the SEALED copy, whose path
+    carries this process's pid.
+
+    The second pins the harness's tool presentation to ``native``, and it is a
+    SECURITY row rather than a preference. Under ``ptc`` or ``both`` the harness
+    exposes a reserved ``run_code`` transport instead of native tool schemas, and a
+    program running inside it reaches Node's own APIs directly -- filesystem,
+    network, subprocess -- which are not tool calls and therefore never traverse
+    ``tools/pre-execute``. The gate would see one ``run_code`` call it cannot read
+    and could apply no command or path rule to the JavaScript inside it. ``native``
+    is the harness's own default, so this row changes nothing on a default install;
+    what it does is stop an operator layer from selecting a mode that would carry
+    side effects around the gate, and a ``--patch`` overlay is applied after the
+    profile's own layer, so the pin wins.
+
+    The remaining rows reassert the stock approval service with policy ``ask`` and
+    the stock ACP bridge as enabled with its startup dependency. dsh applies this
+    overlay after the operator layer, and ``applyEntryPatches`` replaces these fields,
+    so disabling either row, changing the approval policy or changing the ACP startup
+    dependency does not survive. Its ``name`` is a match guard rather than an
+    assignment: a layer that replaced either module is not overwritten, and the gate
+    marker's owner read-back then refuses the session.
+
+    The path is quoted with JSON, which is a strict subset of YAML's
+    double-quoted scalar, so a directory containing a quote or a backslash
+    cannot end the scalar early. Blocking; callers run it off the loop.
+    """
+    artifact_dir = _pi_gate_artifact_dir()
+    body = (
+        f"- insert:\n    - id: kiro-crew-tool-gate\n      name: {json.dumps(sealed_extension)}\n"
+        "- id: tools\n  config:\n    mode: native\n"
+        "- id: approval\n"
+        "  name: '@deepseek-ai/dsh-user-approval'\n"
+        "  disabled: false\n"
+        "  config:\n"
+        "    policy: ask\n"
+        "- id: acp\n"
+        "  name: '@deepseek-ai/dsh-acp'\n"
+        "  disabled: false\n"
+        "  inject:\n"
+        "    - acpAppStartup\n"
+    )
+    return _publish_gate_artifact(
+        artifact_dir,
+        f"kirocrew_dsh_gate_{os.getpid()}.patch.yml",
+        body.encode("utf-8"),
+        stage_prefix=f"kirocrew_dsh_patch_{os.getpid()}_",
+    )
+
+
+def _validate_deepseek_env_mapping(mapping: dict[str, str]) -> None:
+    """Refuse every ``agent.deepseek_env`` entry this harness would not honour.
+
+    Raises :exc:`ValueError` whose message is operator-readable and names ONLY the
+    env-var KEY -- never the secret's vault name and never its value. That is the
+    same rule :mod:`kiro_crew.mcp_gateway.secret_uri` states for its own refusals,
+    and it is what lets this message reach a log and a chat error card unsanitised:
+    the key is operator-declared config, and ``!r`` escapes any control character in
+    it, so a hostile name has no text to forge.
+
+    Each rule refuses a mapping that would FAIL SILENTLY rather than one that is
+    merely unusual, which is why they are refusals and not warnings:
+
+    * a plaintext value would put a live provider key in ``config.json``, which this
+      whole route exists to avoid -- the key belongs in the vault;
+    * a name outside the harness's POSIX-identifier reference grammar is not a
+      credential reference the harness can resolve at all;
+    * a name outside the harness's own child-scrub class
+      (:data:`_DEEPSEEK_ENV_CHILD_SCRUB_CLASS`) is FORWARDED by the harness into
+      every shell it spawns, which hands the model's own bash tool the key -- the
+      exact exposure feeding it through the environment exists to close;
+    * a ``DSH_``-prefixed name is the harness's reserved namespace, a
+      ``KIROCREW_``-prefixed one is Crew's -- it carries this session's identity
+      credentials, which are written onto the child AFTER the provider key and
+      would replace it, handing the harness's provider a live Crew credential --
+      and a name Crew otherwise writes on this child
+      (:data:`_DEEPSEEK_ENV_CREW_OWNED_NAMES`) would either lose the operator's
+      key or overwrite the gate's own variables, depending on which write landed
+      last;
+    * a name Crew's own agent environment scrub strips
+      (:func:`kiro_crew.sandbox.agent_env_scrub_prefixes`) would be removed on the
+      shared spawn tail AFTER this injection, so the harness would start with no key
+      and nothing would say why.
+    """
+    scrub_prefixes = agent_env_scrub_prefixes()
+    for key, value in mapping.items():
+        if not value.startswith(SECRET_URI_PREFIX):
+            raise ValueError(
+                f"agent.deepseek_env entry {key!r} holds a literal value. This "
+                f"mapping takes a '{SECRET_URI_PREFIX}<vault name>' reference only, "
+                "so a provider key is never stored in config.json. Save the key "
+                "under Settings > Secrets, then map it as "
+                f"'{SECRET_URI_PREFIX}<vault name>'."
+            )
+        if not _DEEPSEEK_ENV_NAME_GRAMMAR.fullmatch(key):
+            raise ValueError(
+                f"agent.deepseek_env entry {key!r} is not an environment-variable "
+                "name the harness can resolve: its credential references are POSIX "
+                "shell identifiers, matching [A-Za-z_][A-Za-z0-9_]*."
+            )
+        if key.startswith(_DEEPSEEK_ENV_RESERVED_PREFIXES) or key in _DEEPSEEK_ENV_CREW_OWNED_NAMES:
+            raise ValueError(
+                f"agent.deepseek_env entry {key!r} names a variable Kiro Crew or the "
+                "harness sets on this child itself (the DSH_ and KIROCREW_ namespaces, "
+                "and Kiro Crew's own session credentials), so the mapping would either "
+                "lose the key, overwrite the tool gate's own value, or hand the "
+                "harness's provider a Kiro Crew credential. Choose a provider "
+                "credential name instead, such as DEEPSEEK_API_KEY."
+            )
+        if not _DEEPSEEK_ENV_CHILD_SCRUB_CLASS.search(key):
+            raise ValueError(
+                f"agent.deepseek_env entry {key!r} is outside the name class the "
+                "harness withholds from its own shell children (it scrubs every "
+                "inherited name matching KEY, PASSWORD, SECRET or TOKEN, "
+                "case-insensitively), so the harness would forward this name to "
+                "every shell it runs and the model's bash tool could read the key. "
+                "Name the credential reference in the harness's provider "
+                "configuration with a name in that class, such as DEEPSEEK_API_KEY."
+            )
+        if any(key.startswith(prefix) for prefix in scrub_prefixes):
+            raise ValueError(
+                f"agent.deepseek_env entry {key!r} matches a name prefix Kiro Crew's "
+                "own agent environment scrub removes before the child starts, so the "
+                "injection would be undone and the harness would start with no key. "
+                "Choose a provider credential name outside that set."
+            )
+
+
+def _deepseek_vault_env_names() -> tuple[str, ...]:
+    """The env-var NAMES ``agent.deepseek_env`` maps, validated, in a stable order.
+
+    What the read-back probe needs and all it may have: it hands each name to the
+    gate plugin under a canary value so the plugin can prove the harness withholds
+    that name from its shell children, and it boots a third-party plugin host, so it
+    is never given the key itself. Same validator as :func:`_deepseek_vault_env`,
+    same :exc:`ValueError` on a mapping this harness would not honour; the vault is
+    not opened here. Blocking (reads the config file); callers run it off the loop.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    mapping = dict(KiroCrewConfig.load().agent.deepseek_env)
+    if not mapping:
+        return ()
+    _validate_deepseek_env_mapping(mapping)
+    return tuple(sorted(mapping))
+
+
+def _deepseek_vault_env() -> tuple[dict[str, str], tuple[str, ...]]:
+    """``agent.deepseek_env`` validated and resolved into child env vars.
+
+    Returns ``(env, secret_keys)``: the variables to place on the harness's child,
+    and the keys now holding PLAINTEXT. The contract
+    :func:`kiro_crew.mcp_gateway.secret_uri.resolve_secret_uris` states -- clear
+    the plaintext from the returned dict as soon as nothing needs it from there
+    -- is honoured by the deepseek spawn arm, which empties the dict the
+    moment its entries are copied onto the child's env, inside the arm rather than
+    on the shared post-spawn path (harness-parity H13).
+
+    Every failure is a :exc:`ValueError`, from this module's validator or from the
+    resolver's own fail-closed refusals (a malformed reference, a secret absent from
+    the vault). One exception type, because the caller does the same thing with
+    both: refuse the session rather than start a harness that cannot reach a model.
+
+    Blocking: reads the config file and the vault, so it runs off the event loop.
+    Config is imported lazily for this module's usual reason -- ``config.loader``
+    reaches this module through ``acp.session_handle``.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    mapping = dict(KiroCrewConfig.load().agent.deepseek_env)
+    if not mapping:
+        return {}, ()
+    _validate_deepseek_env_mapping(mapping)
+    resolved, secret_keys = resolve_secret_uris(
+        mapping, Path(config_dir()), subject="agent.deepseek_env"
+    )
+    return resolved, tuple(sorted(secret_keys))
+
+
 def _pi_gate_extension_bytes(payload: bytes) -> bytes:
     """*payload* in the one form the digest is pinned over: LF line endings.
 
@@ -1176,46 +1560,88 @@ def _seal_pi_gate_extension() -> str:
 
     Blocking (reads and may write a file); callers run it off the loop.
     """
-    source = pi_gate_extension_path()
+    return _seal_gate_extension(
+        pi_gate_extension_path(),
+        PI_GATE_EXTENSION_SHA256,
+        artifact_dir=_pi_gate_artifact_dir(),
+        sealed_name=f"kirocrew_pi_gate_{os.getpid()}.ts",
+        stage_prefix=f"kirocrew_pi_gate_{os.getpid()}_",
+        label="pi gate extension",
+    )
+
+
+def _seal_gate_extension(
+    source: str,
+    pinned_digest: str,
+    *,
+    artifact_dir: str,
+    sealed_name: str,
+    stage_prefix: str,
+    label: str,
+) -> str:
+    """Verify one shipped gate file against its pinned digest and publish a sealed copy.
+
+    The one seal for both gate-extension harnesses: read the packaged bytes, bring
+    them to the LF form the digest is pinned over (:func:`_pi_gate_extension_bytes`),
+    refuse on any mismatch, and publish them read-only into *artifact_dir* -- the
+    owner-only gate artifact directory each writer resolves through the strict
+    :func:`_pi_gate_artifact_dir` -- as *sealed_name* through
+    :func:`_publish_gate_artifact`. *label* names the file in the refusal, which is
+    the same refusal for a file that cannot be read as for one with the wrong bytes:
+    no gate this build shipped, no session. Blocking; callers run it off the loop.
+    """
     try:
         with open(source, "rb") as fh:
             payload = _pi_gate_extension_bytes(fh.read())
     except OSError as exc:
-        # An install without the package data is the same refusal as one with the
-        # wrong bytes: no gate this build shipped, no session.
         raise PiGateExtensionTampered(
-            f"the pi gate extension at {source} cannot be read ({exc}); a session cannot "
+            f"the {label} at {source} cannot be read ({exc}); a session cannot "
             "start on a gate whose code this build did not ship. Reinstall Kiro Crew."
         ) from exc
     digest = hashlib.sha256(payload).hexdigest()
-    if digest != PI_GATE_EXTENSION_SHA256:
+    if digest != pinned_digest:
         raise PiGateExtensionTampered(
-            f"the pi gate extension at {source} does not match the digest this build "
-            f"pinned ({digest[:12]}… vs {PI_GATE_EXTENSION_SHA256[:12]}…); a session "
+            f"the {label} at {source} does not match the digest this build "
+            f"pinned ({digest[:12]}… vs {pinned_digest[:12]}…); a session "
             "cannot start on a gate whose code this build did not ship. Reinstall Kiro Crew."
         )
-    artifact_dir = _pi_gate_artifact_dir()
-    sealed = os.path.join(artifact_dir, f"kirocrew_pi_gate_{os.getpid()}.ts")
+    return _publish_gate_artifact(artifact_dir, sealed_name, payload, stage_prefix=stage_prefix)
+
+
+def _publish_gate_artifact(
+    artifact_dir: str, name: str, payload: bytes, *, stage_prefix: str
+) -> str:
+    """Land *payload* as the read-only file *name* in *artifact_dir*; return its path.
+
+    The write-if-changed tail every gate-artifact writer shares: a file already
+    holding exactly these bytes is returned as is (the artifacts are written once
+    per gateway process and reused by every later spawn), otherwise the bytes are
+    staged under *stage_prefix* in the same directory, made read-only where the
+    mode means something (``chmod`` is inert on Windows, where the directory's
+    owner-only DACL is the seal), and moved into place atomically. A failed stage is
+    removed rather than left for the sweep. *stage_prefix* is caller-named because
+    the leaf sweep (``sandbox._PI_GATE_DIR_ARTIFACTS``) reclaims by family, and each
+    writer's stage spelling is registered there.
+    """
+    target = os.path.join(artifact_dir, name)
     try:
-        with open(sealed, "rb") as fh:
+        with open(target, "rb") as fh:
             if fh.read() == payload:
-                return sealed
+                return target
     except OSError:
         pass
-    fd, tmp = tempfile.mkstemp(
-        dir=artifact_dir, prefix=f"kirocrew_pi_gate_{os.getpid()}_", suffix=".tmp"
-    )
+    fd, tmp = tempfile.mkstemp(dir=artifact_dir, prefix=stage_prefix, suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(payload)
         if not platform_compat.IS_WINDOWS:
             os.chmod(tmp, 0o400)
-        os.replace(tmp, sealed)
+        os.replace(tmp, target)
     except OSError:
         with suppress(OSError):
             os.remove(tmp)
         raise
-    return sealed
+    return target
 
 
 def _pi_gate_launcher_body(pi_bin: str, extension_path: str) -> str:
@@ -2639,6 +3065,13 @@ class AcpError(Exception):
         # is a session-expiry / rejected-credential answer, so the dashboard's
         # error row can offer the Kiro sign-in card instead of a retry.
         self.auth_required: bool = False
+        # Spent-allowance tag, set by :func:`_raise_acp_error` when the raw
+        # frame is a usage-limit answer ("The monthly usage limit has been
+        # reached"), so the dashboard's error row can offer a route that needs
+        # no inference where one exists (the feature-request form) instead of a
+        # retry that reproduces the rejection. Terminal like ``auth_required``
+        # and, like it, decided from the raw frame rather than the prose.
+        self.usage_limit: bool = False
         # Structural-rejection tag, set by :func:`_raise_acp_error` when the raw
         # frame is a malformed-request answer ("Improperly formed request"). A
         # DETERMINISTIC rejection of the payload's SHAPE: unlike a transient
@@ -2651,6 +3084,13 @@ class AcpError(Exception):
         # it — a spent usage limit or an unentitled model are also terminal but
         # a NEW context can succeed, so they are not this fact.
         self.structural_terminal: bool = False
+        # Whether this error happened while STARTING a session rather than on a
+        # prompt or another request. The twin of
+        # ``AcpRequestTimeout.session_start_failed`` on the runtime path: the two
+        # exception families share no base, so a self-driving caller reads the
+        # fact with ``getattr`` and both halves must spell it the same way. Only
+        # the raise sites that know the method set it True.
+        self.session_start_failed: bool = False
 
 
 class AcpTimeoutError(AcpError):
@@ -2738,6 +3178,30 @@ class AcpSandboxInitFailed(AcpError):  # noqa: N818
             f"not start{said}. Retrying cannot fix this: {remediation}",
             transient=False,
         )
+
+
+class AcpRegistrationRateLimited(AcpProcessDied):  # noqa: N818
+    """The runtime died after its dynamic registration was throttled (HTTP 429).
+
+    A SUBCLASS of :class:`AcpProcessDied`, because the process IS gone and every
+    existing death handler must keep treating it as a death; the narrower fact is
+    WHY: the child's registration calls were rate-limited by the endpoint, which
+    is a transient property of the endpoint's capacity, not of this host or this
+    request. ``transient`` is fixed True so the retry ladders that read the
+    verdict off the exception (``llm_helpers.acp_error_is_transient``, and
+    through it the sub-agent run loop and ``stream_and_collect``) retry with
+    their existing bounded backoff instead of surfacing a terminal generic
+    death. Replay SAFETY stays where it already lives: every consumer's
+    zero-activity gate decides between a verbatim replay and a continue, so this
+    classification never widens what a retry may re-run.
+
+    The message carries ONE retained cause rather than the full stderr tail: the
+    throttle prints the identical line on every attempt, and five copies of it
+    behind a death summary is the repetitive wall this type exists to replace.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, transient=True)
 
 
 class AcpToolGateUnroutable(AcpError):  # noqa: N818
@@ -3175,6 +3639,73 @@ async def sandbox_init_failure_for_runtime(runtime: Any) -> "AcpSandboxInitFaile
     )
 
 
+# A dynamic-registration call the endpoint throttled, read off the dead child's
+# stderr. Deliberately CONJUNCTIVE per line: a line must carry both the
+# registration context and an unambiguous too-many-requests marker before it
+# classifies, so neither a model-turn throttle (429 with no registration
+# context, which the provider-error path already classifies from its structured
+# frame) nor an unrelated registration failure (auth rejection, malformed
+# response — both terminal) can fire this. A bare ``429`` is deliberately NOT a
+# marker: a digit that lands in an exit code or a byte count must not upgrade a
+# crash to a throttle.
+#
+# Free-text stderr is an accepted evidence source here for the same reason it
+# is for :func:`is_auth_failure_output` and the sandbox latch: the child's
+# stderr is subprocess diagnostic output, not the structured frame the
+# compaction classifier insists on — but it is also the ONLY surface this
+# failure reaches, because the child dies before any frame can carry it. The
+# consequence of a false positive is bounded (a budgeted retry of a turn whose
+# replay safety is gated on observed activity by every consumer), which is why
+# the conjunctive signature above is the whole defence this needs.
+_RE_REGISTRATION_FAILED = re.compile(r"\bregistration failed\b", re.IGNORECASE)
+_RE_REGISTRATION_THROTTLE_MARK = re.compile(
+    r"\bHTTP 429\b|\btoo many requests\b|\brequested too many times\b", re.IGNORECASE
+)
+
+
+def registration_throttle_line(haystack: str) -> str | None:
+    """The first line of *haystack* showing a throttled registration, or ``None``.
+
+    *haystack* is a child's retained stderr (newline-joined lines). Matched per
+    LINE so the two tokens must describe the same event: a registration failure
+    early in the tail plus an unrelated throttle mention later must not combine
+    into a verdict neither line supports. Returns the line itself so the caller
+    can retain ONE sanitized cause instead of the tail's repeated copies.
+    """
+    for line in haystack.splitlines():
+        if _RE_REGISTRATION_FAILED.search(line) and _RE_REGISTRATION_THROTTLE_MARK.search(line):
+            return line.strip()
+    return None
+
+
+def is_registration_throttle_output(haystack: str) -> bool:
+    """True when *haystack* (a child's stderr) shows a throttled registration.
+
+    Shared by both ACP transports — ``AcpClient`` reads its own stderr ring
+    buffer, the shared-runtime death translations read
+    ``AcpRuntime.redacted_stderr_tail()`` — so the two cannot come to disagree
+    about what the signature IS, the same anti-drift reason
+    :func:`is_auth_failure_output` is one function.
+    """
+    return registration_throttle_line(haystack) is not None
+
+
+def registration_rate_limited_error(base: str, cause: str) -> "AcpRegistrationRateLimited":
+    """Build the typed error for a death whose evidence shows a registration throttle.
+
+    ONE composer for every translation site (the shared-runtime ``_died``, the
+    provider's ``_translate_dead``, the direct client's own death paths), so the
+    guidance and the one-retained-cause shape cannot drift apart. *base* is the
+    site's own death context; *cause* is the single matched stderr line, already
+    redacted by whichever reader captured it.
+    """
+    return AcpRegistrationRateLimited(
+        f"{base} — dynamic registration was rate-limited by the endpoint "
+        f"(HTTP 429); this is endpoint throttling, not a crash — retry later. "
+        f"Cause: {cause}"
+    )
+
+
 # Account/plan capacity is EXHAUSTED — terminal. Distinct from a throttle: a
 # throttle clears in seconds and a retry is the right move, whereas a spent
 # monthly allowance does not come back until it resets, so retrying only adds
@@ -3197,6 +3728,12 @@ _RE_USAGE_LIMIT = re.compile(
 # boilerplate, and scoping to `data` keeps a stray echo in `message` from
 # flipping an otherwise-terminal error.
 _RE_GENERATE_FAILED = re.compile(r"failed to generate a response", re.IGNORECASE)
+# kiro-cli's sibling wrapper for the same class of backend failure, observed
+# AFTER tool results had landed and carrying a request_id: "The service failed
+# to process the request (request_id: ...)". Same momentary-blip reasoning and
+# the same `data`-only scoping as _RE_GENERATE_FAILED; kept as its own pattern
+# so the two branches can word their guidance for the moment each one fails.
+_RE_PROCESS_FAILED = re.compile(r"failed to process the request", re.IGNORECASE)
 
 # kiro-cli's structural rejection of a payload the backend could not parse:
 # "Improperly formed request". This string has NO source-side handling and
@@ -3366,6 +3903,7 @@ def _is_transient_raw_error(error: object, available_models: Sequence[str] | Non
         or _RE_5XX_STATUS.search(haystack)
         or _RE_5XX_HINT.search(haystack)
         or _RE_GENERATE_FAILED.search(data)
+        or _RE_PROCESS_FAILED.search(data)
     )
 
 
@@ -3445,6 +3983,7 @@ def classify_provider_error(haystack: str, *, data: str | None = None) -> Provid
         or _RE_5XX_STATUS.search(text)
         or _RE_5XX_HINT.search(text)
         or _RE_GENERATE_FAILED.search(data_field)
+        or _RE_PROCESS_FAILED.search(data_field)
     )
     if match:
         return ProviderErrorClass(PROVIDER_ERROR_HTTP_5XX, True, match.group(0))
@@ -3528,6 +4067,27 @@ def resolve_pin_spelling(model_id: str, advertised: Sequence[str] | None) -> str
     either spelling, and an id advertised verbatim (qualifier and all) never
     gets peeled at all.
 
+    When the peel misses too, both sides are folded with
+    :func:`model_registry.catalog_key` — the same fold
+    :func:`model_registry.namespace_vocabulary` judges nativeness with. That
+    fold strips an inference-profile prefix, the ``[1m]`` window marker and an
+    effort suffix, so a pin spelled in another namespace's provider-id form
+    (``global.anthropic.claude-opus-4-8[1m]``) meets the bare id this harness
+    advertises for the same model (``claude-opus-4.8``). Without it the two
+    sides fold with different functions: the vocabulary side calls the pin
+    native, this side finds no spelling, and the cold start reports an
+    entitlement problem for what is a spelling one. The fold is a SPELLING fold,
+    not a model fold: a candidate the static registry places as a DIFFERENT
+    canonical model from the pin (``claude-opus-4-8`` at 200K against a pin
+    naming the 1M ``claude-opus-4.8``) is rejected even though ``catalog_key``
+    folds the window marker away -- see
+    :func:`model_registry.same_registered_model` -- so a pin never resolves to
+    its neighbour with another context window. Several advertised spellings of
+    the SAME model can remain (a base and a 1M variant the registry lists as one
+    model); the winner is :func:`model_registry.preferred_advertised_spelling`,
+    the tie-break :func:`model_registry.resolve_wire_model_id` applies, so the
+    two folds cannot prefer different spellings.
+
     Returns the ADVERTISED spelling of the match, not the caller's: the result
     is meant to be sent on the wire (``session/set_model`` accepts advertised
     ids), and it keeps the display verdict and the wire withhold answering from
@@ -3551,7 +4111,16 @@ def resolve_pin_spelling(model_id: str, advertised: Sequence[str] | None) -> str
     namespace, sep, bare = wanted.partition("::")
     if sep and namespace and bare in by_key:
         return by_key[bare]
-    return ""
+    wanted_key = model_registry.catalog_key(wanted)
+    if not wanted_key:
+        return ""
+    folded = [
+        m
+        for m in ids
+        if model_registry.catalog_key(m) == wanted_key
+        and model_registry.same_registered_model(model_id, m)
+    ]
+    return model_registry.preferred_advertised_spelling(folded)
 
 
 def resolve_usable_model(preferred: str, advertised: Sequence[str] | None) -> str:
@@ -3766,6 +4335,9 @@ async def _push_model_via_effort_split(driver: Any, backend: str, model_id: str)
     # selector" and skips -- the session then runs the suffix's effort while the
     # UI reports the slot's.
     effort_option = effort_config_option_id(backend)
+    # ...and the same resolver for the VALUE, so the split writes the level in the
+    # harness's own vocabulary rather than the suffix's verbatim.
+    effort = effort_config_option_value(backend, effort)
     if not driver.supports_config_option(effort_option):
         logger.warning(
             "ACP model %s applied as %s; adapter exposes no %r option, effort %s not applied",
@@ -4036,6 +4608,19 @@ def _format_acp_error(
                 "to a different model in the picker."
                 f"{req_id_suffix}"
             )
+        elif _RE_PROCESS_FAILED.search(data):
+            # kiro-cli's sibling wrapper ("The service failed to process the
+            # request (request_id: ...)"): the backend call failed after the
+            # turn was under way, so a request_id exists but no error class.
+            # Same momentary-blip guidance as the branch above, scoped to
+            # `data` for the same reason. The phrase is kept in the rewrite so
+            # the string classifier in llm_helpers matches either form.
+            formatted = (
+                "The model backend failed to process the request (transient error, "
+                "usually a momentary capacity blip). Retry in a moment; if it keeps "
+                "happening, switch to a different model in the picker."
+                f"{req_id_suffix}"
+            )
         elif _RE_MALFORMED_REQUEST.search(data):
             # Structural rejection: the backend refused the payload
             # because of its shape, not a momentary fault. Retrying the same
@@ -4205,6 +4790,15 @@ def _raise_acp_error(
         and not _RE_USAGE_LIMIT.search(raw_data)
     ):
         err.auth_required = True
+    # Tag a spent plan allowance the same way: from the raw frame, and only when
+    # the formatter reached its usage-limit branch -- an entitlement rejection
+    # that happens to carry limit wording keeps its own (served-model) remedy.
+    # The sign-in tag above already withholds itself for this wording, so the
+    # two tags are exclusive and the row's kind is unambiguous.
+    if _RE_USAGE_LIMIT.search(raw_data) and not _model_is_unentitled(
+        raw_data_field, available_models
+    ):
+        err.usage_limit = True
     raise err
 
 
@@ -4739,6 +5333,7 @@ class AcpClient:
         mcp_gateway_overlay: str | Path | None = None,
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
+        shared_scratch: Path | None = None,
     ):
         if work_dir:
             self._work_dir = Path(work_dir)
@@ -4763,6 +5358,16 @@ class AcpClient:
         # what _write_claude_local_settings leaves in place when nothing asked
         # for a mode.
         self._permission_mode = permission_mode
+        # The session tree's work directory when this client is a DEDICATED
+        # subagent process spawned on a parent's behalf: re-validated at spawn
+        # (``agent_scratch.shared_scratch_window``) and mounted as a second
+        # private window beside this process's own scratch, which keeps the
+        # temp triple and the kiro-cli log. ``None`` for a session that starts
+        # its own tree. Once live, the client joins the tree's owner marker
+        # beside its parent (``agent_scratch.adopt_owner``), so a parent that
+        # dies first leaves no dead-owner marker over its running children.
+        self._shared_scratch: Path | None = Path(shared_scratch) if shared_scratch else None
+        self._scratch_dir: Path | None = None
         # True once this session has CREATED <work_dir>/.claude/settings.local.json
         # itself. Only then does reset remove it, and only then does a re-seed
         # overwrite it. The writer refuses a path that already holds a file it did
@@ -4835,6 +5440,8 @@ class AcpClient:
         # raises; minted in the pi spawn arm, placed in the child's environment,
         # and the only key under which a permission frame is read as an envelope.
         self._pi_gate_nonce = ""
+        self._deepseek_gate_nonce = ""
+        self._deepseek_gate_patch = ""
         # toolCallIds the gate extension asked about in this session, read off the
         # envelopes; a completed tool call not in it is a call the gate never saw.
         self._pi_gate_asked_ids: set[str] = set()
@@ -5002,6 +5609,14 @@ class AcpClient:
         # claude-agent-acp to reject the response.
         self._permission_options: dict[str | int, dict[str, str]] = {}
         self._stderr_lines: deque[str] = deque(maxlen=20)
+        # Latched on this process's FIRST non-thinking text chunk, tool call or
+        # tool result, cleared with the rest of the process state on respawn:
+        # the registration-throttle death classification is refused once work
+        # has been observed, so the transient verdict it hands the retry
+        # ladders can only ever license replaying a turn that provably did
+        # nothing. Per PROCESS (this client owns exactly one), matching the
+        # ring the evidence is read from.
+        self._prompt_or_tool_seen = False
         # Set by ``_spawn`` from the wrapped argv; only meaningful once a child
         # has been spawned. False before that, which is also the safe default for
         # the classifier: a spawn that never reached the wrap cannot have been
@@ -5288,7 +5903,16 @@ class AcpClient:
         self._session_mcp_snapshot = projection.derived_spec_snapshot
         servers = projection.params.get("mcpServers") or []
         out = list(servers) if isinstance(servers, list) else []
-        return self._append_member_dispatch_server(out)
+        # The restriction half of the projection's withhold set, from the SAME parse the
+        # array came out of: the member append must not re-add a name this projection
+        # refused on a transport where the withhold is the whole of the enforcement.
+        return self._append_member_panel_server(
+            self._append_member_dispatch_server(
+                out, projection.restricted_servers, projection.disabled_servers
+            ),
+            projection.restricted_servers,
+            projection.disabled_servers,
+        )
 
     def _pooled_broker_stubs(self) -> list[dict[str, Any]]:
         """The raw broker stubs for this session, with no per-backend narrowing.
@@ -5312,7 +5936,12 @@ class AcpClient:
             self._stub_session_token,
         )
 
-    def _append_member_dispatch_server(self, servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _append_member_dispatch_server(
+        self,
+        servers: list[dict[str, Any]],
+        restricted: Collection[str] = (),
+        disabled: Collection[str] = (),
+    ) -> list[dict[str, Any]]:
         """Mount the dashboard session-control server into a member DM session.
 
         Session-level and additive: the on-disk agent spec is untouched, so every
@@ -5320,36 +5949,213 @@ class AcpClient:
         carries ``KIROCREW_SESSION_KEY`` for strict identity — the same value this
         client already exports to the child process env.
 
-        Honors the same permission-surface precondition the mirror translation
-        just applied: when Crew does not own the session's native permission
-        file, the whole array was withheld, and quietly appending a
-        session-control server there would hand a pre-approvable surface exactly
-        the tools the withhold exists to keep off it.
+        The permission-surface precondition is asked of the BACKEND's ROUTING --
+        ``acp_tool_gate.is_enforced`` -- rather than read off
+        ``_claude_settings_authored`` alone. That flag answers one harness's question:
+        claude declares a routing this core does not enforce, so owning
+        ``settings.local.json`` is what stands in for the read-back it lacks, and
+        appending session control onto a surface Crew does not own would hand a
+        pre-approvable file exactly the tools the mirror's withhold keeps off it. A
+        harness whose routing IS enforced cannot satisfy that flag and does not need
+        to -- its session is refused before its first prompt unless the gate arms --
+        and its mirror documents the flag as accepted-and-ignored (see
+        ``providers/mirrors/opencode.py``), so reading the flag there would withhold
+        every member's tools on the strength of a condition that cannot describe the
+        backend.
+
+        A whole-server ``disabled`` on the dashboard server stops the mount outright,
+        for every backend and with no second channel to weigh: ``disabled`` has no
+        per-tool or per-call form, so a harness handed the server cannot refuse a call
+        to it, and the ``tools`` allowlist that keeps it out of the spec-described half
+        of the array does not reach an element this method appends itself. Mounting it
+        anyway would make the operator's switch-off of session control a no-op for the
+        one session type that holds the strongest tools Crew hands out.
+
+        The other composer answers alike: ``AcpRuntime`` asks
+        ``session_mcp.session_mcp_server_is_disabled`` on its create and resume paths,
+        so a member session on an ``ACP_BACKENDS_ACP_RUNTIME`` host (codex, KAS) gets
+        the same answer this method gives. It asks through that reader rather than
+        through a field on the projection because half of those hosts have no mirror to
+        carry one -- KAS projects through ``acp.kas_agents``, not an array.
+
+        A per-tool restriction on the dashboard server is the second precondition,
+        and it is the one this method can UNDO rather than merely fail: the projection
+        withholds a narrowed server (*restricted*), and on a backend whose
+        ``registry.PerToolDeny`` is ``WHOLE_SERVER`` that withhold is the ONLY
+        enforcement there is -- no rule in a file the harness reads, and no per-call
+        identity Crew can refuse by. Appending the entry back would make a tool the
+        operator switched off callable again. So the mount is withheld instead and the
+        thread runs as plain chat. A backend with a second channel keeps its mount:
+        codex refuses the call at permission time from ``denied_tools``, and claude's
+        deny rules refuse it inside the adapter.
+
+        Both halves of a session's array must agree about this. ``AcpRuntime`` mounts
+        the same entry on the resume and create paths, and :meth:`_foreign_mcp_identity`
+        judges a trusted tool identity against the array THIS method returns -- scoped to
+        ``ACP_BACKENDS_SESSION_MCP_ARRAY``, and reached only from
+        :meth:`_refuse_identity_drift`, whose own gate is ``ACP_BACKENDS_META_IDENTITY``
+        (goose alone today, so no backend mounted here runs it yet). A backend that later
+        joins that set and mounts the server on one path while this one withholds it would
+        refuse every dispatch call as a drifted server rather than run a plain chat.
         """
         if self.backend not in ACP_BACKENDS_MEMBER_DISPATCH:
             return servers
         # circular import: members' module graph is heavy; resolved at call time.
-        from kiro_crew.members import is_member_session_key, member_dispatch_session_server
+        from kiro_crew.members import (
+            MEMBER_DISPATCH_SERVER,
+            is_member_session_key,
+            member_dispatch_session_server,
+        )
 
         if not is_member_session_key(self._session_key):
             return servers
         session_key = self._session_key or ""
-        if not getattr(self, "_claude_settings_authored", False):
-            logger.warning(
-                "member session %s: permission surface not Crew-owned — session "
-                "control is not mounted; the DM thread runs as plain chat",
-                self._session_key,
-            )
+        if self._member_mount_withheld(
+            MEMBER_DISPATCH_SERVER, "session control", restricted, disabled
+        ):
             return servers
         entry = member_dispatch_session_server(session_key, self._stub_session_token)
         if entry is None:
             logger.warning(
-                "member session %s: dashboard server unresolved — the DM thread "
+                "member session %s: dashboard server unresolved -- the DM thread "
                 "runs as plain chat this session",
                 self._session_key,
             )
             return servers
         return [e for e in servers if e.get("name") != entry["name"]] + [entry]
+
+    def _member_mount_withheld(
+        self,
+        server_name: str,
+        capability: str,
+        restricted: Collection[str],
+        disabled: Collection[str],
+    ) -> bool:
+        """Whether a member session-array append must be withheld for *server_name*.
+
+        The three preconditions :meth:`_append_member_dispatch_server` documents at
+        length, asked once so both member mounts answer them the same way. Each is
+        about the array, not about which capability rides it: a whole-server
+        ``disabled``, a per-tool restriction on a backend where withholding is the
+        only deny channel there is, and a permission surface Crew does not own.
+
+        *capability* is the phrase the log uses for what the session loses, because
+        that is the only part that differs between the two mounts.
+        """
+        if server_name in disabled:
+            logger.warning(
+                "member session %s: %s is switched off for this session (disabled), so "
+                "%s is not mounted -- no backend can refuse a call to a server it was "
+                "handed, and mounting it would undo that switch; re-enable that server "
+                "to restore it",
+                self._session_key,
+                server_name,
+                capability,
+            )
+            return True
+        if server_name in restricted and self._withhold_is_the_only_deny_channel():
+            logger.warning(
+                "member session %s: one of %s's tools is switched off and this backend has "
+                "no channel to refuse a call to it, so the projection withheld the server "
+                "and mounting it here would make that tool reachable again; %s is not "
+                "mounted, so stop narrowing that server to restore it",
+                self._session_key,
+                server_name,
+                capability,
+            )
+            return True
+        # An unenforced routing is the ONLY case the owned-file fallback answers for;
+        # see the precondition paragraph above for why an enforced one must not read it.
+        if not acp_tool_gate.is_enforced(self.backend) and not getattr(
+            self, "_claude_settings_authored", False
+        ):
+            logger.warning(
+                "member session %s: permission surface not Crew-owned -- %s is not mounted",
+                self._session_key,
+                capability,
+            )
+            return True
+        return False
+
+    def _append_member_panel_server(
+        self,
+        servers: list[dict[str, Any]],
+        restricted: Collection[str] = (),
+        disabled: Collection[str] = (),
+    ) -> list[dict[str, Any]]:
+        """Mount the crew-panel server into a member DM session.
+
+        The sibling of :meth:`_append_member_dispatch_server` and subject to the
+        same three array-level preconditions, through the one reader
+        :meth:`_member_mount_withheld`. One addition: ``agent.crew_panel``, the
+        operator's single withdrawal of the capability, read fail-closed.
+
+        Its own append rather than a widening of the dispatch one, because the two
+        capabilities are assigned per server and withdrawn by separate switches: a
+        member may hold session control without a panel, or a panel without session
+        control, and each mount must answer for itself. For the same reason the
+        backend question is read from :data:`ACP_BACKENDS_MEMBER_PANEL`, whose
+        membership is argued for THIS capability: harness support for session
+        control establishes nothing about the panel (harness-parity H6), so
+        reusing the dispatch set would grant one capability on another's evidence.
+        """
+        if self.backend not in ACP_BACKENDS_MEMBER_PANEL:
+            return servers
+        # circular import: members' module graph is heavy; resolved at call time.
+        from kiro_crew.members import (
+            MEMBER_PANEL_SERVER,
+            crew_panel_enabled,
+            is_member_session_key,
+            member_panel_session_server,
+        )
+
+        if not is_member_session_key(self._session_key):
+            return servers
+        if not crew_panel_enabled():
+            logger.info(
+                "member session %s: agent.crew_panel is off, so the crew panel is not "
+                "mounted; the member keeps its other tools",
+                self._session_key,
+            )
+            return servers
+        if self._member_mount_withheld(MEMBER_PANEL_SERVER, "the crew panel", restricted, disabled):
+            return servers
+        entry = member_panel_session_server(self._session_key or "", self._stub_session_token)
+        if entry is None:
+            logger.warning(
+                "member session %s: panel server unresolved -- the member runs without "
+                "a panel this session",
+                self._session_key,
+            )
+            return servers
+        return [e for e in servers if e.get("name") != entry["name"]] + [entry]
+
+    def _withhold_is_the_only_deny_channel(self) -> bool:
+        """Whether withholding a server is this backend's ONLY per-tool deny channel.
+
+        Read from the declaration each mirror already publishes
+        (``registry.PerToolDeny``) rather than from a second membership set, so a
+        backend cannot answer one way here and another way in the projection that
+        performs the withhold.
+
+        Fail-CLOSED on a backend with no declaration at all: ``projection_for`` raises
+        for one, and "no declared deny channel" is exactly the case where re-adding a
+        withheld server cannot be shown to be safe. The cost of being wrong in this
+        direction is a member thread that runs as plain chat.
+        """
+        from kiro_crew.providers.mirrors import PerToolDeny, projection_for
+
+        try:
+            return projection_for(self.backend).per_tool_deny is PerToolDeny.WHOLE_SERVER
+        except Exception:
+            logger.warning(
+                "member session %s: backend %r declares no MCP projection, so its per-tool "
+                "deny channel is unknown; treating a withheld server as un-re-addable",
+                self._session_key,
+                self.backend,
+                exc_info=True,
+            )
+            return True
 
     def _prepare_spawn_workspace(self) -> None:
         """Create the session's work dir, then snapshot its spec for the detector.
@@ -5991,6 +6797,176 @@ class AcpClient:
             return issue, acp_tool_gate.remediation_for(self.backend)
         return "", ""
 
+    @staticmethod
+    def _read_deepseek_gate_marker(marker_path: str) -> object:
+        """Read one child-written marker without following, blocking, or growing memory.
+
+        The final component is opened through the cross-platform no-reparse helper
+        with nonblocking mode, then accepted only as a regular file no larger than
+        :data:`_DSH_GATE_MARKER_MAX_BYTES`. The one bounded read asks for one byte
+        beyond the fstat size, so truncation or growth before that read is malformed
+        rather than a prefix parse. Every refusal returns ``None`` for the existing
+        routing-refusal path.
+        """
+        try:
+            fd = platform_compat.open_file_no_reparse(marker_path, nonblocking=True)
+        except OSError:
+            return None
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size < 0
+                or metadata.st_size > _DSH_GATE_MARKER_MAX_BYTES
+            ):
+                return None
+            payload = os.read(fd, metadata.st_size + 1)
+            if len(payload) != metadata.st_size:
+                return None
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+        try:
+            return json.loads(payload)
+        except (ValueError, RecursionError):
+            return None
+
+    def _verify_deepseek_gate(
+        self,
+        argv: list[str],
+        extension_path: str,
+        marker_path: str,
+        nonce: str,
+        *,
+        child_scrub_names: tuple[str, ...] = (),
+    ) -> tuple[str, str]:
+        """Boot the harness once with the gate composed and read its load marker back.
+
+        The :meth:`_verify_pi_gate` contract for the
+        :data:`~kiro_crew.agent_sdk.backends.Readback.LOAD_MARKER` style. *argv* is
+        the session's own argv -- the harness binary, its profile selector and the
+        ``--patch`` that composes the gate -- so what is observed is the
+        composition the session will run. The child is given the marker path and
+        the nonce; it boots, and once Cordis settles the plugin snapshots the
+        routing, proves the child-env scrub on a child of its own, and PUBLISHES the
+        marker (written beside its path, renamed onto it).
+
+        stdin is held open until that marker exists and closed only then: stdin EOF
+        is this profile's own bounded shutdown (``packages/bundle/acp-app``), and
+        that shutdown disposes the subprocess service, which terminates every child
+        it still owns -- an EOF handed over at boot would end the proof's child under
+        it and refuse every clean session. A harness that publishes nothing within
+        :data:`_DSH_GATE_READBACK_TIMEOUT_S` is killed and refused.
+
+        *child_scrub_names* are the ``agent.deepseek_env`` names: each is set in the
+        probe's environment to a canary carrying the nonce -- never to the key, which
+        this plugin host does not need -- and listed for the plugin, so the marker
+        must report exactly that set proved absent from the harness's child.
+
+        Both output streams are discarded: they are plugin-controlled and carry no
+        read-back data. The marker is opened without following links or blocking on
+        special files, accepted only as a regular file up to 64 KiB, and read once
+        with a one-byte growth check before JSON parsing.
+
+        Returns ``("", "")`` only when the marker is the one this session's own
+        plugin wrote, its approval snapshot names the stock ACP bridge as the sole
+        answerer under the pinned policy, the composed tool presentation is
+        ``native``, and every configured name was withheld from the child. Blocking;
+        callers run it off the loop.
+        """
+        with suppress(OSError):
+            os.unlink(marker_path)
+        # Built exactly as the pi probe's is, and NOT from a raw ``os.environ``.
+        # Two reasons, both load-bearing. A plugin runs during this boot, so an
+        # unscrubbed environment hands a third-party bundle the gateway's own
+        # credentials before anything has been verified. And the probe is only
+        # evidence about the session if it boots in the session's environment:
+        # ``_extra_env`` carries this session's ``DSH_HOME``, so a probe reading the
+        # ambient one would compose a different profile from the child it speaks for.
+        env = scrub_agent_subprocess_env(
+            _resolve_spawn_env({**os.environ, **self._extra_env}, kiro_api_key=False)
+        )
+        env["PATH"] = augmented_path(env.get("PATH", ""))
+        env[_ENV_DSH_GATE_MARKER] = marker_path
+        env[_ENV_DSH_GATE_SESSION] = nonce
+        env[_ENV_DEEPSEEK_PERMISSION_MODE] = DEEPSEEK_PERMISSION_MODE
+        # The canaries, set AFTER the scrub above so nothing strips them: the
+        # validator already refused any name Crew's own scrub would take.
+        env[_ENV_DSH_GATE_SCRUB_NAMES] = ":".join(child_scrub_names)
+        for name in child_scrub_names:
+            env[name] = f"{_DSH_GATE_SCRUB_CANARY_PREFIX}{nonce}"
+        deadline = time.monotonic() + _DSH_GATE_READBACK_TIMEOUT_S
+        try:
+            process = subprocess_mod.Popen(
+                argv,
+                cwd=self._spawn_work_dir,
+                env=env,
+                stdin=subprocess_mod.PIPE,
+                stdout=subprocess_mod.DEVNULL,
+                stderr=subprocess_mod.DEVNULL,
+            )
+        except (OSError, subprocess_mod.SubprocessError) as exc:
+            # The boot itself failed, which is not the same finding as a boot that
+            # composed no gate -- but it lands in the same place, because a session
+            # cannot be started on a gate that was never observed.
+            return (
+                f"the gate's load marker could not be read back ({exc})",
+                acp_tool_gate.remediation_for(self.backend),
+            )
+        published = False
+        try:
+            while time.monotonic() < deadline:
+                if os.path.lexists(marker_path):
+                    published = True
+                    break
+                if process.poll() is not None:
+                    # The harness ended on its own before publishing: nothing more is
+                    # coming, and the read below judges whatever it left.
+                    break
+                time.sleep(_DSH_GATE_MARKER_POLL_S)
+            with suppress(OSError):
+                if process.stdin is not None:
+                    process.stdin.close()
+            try:
+                process.wait(timeout=_DSH_GATE_PROBE_EXIT_S if published else 0)
+            except subprocess_mod.TimeoutExpired:
+                process.kill()
+                with suppress(subprocess_mod.SubprocessError, OSError):
+                    process.wait(timeout=_DSH_GATE_PROBE_EXIT_S)
+        except (OSError, subprocess_mod.SubprocessError) as exc:
+            with suppress(OSError, subprocess_mod.SubprocessError):
+                process.kill()
+            return (
+                f"the gate's load marker could not be read back ({exc})",
+                acp_tool_gate.remediation_for(self.backend),
+            )
+        if not published and not os.path.lexists(marker_path):
+            return (
+                "the gate's load marker was not written within "
+                f"{_DSH_GATE_READBACK_TIMEOUT_S:.0f}s of booting the harness, so Kiro "
+                "Crew's gate plugin did not load and tools would run unasked",
+                acp_tool_gate.remediation_for(self.backend),
+            )
+        marker = self._read_deepseek_gate_marker(marker_path)
+        # Same FILE, not same string: the plugin reports its own module URL as Node
+        # resolved it, so both sides are brought to one spelling off the loop before
+        # the decision module compares them without touching the filesystem.
+        if isinstance(marker, dict):
+            module = marker.get("module")
+            if isinstance(module, str) and module.startswith("file://"):
+                marker = {**marker, "module": _same_file_spelling(url2pathname(module[7:]))}
+        issue = acp_tool_gate.gate_marker_issue(
+            self.backend,
+            marker,
+            _same_file_spelling(extension_path),
+            nonce,
+            child_scrub_names=child_scrub_names,
+        )
+        if issue:
+            return issue, acp_tool_gate.remediation_for(self.backend)
+        return "", ""
+
     def _write_claude_local_settings(self) -> None:
         """Seed ``<work_dir>/.claude/settings.local.json`` for this session.
 
@@ -6362,6 +7338,17 @@ class AcpClient:
 
     def _is_process_alive(self) -> bool:
         return self._process is not None and self._process.returncode is None
+
+    @property
+    def work_scratch_dir(self) -> Path | None:
+        """The session tree's work directory this process exposes as ``$KIROCREW_SCRATCH``.
+
+        The inherited directory when this client was spawned into an existing
+        tree, else its own allocation; ``None`` before spawn or when allocation
+        failed. Handed as ``shared_scratch`` to every spawn made on behalf of
+        this session (see ``session_allocation._collect_parent_runtime_kwargs``).
+        """
+        return self._shared_scratch or self._scratch_dir
 
     def is_process_alive(self) -> bool:
         """True if the underlying process exists and has not exited."""
@@ -7453,8 +8440,18 @@ class AcpClient:
                     f"dependency), or set CLAUDE_AGENT_ACP_BIN to its entry script."
                 )
             argv: list[str] = claude_argv
-            spawn_label = _adapter_spawn_label(argv, CLAUDE_ACP_BIN)
-            stderr_label = _adapter_spawn_label(argv, "claude-acp")
+            spawn_label = _adapter_spawn_label(
+                argv,
+                CLAUDE_ACP_BIN,
+                pkg_entry=_CLAUDE_ACP_PKG_ENTRY,
+                override_env="CLAUDE_AGENT_ACP_BIN",
+            )
+            stderr_label = _adapter_spawn_label(
+                argv,
+                "claude-acp",
+                pkg_entry=_CLAUDE_ACP_PKG_ENTRY,
+                override_env="CLAUDE_AGENT_ACP_BIN",
+            )
         elif self._is_opencode:
             # This harness serves ACP from its own binary, so the argv is that binary
             # plus its ``acp`` subcommand: no adapter entry script, no node, and no
@@ -7622,7 +8619,9 @@ class AcpClient:
                     f"{_ENV_PI_ACP_PI_COMMAND} to the executable."
                 )
             argv = pi_acp_argv
-            spawn_label = _adapter_spawn_label(argv, PI_ACP_BIN)
+            spawn_label = _adapter_spawn_label(
+                argv, PI_ACP_BIN, pkg_entry=_PI_ACP_PKG_ENTRY, override_env=_ENV_PI_ACP_BIN
+            )
             stderr_label = spawn_label
             # Same refuse-then-mask preflight as the two enforced arms above, keyed
             # on the routing rather than on this harness's identity, and FIRST for
@@ -7691,27 +8690,174 @@ class AcpClient:
             # composition path for every mirror-less backend. See
             # ``providers/mirrors/registry`` for the projection this harness declares.
             #
-            # And no refuse-then-mask preflight, which is the visible cost of the
-            # routing verdict rather than an oversight. That preflight resolves the OS
-            # credential mask, and the mask is gated on
-            # ``tool_gate.ENFORCED_ROUTINGS`` -- so for a harness whose routing is
-            # ``UNVERIFIED`` it would resolve to nothing, and
-            # ``test_every_enforced_harness_reaches_the_spawn_preflight`` counts one
-            # call site per ENFORCED harness, so a call here would break that count.
-            # This harness therefore starts with Crew's ordinary sandbox tier and no
-            # credential mask, which is one of the reasons it is not offered on the
-            # switch.
+            # The refuse-then-mask preflight every ENFORCED harness takes, and FIRST
+            # for the reason the pi arm gives: the read-back below starts a child of
+            # this harness, and it must not run outside the mask the session runs
+            # under. The mask is gated on ``tool_gate.ENFORCED_ROUTINGS``, which this
+            # harness is inside, and NOTHING of its own is spared from it: both of its
+            # credential leaves stay masked for the whole process tree, because its
+            # provider key arrives as an environment variable from Crew's vault
+            # (``agent.deepseek_env``, below) rather than from a file the child can
+            # open -- ``agent_sdk/host_auth`` declares ``adapter_own_leaves=()`` for it.
+            adapter_hidden_dirs = await _run_preflight_bounded(
+                _sandbox_preflight, self.backend, self._sandbox_mode
+            )
+            adapter_expose = acp_tool_gate.adapter_expose_files(self.backend, adapter_hidden_dirs)
             #
-            # No permission overlay, and no read-back, because there is nothing this
-            # client can verify: the harness decides its own tool calls. Its sandbox
-            # permits an in-policy action silently and DENIES an out-of-policy one,
-            # and ``session/request_permission`` carries only a model-initiated
-            # request to escalate past that sandbox. So the approval policy is real
-            # and readable and still does not route a tool call here, which is why
-            # this harness's ``ACP_BACKEND_ROUTING`` entry is ``UNVERIFIED`` and why
-            # it is absent from ``BASELINE_SELECTABLE_BACKENDS``. A read-back would
-            # confirm a setting that governs escalations alone and read as a
-            # guarantee nothing performs.
+            # The gate, and the READ-BACK that is what this harness's Routing member
+            # promises. This harness runs no gate of its own that decides a tool
+            # call, so Crew's plugin is composed into it through a per-launch patch
+            # -- the composition channel its own launcher documents -- and the
+            # plugin answers its ``tools/pre-execute`` waterfall with ``ask``.
+            # Verified against the pinned digest and copied into the sealed
+            # gate-artifact leaf first (the owner-only directory pi's extension also
+            # lives in, read-only against every harness child): the patch names the
+            # COPY, and the read-back requires the marker to report it, so a rewritten
+            # package file is refused here rather than loaded. The marker itself is
+            # NOT written there -- the leaf is sealed against the child -- but into the
+            # probe's own throwaway private scratch window below. The probe's is the
+            # ONLY marker: the session it speaks for names no marker path, and the
+            # plugin skips the write when none is named. Off-loop: file reads and writes.
+            extension_path = await asyncio.to_thread(_seal_deepseek_gate_extension)
+            self._deepseek_gate_patch = await asyncio.to_thread(
+                _write_deepseek_gate_patch, extension_path
+            )
+            self._deepseek_gate_nonce = uuid.uuid4().hex
+            argv = [*argv, _DSH_PATCH_FLAG, self._deepseek_gate_patch]
+            spawn_label = " ".join(argv)
+            stderr_label = spawn_label
+            # The provider-key NAMES the probe proves withheld from a harness child --
+            # never the key, which the probe's plugin host does not need. Same
+            # validator the session's own injection below runs, so a mapping this
+            # harness would not honour is refused HERE, before a harness boots on it;
+            # the vault itself is opened only below, for the session. Off-loop: reads
+            # config.json.
+            try:
+                vault_env_names = await asyncio.to_thread(_deepseek_vault_env_names)
+            except ValueError as exc:
+                try:
+                    acp_tool_gate.enforce_runtime_routing(
+                        self.backend,
+                        str(exc),
+                        remedy=acp_tool_gate.remediation_for(self.backend),
+                    )
+                except acp_tool_gate.ToolGateUnroutable as gate_exc:
+                    raise AcpToolGateUnroutable(str(gate_exc)) from None
+                # Unreachable while this harness is ENFORCED; kept as the fail-closed
+                # floor for the same reason the sites below keep theirs.
+                raise AcpToolGateUnroutable(str(exc)) from None
+            # The READ-BACK runs HERE, in the arm, on the argv assembled directly
+            # above -- and that argv is the one the session runs: the only step
+            # between this point and the real child's wrap is
+            # ``apply_pod_bundle_spawn``, which rewrites argv only for a harness in
+            # ``ACP_BACKENDS_POD_HOME_REMAP``, and this one is not in that set. So
+            # verifying here costs no fidelity, and it is what leaves the shared
+            # construction site exactly as every other backend leaves it: no
+            # adapter-driven conditional on the Kiro path (harness-parity H13).
+            #
+            # The probe gets its OWN THROWAWAY window rather than borrowing the
+            # session's. It needs a writable one at all because the managed scratch
+            # ROOT is masked for every sandboxed child (``sandbox._CREW_HIDDEN_LEAVES``),
+            # and the marker cannot live beside the gate's own code: that leaf is
+            # sealed read-only against every harness child so none can plant what a
+            # later session loads, which makes it the one place the child cannot
+            # create a file. The nonce is in the NAME as well as the contents, so
+            # nothing in a reused directory can be mistaken for this probe's marker.
+            #
+            # ``allocate_scratch`` records the SPAWNING process -- the gateway -- as
+            # the window's provisional owner, and the sweep reclaims only
+            # owned-and-dead-and-idle directories. The gateway is long-lived, so an
+            # abandoned probe window is retained for its whole lifetime and one more
+            # per retry: this window is therefore removed EXPLICITLY, in the same
+            # ``finally`` as the launcher unlink, rather than left to the sweep.
+            try:
+                probe_dir = await asyncio.to_thread(
+                    agent_scratch.allocate_scratch,
+                    f"{self._session_key or 'session'}-dsh-probe",
+                )
+            except (OSError, agent_scratch.ScratchBoundaryError) as exc:
+                # No window means no marker, so the gate cannot be verified at all.
+                # Refused rather than run: without the gate composed this harness
+                # executes every in-policy side effect unasked.
+                try:
+                    acp_tool_gate.enforce_runtime_routing(
+                        self.backend,
+                        "the gate's load marker has nowhere to be written: this "
+                        "session got no private scratch directory",
+                        remedy=acp_tool_gate.remediation_for(self.backend),
+                    )
+                except acp_tool_gate.ToolGateUnroutable as gate_exc:
+                    raise AcpToolGateUnroutable(str(gate_exc)) from None
+                # Unreachable while this harness is ENFORCED, since the call above
+                # raises for every enforced routing. Kept as the fail-closed floor:
+                # a routing table that ever stops enforcing this harness must not
+                # silently turn an unverifiable gate into an unverified spawn.
+                raise AcpToolGateUnroutable(
+                    "the gate's load marker has nowhere to be written: this session "
+                    "got no private scratch directory"
+                ) from exc
+            probe_marker = os.path.join(
+                str(probe_dir),
+                f"kirocrew_dsh_gate_{self._deepseek_gate_nonce}.marker.json",
+            )
+            # Pre-bound so the ``finally`` below can tell "no launcher to unlink" from
+            # "the wrap never returned one". Deliberately unannotated: the opencode
+            # arm above already binds this name in the same function scope.
+            readback_cleanup = None
+            try:
+                readback_argv, readback_cleanup = await wrap_argv_async(
+                    argv,
+                    mode=self._sandbox_mode,
+                    strip_python_env=True,
+                    extra_hidden_dirs=adapter_hidden_dirs,
+                    # The probe's own window, re-exposed the way the session's own is
+                    # below. Without it the probe boots under the scratch ROOT mask,
+                    # its plugin cannot write the marker, and the read-back would
+                    # report an absent gate for a gate that loaded -- evidence about
+                    # a different process rather than about this composition.
+                    extra_private_dirs=(str(probe_dir),),
+                    # Only the adapter's own re-exposures, exactly as the pi arm
+                    # passes. The sealed plugin and the patch are deliberately NOT
+                    # here: they live in the gate-artifact leaf, which this routing
+                    # already excludes from the child mask, so the child reads them
+                    # without a re-exposure -- and asking for one is fatal, because
+                    # the launcher restores an exposed file by WRITING a copy of it
+                    # and that leaf is sealed read-only, so the spawn dies with
+                    # EROFS before the harness starts.
+                    extra_expose_files=adapter_expose,
+                    _prepare=wrap_argv,
+                )
+                routing_issue, routing_remedy = await asyncio.to_thread(
+                    functools.partial(
+                        self._verify_deepseek_gate,
+                        readback_argv,
+                        extension_path,
+                        probe_marker,
+                        self._deepseek_gate_nonce,
+                        child_scrub_names=vault_env_names,
+                    )
+                )
+            finally:
+                if readback_cleanup:
+                    await asyncio.to_thread(_unlink_readback_launcher, readback_cleanup)
+                # The same removal the sweep makes, run here because the sweep never
+                # will: the gateway is this window's provisional owner and is alive.
+                # Off-loop, and error-swallowing for the sweep's own reason -- losing
+                # a temp directory must not fail the spawn that created it.
+                await asyncio.to_thread(shutil.rmtree, probe_dir, ignore_errors=True)
+            if routing_issue:
+                # Refused before the first prompt, for the reason the pi arm gives:
+                # without the gate composed this harness runs every in-policy side
+                # effect unasked, so a session that cannot establish it is a session
+                # where none of Crew's tool controls run.
+                try:
+                    acp_tool_gate.enforce_runtime_routing(
+                        self.backend,
+                        routing_issue,
+                        remedy=routing_remedy,
+                    )
+                except acp_tool_gate.ToolGateUnroutable as exc:
+                    raise AcpToolGateUnroutable(str(exc)) from None
         else:
             # Pin ONE reading of the environment for both the search and the
             # message that reports it. The previous code resolved against the live
@@ -7826,6 +8972,15 @@ class AcpClient:
         # child's own directory is re-exposed as a PRIVATE window (siblings stay hidden).
         # Fail-open; owner recorded after spawn; reclamation is
         # liveness-keyed, never age-keyed.
+        if self._shared_scratch is None and self._scratch_dir is not None:
+            # A respawn of this client (``ensure_ready`` after the process
+            # exited): the directory the previous process exposed IS this
+            # session's tree -- the children it spawned mounted it, and the
+            # work it staged is there -- so the new process joins it instead
+            # of starting an empty one that hides that work until the old
+            # directory is reclaimed. Validated and adopted below like any
+            # inherited tree; dropped if it was swept meanwhile.
+            self._shared_scratch = self._scratch_dir
         self._scratch_dir = None
         try:
             self._scratch_dir = await asyncio.to_thread(
@@ -7840,6 +8995,15 @@ class AcpClient:
                 exc_info=True,
             )
         scratch_window = (str(self._scratch_dir),) if self._scratch_dir is not None else ()
+        # The tree's work directory as a second window into the masked root
+        # (twin of acp/runtime.py): re-validated now, since the allocation it
+        # names may have been swept, and dropped -- not re-created -- if so.
+        if self._shared_scratch is not None:
+            self._shared_scratch = await asyncio.to_thread(
+                agent_scratch.shared_scratch_window, self._shared_scratch
+            )
+        if self._shared_scratch is not None:
+            scratch_window = (*scratch_window, str(self._shared_scratch))
         # Resolve the SSH_AUTH_SOCK forward opt-in OFF the event
         # loop (KiroCrewConfig.load() may stat/read config) ONCE, then pass the
         # resolved boolean into both the sandbox wrap below and the parent-side
@@ -7916,8 +9080,72 @@ class AcpClient:
         if self._is_deepseek:
             # Pinned rather than left to the ambient value, so a variable inherited
             # from the operator's shell cannot select the unconfined mode. Defence in
-            # depth: nothing here routes a tool call to Crew's gate.
+            # depth: the gate plugin below is what routes a tool call to Crew's gate.
             env[_ENV_DEEPSEEK_PERMISSION_MODE] = DEEPSEEK_PERMISSION_MODE
+            if self._deepseek_gate_nonce:
+                # The nonce the read-back issued, applied unconditionally: the
+                # permission-frame tripwire keys on it, so a session that carries no
+                # nonce is a session whose completed-unasked guard cannot arm. NO
+                # marker path: the one load marker is the probe's, written into the
+                # probe's own window and already judged above. The session's plugin
+                # runs the same gate without writing anything -- it skips the write
+                # when no path is named -- so whether this session got a private
+                # scratch window is the hygiene question it is for every other
+                # backend, settled at the shared site above, not a refusal here.
+                env[_ENV_DSH_GATE_SESSION] = self._deepseek_gate_nonce
+            # The provider key, from Crew's OWN vault rather than from a file inside
+            # the child's tree. This is what lets ``host_auth`` declare no
+            # ``adapter_own_leaves`` for this harness: both of its credential leaves
+            # stay masked for the whole process tree, and the key arrives as an
+            # environment variable the harness resolves ABOVE those files and
+            # withholds from every shell it spawns (see the constants above).
+            #
+            # HERE rather than on the shared tail, and that placement is load-bearing
+            # twice over. It keeps the Kiro construction path free of this adapter
+            # (harness-parity H13), and it runs BEFORE ``_resolve_spawn_env`` and
+            # ``scrub_agent_subprocess_env`` -- which is exactly why the validator
+            # refuses a name that scrub would strip: a key injected after this point
+            # and removed there would leave the operator with a harness that cannot
+            # reach a model and no error naming why.
+            #
+            # Off-loop: reads config.json and the vault. Guarded: the sandbox temp
+            # file is live, so a cancellation here must not orphan it.
+            try:
+                deepseek_env, _ = await self._to_thread_guarding_sandbox(_deepseek_vault_env)
+            except ValueError as exc:
+                # Fail CLOSED on a mapping this harness would not honour, or a vault
+                # secret that is not there. The message names only the operator's own
+                # env-var key -- never the vault name and never the value -- so it is
+                # safe on the log and in the chat error card. The launcher the wrap
+                # above wrote is already reclaimed: ``_to_thread_guarding_sandbox``
+                # discards it on ANY exception out of the hop, which is why this arm
+                # makes no ``_discard_sandbox_cleanup`` call of its own.
+                try:
+                    acp_tool_gate.enforce_runtime_routing(
+                        self.backend,
+                        str(exc),
+                        remedy=acp_tool_gate.remediation_for(self.backend),
+                    )
+                except acp_tool_gate.ToolGateUnroutable as gate_exc:
+                    raise AcpToolGateUnroutable(str(gate_exc)) from None
+                # Unreachable while this harness is ENFORCED; kept as the fail-closed
+                # floor for the same reason the arm above keeps its own.
+                raise AcpToolGateUnroutable(str(exc)) from None
+            env.update(deepseek_env)
+            # The resolver's contract -- clear the PLAINTEXT it returned as soon as
+            # nothing needs it from that dict -- is honoured HERE, inside the arm,
+            # rather than after the spawn on the shared tail, which would put a branch
+            # on this adapter's state onto every Kiro session start (harness-parity
+            # H13). Copying onto ``env`` is the last read of the resolver's dict, so it
+            # is emptied now; ``env`` itself is the dict ``exec`` copies into the child
+            # and is a local of this coroutine, never written to the gateway's
+            # ``os.environ`` and never stored on ``self``, so its plaintext lives
+            # exactly as long as this frame. The resolved key NAMES are not kept: the
+            # harness withholds the variable from its own shells by name CLASS, not
+            # by a list Crew hands it, and nothing on this side reads them later.
+            deepseek_env.clear()
+            # NOT given to the read-back probe, which boots the plugin and exits: it
+            # needs no provider key, so it is never handed one.
         self._apply_session_identity_env(env)
         if self._channel_id:
             env["KIROCREW_CHANNEL_ID"] = self._channel_id
@@ -7980,7 +9208,11 @@ class AcpClient:
         # The scratch dir was allocated before the sandbox wrap (carved out of
         # the masked root there); hand it to the child as its temp.
         if self._scratch_dir is not None:
-            env.update(agent_scratch.scratch_env(self._scratch_dir))
+            env.update(agent_scratch.scratch_env(self._scratch_dir, shared=self._shared_scratch))
+        elif self._shared_scratch is not None:
+            # Own allocation failed (inherited temp) but the tree's work
+            # directory is mounted: the prompt-visible name still points there.
+            env["KIROCREW_SCRATCH"] = str(self._shared_scratch)
         # Memory-aware cap for pytest-xdist's ``-n auto``: xdist sizes auto to
         # the CPU count, ignoring memory, so a full-suite run in an agent turn
         # can spawn cpu_count workers x ~1 GB each and exhaust the host. xdist
@@ -8107,6 +9339,26 @@ class AcpClient:
                     # recoverable; that deletion is not.
                     raise agent_scratch.ScratchBoundaryError(
                         "the scratch owner marker still names the gateway after a failed update"
+                    )
+            if self._shared_scratch is not None:
+                # Twin of acp/runtime.py: join the tree's owner marker beside
+                # the parent, so the sweep keeps the tree while either lives.
+                adopt_outcome = await asyncio.get_running_loop().run_in_executor(
+                    subprocess_executor(),
+                    functools.partial(agent_scratch.adopt_owner, self._shared_scratch, self._pid),
+                )
+                if adopt_outcome in ("refused", "stale"):
+                    raise agent_scratch.SharedScratchJoinError(
+                        "the inherited scratch owner marker could not be joined"
+                        if adopt_outcome == "stale"
+                        else "the inherited scratch owner marker was replaced with a link"
+                    )
+                if adopt_outcome != "recorded":
+                    logger.warning(
+                        "agent-scratch: could not join the owner marker of %r (%s); the tree's "
+                        "work directory is left unowned and will not be swept",
+                        self._shared_scratch.name,
+                        adopt_outcome,
                     )
             logger.info("Spawned %s (PID %d)", _spawn_label, self._pid)
             # Track root PID and do an early descendant scan.  kiro-cli forks
@@ -8558,6 +9810,10 @@ class AcpClient:
         self.last_prompt_stats.cost_session_usd = 0.0
         self._buffer.clear()
         self._stderr_lines.clear()
+        # A fresh process opens a fresh registration window: cleared WITH the
+        # ring, so the latch and the evidence it gates always describe the same
+        # child.
+        self._prompt_or_tool_seen = False
         if self._stderr_task and not self._stderr_task.done():
             self._stderr_task.cancel()
         self._stderr_task = None
@@ -9167,15 +10423,27 @@ class AcpClient:
                         if isinstance(exc, OSError):
                             await asyncio.sleep(_ACP_RESPAWN_BACKOFF_S)
                     else:
+                        # Read the ring BEFORE the cleanup below clears it: a
+                        # startup that died with a throttled registration on its
+                        # stderr is pre-prompt by construction, so the typed
+                        # transient subclass is the accurate verdict here too.
+                        _throttled = await self._registration_throttle_line()
                         # AcpAuthRequired subclasses AcpError; label it distinctly
                         # so a not-logged-in exit is never counted as a generic
                         # startup error. (The fork has no separate auth fail-fast
                         # branch — retry semantics stay unchanged.)
-                        _startup_outcome = (
-                            "auth_required" if isinstance(exc, AcpAuthRequired) else "error"
-                        )
+                        if isinstance(exc, AcpAuthRequired):
+                            _startup_outcome = "auth_required"
+                        elif _throttled is not None:
+                            _startup_outcome = "registration_rate_limited"
+                        else:
+                            _startup_outcome = "error"
                         await self._cleanup_failed_live_spawn()
                         self._reset_state()
+                        if _throttled is not None and not isinstance(exc, AcpAuthRequired):
+                            raise registration_rate_limited_error(
+                                "ACP session startup failed", _throttled
+                            ) from exc
                         raise
         finally:
             try:
@@ -9246,6 +10514,41 @@ class AcpClient:
             mode=self._sandbox_mode,
             extra_hidden_dirs=self._sandbox_hidden_dirs,
         )
+
+    async def _registration_throttle_line(self) -> str | None:
+        """One redacted stderr line showing a throttled registration, or ``None``.
+
+        Refuses to classify once this process has produced a non-thinking text
+        chunk or dispatched a tool (``_prompt_or_tool_seen``): the transient
+        verdict this evidence buys licenses the retry ladders to act, and a
+        stale throttle line surviving in the ring past real work must never
+        hand that verdict to a death whose replay could repeat side effects.
+        The latch clears with the ring on respawn, so a recovered throttle
+        followed by a fresh child opens a fresh window.
+
+        Returns ``None`` when nothing was retained, which is the case for a
+        restricted-memory session: stderr is not kept there by design, so this
+        cannot classify and must not guess. Those sessions keep the generic
+        death surface rather than getting a made-up verdict.
+
+        Settles the drain first, for the reason :meth:`_sandbox_init_failure`
+        does: the ring is filled by the drain task while the death that brings
+        us here is discovered on the stdout side, so a straight read can miss a
+        line already in the pipe. Redacted before it leaves: the line rides an
+        exception message that reaches session cards and persisted errors, and
+        child stderr is untrusted subprocess output that can echo a credential.
+        """
+        if getattr(self, "_prompt_or_tool_seen", True):
+            return None
+        await self._settle_stderr()
+        if not self._stderr_lines:
+            return None
+        line = registration_throttle_line("\n".join(self._stderr_lines))
+        if line is None:
+            return None
+        line, _ = redact_exfiltration_urls(line)
+        line, _ = redact_credentials(line)
+        return line
 
     async def shutdown(self) -> None:
         """Gracefully stop the ACP process."""
@@ -9558,6 +10861,13 @@ class AcpClient:
             progress = self._mcp_timeout_progress(expected_mcp)
             if progress:
                 message += f" ({progress})"
+            err = AcpTimeoutError(message=message)
+            # A start that never answered, tagged for the self-driving callers
+            # that count consecutive start failures (see
+            # ``AcpError.session_start_failed``). Set only in this branch: the
+            # other awaited requests are not session starts.
+            err.session_start_failed = True
+            raise err
         raise AcpTimeoutError(message=message)
 
     def _mcp_timeout_progress(self, expected: object) -> str:
@@ -9936,6 +11246,16 @@ class AcpClient:
                     consecutive_empty += 1
                     if consecutive_empty >= _MAX_CONSECUTIVE_EMPTY and not self._is_process_alive():
                         rc = self._process.returncode if self._process else "?"
+                        # A death whose retained stderr shows a throttled
+                        # registration is endpoint throttling, not a crash:
+                        # raise the typed transient subclass so the retry
+                        # ladders recover it (a respawn through ensure_ready
+                        # genuinely retries registration on this transport).
+                        _throttled = await self._registration_throttle_line()
+                        if _throttled is not None:
+                            raise registration_rate_limited_error(
+                                f"Process exited during prompt (exit code {rc})", _throttled
+                            )
                         raise AcpProcessDied(f"Process exited during prompt (exit code {rc})")
                     # Staleness check: if caller set _stale_eligible (text was
                     # streamed) and kiro-cli has gone silent, exit early.
@@ -10459,6 +11779,7 @@ class AcpClient:
                     if not is_thinking:
                         self.last_prompt_stats.text_chunks += 1
                         self._stale_eligible = True
+                        self._prompt_or_tool_seen = True
                     yield AcpEvent(kind=kind, text=chunk, control_notice=_notice_chunk)
                     if not is_thinking and _is_tool_interrupted_marker(chunk):
                         # kiro-cli's built-in security filter cancelled the turn's tools.
@@ -10477,6 +11798,7 @@ class AcpClient:
                 tool_event = self._extract_tool_event(msg)
                 if tool_event:
                     self._stale_eligible = False
+                    self._prompt_or_tool_seen = True
                     # Arm the tool-stall watchdog: if no further data arrives
                     # within _TOOL_STALL_TIMEOUT, _prompt_loop treats the turn
                     # as dead instead of hanging to the full prompt timeout.
@@ -10560,6 +11882,11 @@ class AcpClient:
                     len(_subs) if isinstance(_subs, list) else "n/a",
                 )
                 if isinstance(_subs, list):
+                    # A roster means children exist: a spawned child can mutate
+                    # state before its first activity frame is observed, so the
+                    # roster itself closes the registration-throttle window.
+                    if _subs:
+                        self._prompt_or_tool_seen = True
                     # No runtime_global marking here: AcpClient owns a dedicated
                     # process with a single session, so an ownerless frame from
                     # it is this session's own roster, never a co-tenant's.
@@ -10591,6 +11918,12 @@ class AcpClient:
                 if _ssid and _ssid == (self._session_id or ""):
                     continue
                 if _ssid and _tcid:
+                    # A child's tool call is this process's side effect for
+                    # replay purposes — the parent prompt spawned it, so a
+                    # replay would re-run it. Close the registration-throttle
+                    # window, exactly as the shared-runtime handle does for its
+                    # fanned-out child tool calls.
+                    self._prompt_or_tool_seen = True
                     # Sub-agent output is LLM-influenced — redact the title before
                     # it reaches the dashboard/persisted message.
                     _su_title, _ = redact_exfiltration_urls(str(_upd.get("title") or ""))
@@ -10607,6 +11940,10 @@ class AcpClient:
                     # Skip reasoning/thinking blocks (is_thinking) — those are the
                     # sub-agent's internal reasoning, not user-visible output, and
                     # the flat pre-port read never surfaced them.
+                    # Observed child output also closes the registration-throttle
+                    # window: a child whose tool frame was lost or differently
+                    # spelled must not read as "did nothing".
+                    self._prompt_or_tool_seen = True
                     _su_text, _ = redact_exfiltration_urls(_su_text)
                     _su_text, _ = redact_credentials(_su_text)
                     yield AcpEvent(
@@ -11452,30 +12789,70 @@ class AcpClient:
         and pi-acp maps ``isError`` to ``status: "failed"`` on the
         ``tool_execution_end`` it forwards, so a denial reported ``completed`` is a
         harness that did not block. No-op on every session without a gate extension.
+
+        An id's gate state lives exactly as long as its call: the terminal update,
+        ``completed`` or ``failed``, consumes both the ask and any deny recorded for
+        that id, because harness ids recur within a session and an approval left
+        behind would vouch for a later call that merely reused the id.
+
+        Armed for BOTH gate-extension harnesses, on the same grounds and with the
+        same state. What a read-back proves is that the gate loaded in the child it
+        booted; that the harness then asks for every call is its own behaviour across
+        upgrades, which no client-side read pins. For the DeepSeek Harness this carries
+        extra weight, because its load marker is written by the gate itself in a child
+        the read-back booted: this is the check that speaks for the SESSION's own
+        child, so a session whose real child composed no gate cannot complete a single
+        tool call unnoticed.
         """
-        if not getattr(self, "_pi_gate_nonce", ""):
+        if not (getattr(self, "_pi_gate_nonce", "") or getattr(self, "_deepseek_gate_nonce", "")):
             return
         params = msg.params if isinstance(msg.params, dict) else {}
         update = params.get("update")
         if not isinstance(update, dict) or update.get("sessionUpdate") != "tool_call_update":
             return
-        if update.get("status") != "completed":
+        status = update.get("status")
+        if status not in ("completed", "failed"):
             return
         tool_call_id = update.get("toolCallId")
         if not isinstance(tool_call_id, str) or not tool_call_id:
             return
-        if tool_call_id in self._pi_gate_denied_ids:
+        # The id's gate state is CONSUMED at its terminal frame, whichever way the
+        # call ended, and the verdict below is read from what was consumed. Nothing
+        # makes a tool-call id unique for the life of a session (see
+        # ``_note_pi_gate_asked``): a provider that mints per-response ids repeats
+        # ``call_0`` on every response, so an approval that outlived its call would
+        # vouch for the NEXT call wearing the same id -- one that ran with no fresh
+        # ask -- and this check would wave it through. Consumed here, a reused id
+        # has to earn its own ask again or it is an unasked call. CAPTURED rather
+        # than asserted: ``test/fixtures/acp_frames/deepseek/tool-call-id-reuse-
+        # live.jsonl`` is real dsh-acp driven by a model minting ``call_0`` in two
+        # consecutive turns of one session -- the harness forwards the provider's
+        # id as its ``toolCallId``, so the corpus carries ``call_0`` asked about
+        # twice and ``completed`` twice, one terminal frame per call. Sound because
+        # both harnesses emit exactly ONE terminal update per call: dsh-acp maps one
+        # tool-result event to one ``completed``/``failed`` (``toolResultUpdate``),
+        # pi-acp maps ``tool_execution_end`` the same way, and that capture shows
+        # the second terminal for an id arriving only with the id's second call.
+        # ``in_progress`` frames are not terminal and leave the state alone.
+        asked = tool_call_id in self._pi_gate_asked_ids
+        denied = tool_call_id in self._pi_gate_denied_ids
+        self._pi_gate_asked_ids.discard(tool_call_id)
+        self._pi_gate_denied_ids.discard(tool_call_id)
+        if status != "completed":
+            return
+        if denied:
             # Third link: pi did not honour the extension's block. The call the host
             # refused ran anyway, which is the outcome the whole chain exists to
             # prevent, so it ends the session the same way an unasked call does.
             outcome, what = "ran_despite_deny", "after Kiro Crew's gate DENIED it"
-        elif tool_call_id not in self._pi_gate_asked_ids:
+        elif not asked:
             outcome, what = "ran_without_gate", "without asking Kiro Crew's gate"
         else:
             return
         logger.error(
-            "pi gate: tool call %s COMPLETED %s; the session's tool calls are no longer "
+            "%s gate: tool call %s COMPLETED %s; the session's tool calls are no longer "
             "governed by Kiro Crew's gate, so the harness is being stopped [session=%s]",
+            acp_tool_gate.label_for(self.backend),
             tool_call_id,
             what,
             self._session_id,
@@ -11492,12 +12869,26 @@ class AcpClient:
         except Exception:  # pragma: no cover - audit is best-effort
             logger.debug("pi gate: audit of the tripwire failed", exc_info=True)
         await self._kill_process(force=True)
+        # The remedy is per harness because the unpinned link differs: pi's is the
+        # adapter that must keep running Crew's launcher and forwarding dialogs, and
+        # this harness's is the plugin composition its own launcher performs.
+        if self._is_deepseek:
+            remedy = (
+                "Start a new chat, and if it recurs check the harness version: its "
+                "launcher must keep applying the --patch overlay that composes the "
+                "gate plugin, and its tools core must keep resolving an `ask` through "
+                "its approval service."
+            )
+        else:
+            remedy = (
+                "Start a new chat, and if it recurs check the pi-acp and pi versions: "
+                "the adapter must run the command named by PI_ACP_PI_COMMAND and forward "
+                "extension dialogs, and pi must honour an extension's block."
+            )
         raise AcpToolGateUnroutable(
             f"{acp_tool_gate.label_for(self.backend)} ran tool call {tool_call_id} {what}, "
             "so the gate extension is no longer in force for this session; the harness was "
-            "stopped. Start a new chat, and if it recurs check the pi-acp and pi versions: "
-            "the adapter must run the command named by PI_ACP_PI_COMMAND and forward "
-            "extension dialogs, and pi must honour an extension's block."
+            f"stopped. {remedy}"
         )
 
     def _audit_spec_restriction(self, *, tool_name: str, outcome: str, reason: str) -> None:
@@ -11998,7 +13389,7 @@ class AcpClient:
             input_str = ""
             if tool_call_id and raw_input:
                 input_str = (
-                    json.dumps(raw_input, indent=2)
+                    _dumps_degraded(raw_input, indent=2)
                     if isinstance(raw_input, (dict, list))
                     else str(raw_input)
                 )
@@ -12098,8 +13489,9 @@ class AcpClient:
                 kind, _ = redact_exfiltration_urls(kind)
                 kind, _ = redact_credentials(kind)
             self.last_prompt_stats.tool_calls.append((kind, title))
-            # Trusted identity from _meta.kiro (NOT the LLM-authored title) —
-            # shared with the _dispatch builder so both event paths carry it.
+            # Trusted identity from adapter-authored markers (NOT the
+            # LLM-authored title), shared with the dispatch builder so both
+            # event paths carry the same classifier verdict.
             return AcpEvent(
                 kind=EVENT_TOOL_CALL,
                 title=title,
@@ -12120,6 +13512,7 @@ class AcpClient:
                 # populates nothing and asserts no provenance.
                 tool_name=identity.tool_name,
                 mcp_server_name=identity.mcp_server_name,
+                tool_identity_trusted=identity.tool_identity_trusted,
                 mcp_identity_trusted=identity.identity_trusted,
             )
         return None
@@ -12187,7 +13580,7 @@ class AcpClient:
                             if "stdout" in j and j.get("stdout"):
                                 output_parts.append(str(j["stdout"]))
                             else:
-                                output_parts.append(json.dumps(j, default=str))
+                                output_parts.append(_dumps_degraded(j, default=str))
                 # Path 3: an object that is not that envelope at all. Mirrors
                 # ``_dispatch._build_tool_result_event`` -- ``rawOutput`` is
                 # unstructured passthrough, so ``items[]`` is one producer's
@@ -12202,7 +13595,7 @@ class AcpClient:
                 # method, because a cut taken before redaction can split a
                 # credential into fragments no pattern matches.
                 if raw_output and "items" not in raw_output:
-                    output_parts.append(json.dumps(raw_output, default=str))
+                    output_parts.append(_dumps_degraded(raw_output, default=str))
 
         tool_status = str(update.get("status") or "")
         if not output_parts:
@@ -12278,10 +13671,7 @@ class AcpClient:
         # the merged toolLog entry / message meta lines up across both events.
         input_str = ""
         if isinstance(raw_input, (dict, list)) and raw_input:
-            try:
-                input_str = json.dumps(raw_input, indent=2)
-            except (TypeError, ValueError):
-                input_str = str(raw_input)
+            input_str = _dumps_degraded(raw_input, indent=2)
         elif isinstance(raw_input, str):
             input_str = raw_input
         # Edit-style diff content blocks: prefer the rendered unified diff over
@@ -12382,7 +13772,12 @@ class AcpClient:
                         continue
                     try:
                         entry = json.loads(line)
-                    except json.JSONDecodeError:
+                    # A line past the decoder's recursion ceiling raises
+                    # ``RecursionError``, which is a ``RuntimeError`` and not a
+                    # ``JSONDecodeError``: unlisted, it reaches the method's
+                    # catch-all arm and costs every LATER line's results too,
+                    # since the saved offset has already moved past this one.
+                    except (json.JSONDecodeError, RecursionError):
                         continue
                     if entry.get("kind") != "ToolResults":
                         continue
@@ -12404,7 +13799,7 @@ class AcpClient:
                                     if out:
                                         output_parts.append(out[:4000])
                                 else:
-                                    output_parts.append(json.dumps(d, indent=2)[:4000])
+                                    output_parts.append(_dumps_degraded(d, indent=2)[:4000])
                             elif rc.get("kind") == "text":
                                 output_parts.append(str(rc.get("data", ""))[:4000])
                         if output_parts:
@@ -12422,24 +13817,60 @@ class AcpClient:
         return results
 
     def _note_pi_gate_asked(self, msg: JsonRpcMessage) -> None:
-        """Remember the tool call a gate-extension dialog is asking about.
+        """Remember the tool call a gate-extension permission frame is asking about.
 
         The tripwire (:meth:`_tripwire_pi_gate`) trusts a completed call only when
         the gate asked about it first, so this must run on EVERY path that answers a
         permission frame -- the streaming dispatch, which builds the event
         unconditionally, and the auto-approve site, which builds one only under a
         spec deny set. Idempotent, and a no-op without a session nonce.
+
+        Two shapes, one tripwire. pi's adapter can only forward a generic confirm
+        DIALOG, so the real call rides inside it as the envelope Crew's extension
+        wrote and the id is read back out of that. The DeepSeek Harness emits an
+        ordinary ACP permission frame that names the call directly, so its id is read
+        off ``toolCall.toolCallId``. Deliberately the same method rather than a second
+        one per harness: the state it feeds and the refusal it arms are shared, so a
+        future fix to either lands in both.
+
+        A fresh ask is a fresh verdict, so any earlier DENY for the same id is dropped
+        here. Nothing makes a tool-call id unique for the life of a session: the id is
+        the harness's own, and an OpenAI-compatible provider that mints per-response
+        ids (``call_0``, ``call_1``) repeats them on every response -- captured live
+        in ``test/fixtures/acp_frames/deepseek/tool-call-id-reuse-live.jsonl``, where
+        dsh-acp emits ``call_0`` for two consecutive turns of one session, each with
+        its own permission frame and its own terminal update. Without the discard a single denial would arm
+        :meth:`_tripwire_pi_gate` permanently, so the next APPROVED call reusing that
+        id would report ``completed`` and be killed as ``ran_despite_deny`` -- a
+        healthy session ended on stale state; a new denial re-arms it through
+        :meth:`_note_pi_gate_denied`. Rejected alternative: turn-scoping this state by
+        clearing ``_pi_gate_asked_ids`` at the prompt boundary, because a ``completed``
+        frame arriving after that boundary would then read as ``ran_without_gate`` and
+        kill a healthy session for the symmetric reason. What scopes the state instead
+        is the call itself: the tripwire consumes an id's ask and deny at that call's
+        terminal frame, so a reused id must be asked about afresh before its next
+        ``completed`` is trusted. The third link is untouched: a denied id that
+        completes with NO fresh frame still trips ``ran_despite_deny``.
         """
-        nonce = getattr(self, "_pi_gate_nonce", "")
-        if not nonce:
-            return
         params = msg.params if isinstance(msg.params, dict) else {}
         tool_call = params.get("toolCall")
-        envelope = gate_envelope(tool_call if isinstance(tool_call, dict) else {}, nonce)
-        if envelope is not None and envelope["toolCallId"]:
-            self._pi_gate_asked_ids.add(envelope["toolCallId"])
-            if msg.id is not None:
-                self._pi_gate_request_tool[str(msg.id)] = envelope["toolCallId"]
+        tool_call = tool_call if isinstance(tool_call, dict) else {}
+        tool_call_id = ""
+        pi_nonce = getattr(self, "_pi_gate_nonce", "")
+        if pi_nonce:
+            envelope = gate_envelope(tool_call, pi_nonce)
+            if envelope is not None and envelope["toolCallId"]:
+                tool_call_id = envelope["toolCallId"]
+        elif getattr(self, "_deepseek_gate_nonce", ""):
+            candidate = tool_call.get("toolCallId")
+            if isinstance(candidate, str):
+                tool_call_id = candidate
+        if not tool_call_id:
+            return
+        self._pi_gate_asked_ids.add(tool_call_id)
+        self._pi_gate_denied_ids.discard(tool_call_id)
+        if msg.id is not None:
+            self._pi_gate_request_tool[str(msg.id)] = tool_call_id
 
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
         """Build one permission event through the transport-shared parser.

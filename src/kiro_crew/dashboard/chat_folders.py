@@ -9,10 +9,12 @@ import os
 import unicodedata
 import uuid
 import weakref
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
+from kiro_crew import pinned_fs
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_ids
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
@@ -21,12 +23,16 @@ from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.token_auth import (
     KNOWN_INTERNAL_CALLERS,
+    MEMBER_CHAT_PRINCIPAL_KEY,
     app_owns_transcript,
     effective_request_app,
+    folder_principal,
     refuse_unattributable_caller,
     request_origin,
 )
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.folder_steering import crosses_memory_silo, memory_silo_fence
+from kiro_crew.hooks import is_unc_shape, unc_probe_allowed, validate_file_path
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import voice_runtime_workspace_conflict
@@ -445,7 +451,15 @@ def _audit_origin(request: web.Request) -> tuple[str, str]:
 
 
 async def api_chat_folders(request: web.Request) -> web.Response:
-    """GET /api/chat/folders — list all project folders (with archived-session counts)."""
+    """GET /api/chat/folders — list project folders (with archived-session counts).
+
+    Person and app callers see the WHOLE tree, exactly as before (an app files
+    its own sessions into the person's folders, so it needs to see them). A crew
+    MEMBER caller sees only the folders it OWNS -- the chat gate stamped its
+    verified principal, and the tree it can reshape is the tree it should read,
+    so its view matches its write authority instead of exposing the person's
+    organisation.
+    """
     state: DashboardState = request.app["state"]
     # _folders_with_history_counts walks the on-disk session list (a synchronous
     # filesystem scan) that is user-triggered (every GET) and scales with the
@@ -455,6 +469,9 @@ async def api_chat_folders(request: web.Request) -> web.Response:
     # stay responsive and could otherwise be starved by frequent polling.
     loop = asyncio.get_running_loop()
     folders = await loop.run_in_executor(subprocess_executor(), _folders_with_history_counts, state)
+    member_principal = str(request.get(MEMBER_CHAT_PRINCIPAL_KEY) or "")
+    if member_principal.startswith("member:"):
+        folders = [f for f in folders if _folder_owner_app(f) == member_principal]
     return web.json_response(folders)
 
 
@@ -528,6 +545,319 @@ def _resolve_folder_project_dir(
     return "", None
 
 
+#: Ceiling on the extra steering directories one folder may declare. Small on
+#: purpose: these are org-standard/repo-standard roots, not a general file list,
+#: and each one is globbed and read at every chat launch in the subtree, so the
+#: bound is a cost ceiling as much as a config one. Accumulative inheritance can
+#: still stack several folders' lists past this per-folder cap; the resolver's
+#: own dedup and the collector's ``_MAX_DOCUMENTS`` bound the total.
+MAX_FOLDER_STEERING_DIRS = 16
+
+#: Longest steering-directory string accepted from a client, checked BEFORE the
+#: entry is resolved, compared or stored. 4096 is Linux ``PATH_MAX``; nothing
+#: longer can name a real directory anywhere, and the bound keeps a
+#: ``steering_dirs`` write from parking arbitrary payload in folder state.
+MAX_FOLDER_STEERING_DIR_LEN = 4096
+
+
+def _refuse_principal_steering_dirs(
+    request_app: str, steering_dirs: list, *, operation: str, folder_id: str
+) -> web.Response | None:
+    """Only the PERSON may declare steering directories; refuse everyone else.
+
+    A steering directory is a host-file READ the unsandboxed gateway performs
+    on the folder's behalf and hands to every chat in the folder. Folder
+    permission is not host-file permission: an app (or an admitted crew member)
+    that may create and edit its own folders must not be able to point one at
+    an arbitrary readable Markdown tree -- the person's notes, a repository
+    outside the app's reach -- and have the gateway launder that read into its
+    own model session, with no tool grant and no signal. So a NON-EMPTY
+    ``steering_dirs`` from a non-person principal is refused at both write
+    sites, before any path is touched, and audited as denied. Clearing to
+    ``[]`` stays allowed (it only removes reads). The person's own dashboard
+    calls carry the empty principal and are unaffected; a person can still
+    declare steering on a folder an app or member owns, and the delivery gate
+    then routes it to that principal's chats as before.
+    """
+    if not request_app or not steering_dirs:
+        return None
+    sel().log_api_access(
+        caller=request_app,
+        operation=operation,
+        outcome="denied",
+        source="app_isolation",
+        resources=f"folder={folder_id or '-'} steering_dirs={len(steering_dirs)}",
+        error="steering_dirs may be declared only by the person",
+    )
+    return web.json_response(
+        {
+            "error": (
+                "steering_dirs may be declared only from the person's own session: "
+                "folder permission does not grant host-file reads"
+            ),
+            "code": "steering_dirs_forbidden",
+        },
+        status=403,
+    )
+
+
+def _validate_steering_dirs(value: object) -> tuple[list[str], str | None]:
+    """Validate a folder's ``steering_dirs`` list. Returns (resolved, error_msg).
+
+    Reuses the ``_validate_project_dir`` contract per entry: absolute or
+    ``~``-prefixed, ``expanduser`` + ``realpath``, sensitive-path rejection
+    (SEL-logged like ``project_dir``), and must be an existing directory. Adds
+    list-level rules a single project path does not need: a ``16``-entry cap,
+    a per-entry length bound, rejection of duplicates within one folder
+    (compared by the resolved realpath, so two spellings of one directory are
+    still a duplicate), and a UNC gate applied BEFORE resolution -- on Windows
+    ``realpath``/``isdir`` on ``\\\\host\\share`` opens an SMB connection to
+    that host, so untrusted text must not reach the filesystem unless it names
+    a share this gateway already writes to (``unc_probe_allowed``). An empty
+    list is valid and resolves to ``[]`` -- and is the ONE spelling that clears
+    the field. An explicit ``None`` is refused like any other non-list: a
+    ``PATCH {"steering_dirs": null}`` is one ordinary request any client can
+    send, and accepting it as "clear" would silently drop a configured list.
+    """
+    if not isinstance(value, list) or any(not isinstance(entry, str) for entry in value):
+        return [], "steering_dirs must be a list of strings (send [] to clear)"
+    if len(value) > MAX_FOLDER_STEERING_DIRS:
+        return [], f"steering_dirs may list at most {MAX_FOLDER_STEERING_DIRS} directories"
+    if any(len(entry) > MAX_FOLDER_STEERING_DIR_LEN for entry in value):
+        return [], (
+            f"each steering directory must be at most {MAX_FOLDER_STEERING_DIR_LEN} characters"
+        )
+    resolved: list[str] = []
+    for entry in value:
+        stripped = entry.strip()
+        if not stripped:
+            return [], "steering directory must not be empty"
+        if is_unc_shape(stripped) and not unc_probe_allowed(stripped):
+            # Lexical check only; never touches the network. Same refusal the
+            # attachment and prompt-block readers apply to untrusted UNC text.
+            # Before the absolute-path check on purpose: a UNC spelling is not
+            # "absolute" on POSIX, and this is the refusal that must win.
+            return [], "Steering directory must not be a network (UNC) path"
+        if not os.path.isabs(stripped) and not stripped.startswith("~"):
+            return [], "Steering directory must be an absolute path"
+        if not pinned_fs.supports_pinned_tree_walk():
+            # Where a directory cannot be opened relative to a descriptor
+            # (native Windows) the collector REFUSES to walk, so a stored value
+            # would never be delivered -- and validating it would itself be the
+            # by-name probe the collector refuses: ``isdir``/``realpath`` on a
+            # name that an agent running as this user has swapped for a
+            # junction at a share is the outbound SMB authentication. Refuse
+            # here, after the lexical checks and before the FIRST filesystem
+            # call, with the same reason the collector logs.
+            return [], (
+                "Steering directories are not supported on this platform: a directory "
+                "cannot be opened relative to a descriptor, so the tree could not be "
+                "read without following a swapped link"
+            )
+        # ``validate_file_path`` is the hardened canonicalizer, not the bare
+        # ``realpath``/``isdir`` pair: representability, the UNC trusted-root
+        # gate and the Windows LINK-TARGET screen all run BEFORE anything is
+        # resolved. The lexical gate above cannot see a local junction aimed at
+        # a share, and following it is itself the outbound SMB probe.
+        canonical = validate_file_path(stripped)
+        if canonical is None:
+            # The screen fences sensitive paths ITSELF (returning ``None`` for
+            # them as for a bad link target), so this is where a sensitive
+            # submission is refused in practice -- audit it here, not only in
+            # the explicit re-check below.
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.folder_steering_dirs",
+                outcome="denied",
+                resources=stripped,
+                error="refused by path screen (invalid, link into a network share, or sensitive)",
+            )
+            return [], (
+                "Steering directory is not a valid path, or points through a link "
+                "into a network or sensitive location"
+            )
+        if len(canonical) > MAX_FOLDER_STEERING_DIR_LEN:
+            # The bound above ran on the SUBMITTED spelling; ``~`` and a link
+            # chain expand it, and the canonical form is what ``folders.json``
+            # retains and what every later resolve re-validates. An unbounded
+            # stored value would trip the first check on every read and drop
+            # the whole chain's steering with nothing but a warning -- so the
+            # bound applies to the field as stored, not only as typed.
+            return [], (
+                f"steering directory expands to more than {MAX_FOLDER_STEERING_DIR_LEN} "
+                "characters once links and ~ are resolved"
+            )
+        if is_sensitive_path(canonical):
+            # Defense in depth over the screen's own fence, on the canonical
+            # spelling, with the project_dir-style audit line.
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.folder_steering_dirs",
+                outcome="denied",
+                resources=canonical,
+                error="sensitive path",
+            )
+            return [], "steering_dirs refers to a sensitive path"
+        fence = memory_silo_fence()
+        if not fence.complete:
+            # The fence is built from the configuration's ``workspaces`` table,
+            # which can place a Global V1 workspace at an absolute directory
+            # anywhere. When that table cannot be read the default directories
+            # are NOT the fence, so no root can be cleared against it: refuse
+            # the admission outright (and audit it) rather than admit a root
+            # that may contain a workspace this process cannot see. ``[]``
+            # (clearing) never reaches this branch, so a degraded config can
+            # still remove steering, only not add it.
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.folder_steering_dirs",
+                outcome="denied",
+                resources=canonical,
+                error=f"memory store fence incomplete: {fence.degraded}",
+            )
+            return [], (
+                "Steering directories cannot be admitted while the memory-store fence "
+                f"is incomplete: {fence.degraded}. Repair config.json and retry"
+            )
+        if crosses_memory_silo(Path(canonical), fence.roots):
+            # A named memory store is a silo. A steering root that is, lies
+            # inside or contains the Global workspace or the named-store tree
+            # would hand one store's Markdown to every chat in the folder --
+            # a V2 member's included -- with nothing going red.
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.folder_steering_dirs",
+                outcome="denied",
+                resources=canonical,
+                error="memory store silo",
+            )
+            return [], (
+                "Steering directory must not be, contain, or lie inside a memory store "
+                "(the crew workspace or memory_stores directory)"
+            )
+        # Existence is proven by OPENING the directory the way the collector
+        # will read it -- ancestor chain pinned, the leaf ``O_DIRECTORY |
+        # O_NOFOLLOW`` -- not by ``isdir`` on the name: after the screen above
+        # the name can be swapped for a link, and a by-name ``isdir`` follows
+        # whatever sits there now (on Windows a junction at a share is the
+        # SMB probe). The pinned open refuses a link outright, and the
+        # descriptor is closed at once; nothing is read here.
+        try:
+            probe_fd = pinned_fs.open_dir_pinned(canonical, what="steering directory")
+        except (pinned_fs.PinnedPathRefusal, OSError):
+            return [], "Steering directory must be an existing directory"
+        os.close(probe_fd)
+        if canonical in resolved:
+            return [], "steering_dirs must not repeat a directory"
+        resolved.append(canonical)
+    return resolved, None
+
+
+def slot_steering_principal(slot: Any, execution_context: Any) -> str:
+    """The non-person principal a chat slot runs AS, in ``owner_app``'s space.
+
+    The slot-side mirror of ``token_auth.folder_principal``: that function
+    stamps ``owner_app`` on a folder from the WRITER (an app's bare name, or
+    ``"member:<store>"`` for an admitted crew member), and
+    :func:`_resolve_folder_steering_dirs` compares ``owner_app`` against the
+    value returned here. The two must be spelled from the same alphabet or the
+    fence silently drops a principal's own steering: a member-owned folder is
+    stamped ``member:<store>`` while a member slot's ``_app`` is empty, so
+    comparing against ``_app`` alone would skip the member's own documents.
+
+    * an App Kit slot -> its ``_app``, checked FIRST exactly as the writer side
+      checks the app claim first (the two are mutually exclusive in practice,
+      but the ordering keeps an app's principal byte-identical);
+    * a V2 member execution -> ``"member:<store>"`` from the CAPTURED execution
+      context's store (``legacy_name``, the same field the request gate reads
+      for the writer side), never from a later mutable declaration;
+    * a person's slot -> ``""``, matching an absent ``owner_app``.
+    """
+    app = str(getattr(slot, "_app", "") or "")
+    if app:
+        return app
+    if execution_context is None or not getattr(execution_context, "member_id", None):
+        return ""
+    store = str(getattr(getattr(execution_context, "store", None), "legacy_name", "") or "")
+    return f"member:{store}" if store else ""
+
+
+def _resolve_folder_steering_dirs(
+    folders: list[dict[str, Any]], folder_id: str, *, slot_app: str = ""
+) -> tuple[list[str], str | None]:
+    """Return the steering directories a folder inherits, ACCUMULATIVELY.
+
+    Unlike ``_resolve_folder_project_dir`` (nearest ancestor wins), steering
+    directories accumulate up the ``parent_id`` chain root-first: an
+    org-standards folder above a per-repo folder contributes both sets. The walk
+    is cycle-guarded exactly like the project resolver; each folder's stored
+    value is RE-VALIDATED (not trusted from ``folders.json``, which can list a
+    directory that has since been moved or become sensitive) and deduped by
+    resolved realpath, keeping the first occurrence.
+
+    Re-validation is PER ENTRY at read time: a directory that has since
+    disappeared, been renamed, or become sensitive is skipped with a warning
+    and the rest of the chain still steers -- the collector's own
+    skip-and-continue contract, and the one ``config.md`` promises. Failing
+    the whole resolution would let one stale ancestor entry silently drop
+    every other folder's standards for the entire subtree. Only a MALFORMED
+    stored shape (not a list of strings, or over the count ceiling) fails the
+    resolution, matching the project resolver's contract for a corrupt
+    ``folders.json``.
+
+    Ownership gates WHOSE steering a chat receives: a folder the person owns
+    contributes to every chat filed beneath it, but a folder a non-person
+    principal created (``owner_app``: an app's name, or ``member:<store>`` for a
+    crew member) contributes only to slots running AS that principal
+    (*slot_app*, spelled by :func:`slot_steering_principal`). A person can file
+    a chat into, or nest a folder under, an app's folder, and accumulative
+    inheritance would otherwise let the app write rules into the person's model
+    context through the parent chain -- a confused deputy the tree-shaping
+    ownership rules never intended to allow.
+    """
+    by_id = {str(folder.get("id") or ""): folder for folder in folders if isinstance(folder, dict)}
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    current_id = folder_id
+    while current_id and current_id not in seen:
+        seen.add(current_id)
+        folder = by_id.get(current_id)
+        if folder is None:
+            break
+        chain.append(folder)
+        current_id = str(folder.get("parent_id") or "")
+    # Root-first so an ancestor's standards land ahead of a child's additions.
+    result: list[str] = []
+    for folder in reversed(chain):
+        raw = folder.get("steering_dirs")
+        if raw is None or raw == []:
+            # Absent or an empty LIST is "declares none" -- the only two shapes
+            # the writer stores for that. Any other falsy value (``{}``, ``""``,
+            # ``0``) is a corrupt folders.json and must fail the shape check
+            # below, not slide past it as "nothing declared".
+            continue
+        owner = _folder_owner_app(folder)
+        if owner and owner != slot_app:
+            continue
+        if not isinstance(raw, list) or any(not isinstance(entry, str) for entry in raw):
+            return [], "steering_dirs must be a list of strings"
+        if len(raw) > MAX_FOLDER_STEERING_DIRS:
+            return [], f"steering_dirs may list at most {MAX_FOLDER_STEERING_DIRS} directories"
+        for entry in raw:
+            resolved, err = _validate_steering_dirs([entry])
+            if err:
+                logger.warning(
+                    "folder %s: steering directory skipped at read time (%s)",
+                    folder.get("id"),
+                    err,
+                )
+                continue
+            for one in resolved:
+                if one not in result:
+                    result.append(one)
+    return result, None
+
+
 def _refuse_unattributable_caller(
     state: DashboardState, request: web.Request
 ) -> web.Response | None:
@@ -540,19 +870,67 @@ def _refuse_unattributable_caller(
     return refuse_unattributable_caller(state, request, "chat.folder_write")
 
 
-def _folder_owner_app(folder: dict[str, Any]) -> str:
-    """The app that owns *folder*, or ``""`` when the person owns it.
+def member_slot_write_refused(
+    state: DashboardState, request: web.Request, slot: Any, operation: str
+) -> web.Response | None:
+    """403/404 when a crew-MEMBER caller may not file/tag *slot*, else ``None``.
 
-    The single place the storage rule is expressed: a folder created by an app
-    carries that app in ``owner_app``, and **an absent or empty key reads as the
-    person's**. That default is what makes this a field addition rather than a
-    migration — every folder written before the field existed is the person's,
-    which is exactly what it was.
+    The member analogue of the ``_app`` / ``app_owns_transcript`` fence the two
+    slot-write handlers (``api_chat_slot_folder`` and
+    ``chat_tags.api_chat_slot_tags``) apply to APP callers, and it MUST run
+    beside that app fence: a member carries NO app claim, so
+    ``effective_request_app`` returns ``""`` for it and the app fence's
+    ``if request_app`` guard is falsy -- without this a member would reach the
+    handler (the gate admits it) and file or tag ANY session. Shared by both
+    handlers so filing and tagging cannot drift on which sessions a member owns.
+
+    A member is recognised by the principal the chat gate stamped on the
+    VERIFIED scope (``token_auth.MEMBER_CHAT_PRINCIPAL_KEY``); a non-member
+    caller (person, app) makes this a no-op and the app fence beside it decides.
+    An admitted member may write ONLY a slot it owns for filing:
+    :func:`session_control.member_owns_slot` -- its own session or one it
+    created. Anything else is the same indistinguishable 404 the app fence
+    returns, so the route is not an existence oracle for sessions the member
+    cannot see.
+    """
+    principal = str(request.get(MEMBER_CHAT_PRINCIPAL_KEY) or "")
+    if not principal.startswith("member:"):
+        return None
+    caller_key = request.headers.get("X-Session-Key", "").strip()
+    from kiro_crew.dashboard import session_control as sc
+
+    if sc.member_owns_slot(state, slot, caller_key):
+        return None
+    sel().log_api_access(
+        caller=principal,
+        operation=operation,
+        outcome="denied",
+        source="member_isolation",
+        resources=f"slot={getattr(slot, 'key', '')}",
+        error="member can only file or tag its own or created sessions",
+    )
+    return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+
+def _folder_owner_app(folder: dict[str, Any]) -> str:
+    """The principal that owns *folder*, or ``""`` when the person owns it.
+
+    The single place the storage rule is expressed. A folder created by a
+    non-person principal carries that principal in ``owner_app``:
+
+    * an APP -> its bare app name (unchanged; every folder written before crew
+      members reached this surface keeps its meaning, so this stayed a field
+      addition rather than a migration); and
+    * an admitted crew MEMBER -> ``"member:<store>"`` (see
+      ``token_auth.folder_principal``). App names are validated identifiers that
+      never begin ``member:``, so the two principal spaces cannot collide.
+
+    An absent or empty key reads as the person's, exactly as before.
 
     Ownership decides only the tree-shaping verbs (create-into, rename,
-    reparent, delete). Reads stay whole: an app sees the person's folders and
-    can file its OWN sessions into one (``api_chat_slot_folder``), which is the
-    case a per-app namespace would have cost.
+    reparent, delete). Reads stay whole for apps (an app sees the person's
+    folders); a member's reads are scoped to its own folders and sessions (see
+    ``api_chat_folders``).
     """
     return str(folder.get("owner_app") or "")
 
@@ -664,6 +1042,7 @@ async def create_folder_record(
     icon: str = "",
     request_app: str = "",
     tags: list[str] | None = None,
+    steering_dirs: list[str] | None = None,
     unique_project_dir: bool = False,
     require_resolved_project_dir: bool = False,
 ) -> dict[str, Any]:
@@ -768,6 +1147,15 @@ async def create_folder_record(
         # Same contract shape as ``color``: a stored icon is always a single
         # grapheme-exact emoji, whichever caller created the folder.
         raise FolderCreateError("icon must be a single emoji", "icon_invalid")
+    # Off-loop like project_dir: each entry's realpath + isdir + sensitive-path
+    # scan touches the filesystem, and the scaffold calls this once per folder.
+    resolved_steering: list[str] = []
+    if steering_dirs:
+        resolved_steering, steering_err = await asyncio.to_thread(
+            _validate_steering_dirs, steering_dirs
+        )
+        if steering_err:
+            raise FolderCreateError(steering_err, "steering_dirs_invalid")
     folder: dict[str, Any] = {
         "id": uuid.uuid4().hex[:12],
         "name": name,
@@ -782,6 +1170,10 @@ async def create_folder_record(
         folder["color"] = color
     if icon:
         folder["icon"] = icon
+    if resolved_steering:
+        # Omitted when empty, like ``color``/``tags``: "absent means none" stays
+        # the single on-disk representation.
+        folder["steering_dirs"] = resolved_steering
     if request_app:
         folder["owner_app"] = request_app
 
@@ -902,11 +1294,34 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
                 {"error": tags_err or "tags invalid", "code": "tags_invalid"}, status=400
             )
         folder_tags = clean_tags
+    # Shape-checked here (request-facing) so a non-array/ non-string payload is
+    # refused before any folder work; the authoritative path validation runs in
+    # ``create_folder_record`` off the loop.
+    steering_dirs: list[str] = []
+    if "steering_dirs" in body:
+        raw_steering = body.get("steering_dirs")
+        if not isinstance(raw_steering, list) or any(
+            not isinstance(entry, str) for entry in raw_steering
+        ):
+            return web.json_response(
+                {
+                    "error": "steering_dirs must be a list of strings",
+                    "code": "steering_dirs_invalid",
+                },
+                status=400,
+            )
+        steering_dirs = raw_steering
     # Never from the body: a caller that could name its own owner could name
-    # someone else's. Written only when an app is calling, so the person's rows
-    # keep the shape they have on disk today and "absent means the person"
-    # stays the one representation (see _folder_owner_app).
-    request_app = _effective_request_app(state, request)
+    # someone else's. Written only when a NON-PERSON principal is calling (an
+    # app -> its bare name; an admitted crew member -> ``member:<store>``), so
+    # the person's rows keep the shape they have on disk today and "absent means
+    # the person" stays the one representation (see _folder_owner_app).
+    request_app = folder_principal(state, request)
+    refused = _refuse_principal_steering_dirs(
+        request_app, steering_dirs, operation="chat.folder_create", folder_id=""
+    )
+    if refused is not None:
+        return refused
     parent_id = str(body.get("parent_id") or "")
     try:
         folder = await create_folder_record(
@@ -919,6 +1334,7 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
             icon=icon_val,
             request_app=request_app,
             tags=folder_tags,
+            steering_dirs=steering_dirs,
         )
     except FolderOwnershipError as exc:
         sel().log_api_access(
@@ -965,7 +1381,7 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
     folder = next((f for f in state._folders if f["id"] == fid), None)
     if not folder:
         return web.json_response({"error": "not found"}, status=404)
-    request_app = _effective_request_app(state, request)
+    request_app = folder_principal(state, request)
     try:
         body = await request.json()
     except Exception:
@@ -1097,6 +1513,30 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
                 status=400,
             )
         changes["icon"] = icon_val
+    if "steering_dirs" in body:
+        # A list of directories loaded as steering for every chat in this
+        # folder's subtree. An empty list clears them; anything else is
+        # validated per entry (absolute/sensitive/isdir), capped at 16, and
+        # deduped. Off the loop, like project_dir, since each entry stats disk.
+        # Only the person may declare a non-empty list (see
+        # _refuse_principal_steering_dirs); the refusal precedes any path work.
+        raw_steering = body["steering_dirs"]
+        refused = _refuse_principal_steering_dirs(
+            request_app,
+            raw_steering if isinstance(raw_steering, list) else [raw_steering],
+            operation="chat.folder_steering_dirs",
+            folder_id=fid,
+        )
+        if refused is not None:
+            return refused
+        resolved_steering, steering_err = await asyncio.to_thread(
+            _validate_steering_dirs, body["steering_dirs"]
+        )
+        if steering_err:
+            return web.json_response(
+                {"error": steering_err, "code": "steering_dirs_invalid"}, status=400
+            )
+        changes["steering_dirs"] = resolved_steering
     if "tags" in body:
         # Vocabulary-constrained tag list. An empty list clears the folder's
         # tags; anything else must be ids that exist in the tag vocabulary.
@@ -1152,6 +1592,11 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             # default glyph" stays the single on-disk representation
             # (mirrors color above).
             target.pop("icon", None)
+        if not target.get("steering_dirs"):
+            # Empty list clears the key entirely, so "absent means none" stays
+            # the single on-disk representation (mirrors color/tags). PATCH with
+            # ``[]`` therefore clears a folder's steering directories.
+            target.pop("steering_dirs", None)
         if not target.get("tags"):
             # Empty list clears the key entirely, so "absent means no tags"
             # stays the single on-disk representation (mirrors color above).
@@ -1309,7 +1754,7 @@ async def api_chat_folder_reorder(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if (refusal := _refuse_unattributable_caller(state, request)) is not None:
         return refusal
-    request_app = _effective_request_app(state, request)
+    request_app = folder_principal(state, request)
     body, body_err = await read_bounded_json(request, max_bytes=_MAX_REORDER_BODY_BYTES)
     if body_err is not None:
         return body_err
@@ -1713,6 +2158,12 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     # A caller whose tab closed mid-call is refused first: its derived app
     # would be "" and read as the person (the same guard the tree writes apply).
     if (refusal := refuse_unattributable_caller(state, request, "chat.slot_folder")) is not None:
+        return refusal
+    # Member ownership, beside the app fence and for the same reason: a member
+    # carries no app claim, so the app guard below is a no-op for it and would
+    # let it file ANY session. This refuses a member filing a session that is
+    # not its own or created; a non-member caller makes it a no-op.
+    if (refusal := member_slot_write_refused(state, request, slot, "chat.slot_folder")) is not None:
         return refusal
     request_app = _effective_request_app(state, request)
     if request_app and getattr(slot, "_app", "") != request_app:

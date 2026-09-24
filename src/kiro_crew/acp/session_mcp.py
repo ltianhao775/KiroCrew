@@ -75,7 +75,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -90,24 +90,31 @@ from kiro_crew.agent import (
 from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
 from kiro_crew.env import sanitize_spec_env
-from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+from kiro_crew.mcp_cleanup import (
+    CONTROL_PLANE_SERVERS,
+    KIROCREW_BIN_MCP_SERVERS,
+    mcp_entry_is_muted,
+)
 
 logger = logging.getLogger(__name__)
 
-# Crew's own control plane. Re-derived from the managed source of truth on every
-# spawn so a stale hand-edited command in the spec cannot cost a claude session
-# the tools it needs to report back to its channel at all. Both are always-on
-# (no gate, not opt_in), so ``managed_mcp_spec_entry`` returns them unless the
-# install is broken. Re-derived, not read from the spec, is also what keeps them
-# out of the registry filter below: they are the host's own process, not a
-# third-party server the admin's catalog governs.
+# Crew's own control plane, defined in the ``mcp_cleanup`` leaf and re-exported
+# here. Re-derived from the managed source of truth on every spawn so a stale
+# hand-edited command in the spec cannot cost a claude session the tools it needs
+# to report back to its channel at all. Both are always-on (no gate, not
+# opt_in), so ``managed_mcp_spec_entry`` returns them unless the install is
+# broken. Re-derived, not read from the spec, is also what keeps them out of the
+# registry filter below: they are the host's own process, not a third-party
+# server the admin's catalog governs.
 #
-# PUBLIC because the codex projection carries this session's identity onto these
-# two entries and onto NOTHING else. Naming the same tuple twice is how the two
-# decisions drift apart, and the safety of that carriage rests on this being the
-# set the loop below REPLACES from the managed source: the element's command, args
-# and env are Crew's own by construction, not the spec's.
-CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
+# PUBLIC on this module because the codex projection carries this session's
+# identity onto these two entries and onto NOTHING else, and the safety of that
+# carriage rests on this being the set the loop below REPLACES from the managed
+# source: the element's command, args and env are Crew's own by construction, not
+# the spec's. The definition sits in the leaf so a consumer the agent-SDK import
+# boundary keeps off ``kiro_crew.acp`` -- the broker-stub ceiling in
+# ``mcp_gateway.session_servers`` -- reads the same tuple rather than a second
+# copy of it.
 
 # Every managed Crew server that must be handed the session's IDENTITY when it
 # is mounted -- a wider set than the control plane above, and a different
@@ -335,7 +342,9 @@ def _project_spec_path_for(agent: str, work_dir: str | Path | None) -> Path | No
     if not work_dir:
         return None
     try:
-        for spec in project_agent_files(work_dir):
+        for spec in project_agent_files(
+            work_dir, operation="session_mcp_project_agent", source="unknown"
+        ):
             if project_agent_name(spec) == agent:
                 return spec
     except OSError:
@@ -542,6 +551,68 @@ def session_mcp_disabled_tools(
     return frozenset(pairs)
 
 
+def session_mcp_disabled_servers(spec: Any, settings: Any) -> frozenset[str]:
+    """Every server switched off WHOLE by ``disabled: true``, from both sources.
+
+    A different question from :func:`session_mcp_restricted_servers`, and the
+    difference is what makes this its own function: a per-tool narrowing leaves a
+    server the user still wants, while ``disabled`` withdraws the server itself. The
+    array honours that through the ``tools`` allowlist -- ``agent.build_agent_config``
+    strips a disabled server's ``@alias``, so nothing mounts it -- but an allowlist
+    only governs elements the SPEC describes. A caller that appends an element of its
+    OWN (``AcpClient._append_member_dispatch_server``, which mounts a server the
+    template deliberately does not name) is outside that rule and has to ask this.
+
+    Unlike the restriction sets there is no backend condition on the answer: a
+    whole-server disable has no per-call form, so no harness can refuse a call to a
+    server it was handed. The only faithful action anywhere is not mounting it.
+
+    Same two sources as :func:`session_mcp_disabled_tools`, unioned for the same
+    reason -- a switch-off can only ever switch off -- and taken as the caller's
+    ALREADY-PARSED bytes so this cannot disagree with the array built beside it. The
+    control plane is NOT exempt: ``disabled`` on ``kirocrew-core`` is the user
+    saying so, and this function only reports it. Free of I/O.
+    """
+    names: set[str] = set()
+    for source in (spec, settings):
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("mcpServers")
+        if not isinstance(raw, dict):
+            continue
+        for name, entry in raw.items():
+            if isinstance(entry, dict) and entry.get("disabled"):
+                names.add(str(name))
+    return frozenset(names)
+
+
+def session_mcp_server_is_disabled(
+    name: str, agent: str | None, *, work_dir: str | Path | None = None
+) -> bool:
+    """Whether *name* is switched off WHOLE for a session running as *agent*.
+
+    The reading form of :func:`session_mcp_disabled_servers`, for a caller that holds
+    no parse of its own to pass in. ``AcpRuntime`` is that caller: it composes the
+    array for an ``ACP_BACKENDS_ACP_RUNTIME`` host, and half of those hosts have no
+    mirror to carry the answer down -- KAS projects through ``acp.kas_agents`` rather
+    than through an ``mcpServers`` array at all -- so a field on the mirrored
+    projection would answer for one of them and not the other.
+
+    One read of each source, which on a mirrored host is a SECOND read of files its
+    projection also read. The direction that costs is the safe one: a switch-off can
+    only ever switch off, so the window between two reads can withhold a mount whose
+    switch-off arrived a moment ago and can never mount one it missed. A caller that
+    HAS the parse uses :func:`session_mcp_disabled_servers` instead and keeps its
+    answers on one read.
+
+    Blocking (reads the agent spec and the global settings file); callers run it off
+    the event loop. Never raises: an unreadable source switches nothing off, the same
+    contract :func:`session_mcp_disabled_tools` keeps.
+    """
+    spec = _agent_spec_for(agent, work_dir) if agent else None
+    return name in session_mcp_disabled_servers(spec, _global_settings())
+
+
 def session_mcp_restricted_servers(disabled_tools: Collection[tuple[str, str]]) -> frozenset[str]:
     """Servers whose per-TOOL narrowing no transport can carry as an element.
 
@@ -634,6 +705,10 @@ class SessionMcpProjection(NamedTuple):
     #: Every ``(server, tool)`` the spec switches off, no server exempt
     #: (:func:`session_mcp_disabled_tools`).
     disabled_tools: frozenset[tuple[str, str]]
+    #: Servers switched off WHOLE by ``disabled: true``
+    #: (:func:`session_mcp_disabled_servers`). Separate from ``restricted`` because
+    #: no backend has a per-call form for it, so nothing may mount one.
+    disabled_servers: frozenset[str]
     #: The ``tools`` allowlist the translated half was filtered by, so a caller
     #: appending elements of its own (pooled stubs) can hold them to the same one.
     allowlist: ToolsAllowlist
@@ -682,6 +757,7 @@ def session_mcp_projection(
         ),
         restricted=session_mcp_restricted_servers(disabled_tools),
         disabled_tools=disabled_tools,
+        disabled_servers=session_mcp_disabled_servers(spec, settings),
         allowlist=_tools_allowlist(spec),
         derived_spec_snapshot=snapshot,
     )
@@ -864,6 +940,19 @@ def _managed_element_env(declared: Any) -> dict[str, str]:
     return env
 
 
+def _declared_launch(source: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """``(command, args)`` as a spec or settings entry declares them, for comparison.
+
+    A non-sequence ``args`` (``8080``, ``"--flag"``) reads as no args rather than
+    being iterated: it cannot equal the managed launch either way, and raising
+    here would abort ``session/new`` over a typo the module's own rules say must
+    not raise (see :func:`acp_server_element`).
+    """
+    raw_args = source.get("args")
+    args = [str(a) for a in raw_args] if isinstance(raw_args, (list, tuple)) else []
+    return str(source.get("command", "") or ""), args
+
+
 def kiro_control_plane_servers(
     agent: str | None,
     *,
@@ -923,14 +1012,47 @@ def kiro_control_plane_servers(
             not isinstance(source, dict)
             or set(source) - supported
             or source.get("type", "stdio") != "stdio"
-            or source.get("disabled", False) is not False
+            or mcp_entry_is_muted(source)
             or source.get("disabledTools", []) != []
-            or ("command" in source and source["command"] != managed.get("command"))
-            or ("args" in source and source["args"] != managed.get("args", []))
             for source in sources
         ):
             continue
-        owned = {**entry, "env": _managed_element_env(entry.get("env"))}
+        # The launch is the managed source's, never the spec's. A hand-authored
+        # command for a reserved name cannot be right across users or upgrades
+        # (the managed path carries the home and the installed version; the one
+        # writable spelling, bare ``kirocrew``, resolves to the Toolbox
+        # dispatcher), and skipping such an entry cost the session every
+        # control-plane tool while the server looked mounted. The
+        # module docstring already states the rule -- "re-derived from the
+        # managed source of truth on every spawn so a stale hand-edited command
+        # in the spec cannot cost a claude session the tools it needs" -- and the
+        # codex/opencode projections REPLACE the same way; this applies it here.
+        # Restrictions (mute, ``disabledTools``, non-stdio) still withhold above:
+        # they narrow the grant, which stays the spec's; only the invocation is
+        # ours. Only a sequence is iterated, as in ``acp_server_element``: the
+        # spec is hand-editable JSON, so ``"args": 8080`` is an easy thing to
+        # write, and it must read as "not the managed launch", not abort
+        # ``session/new`` with a TypeError from inside a comprehension.
+        declared = [
+            _declared_launch(source)
+            for source in sources
+            if isinstance(source, dict) and ("command" in source or "args" in source)
+        ]
+        managed_launch = _declared_launch(managed)
+        if any(launch != managed_launch for launch in declared):
+            logger.warning(
+                "session MCP: agent %r declares reserved server %r with a command that is"
+                " not the managed invocation; mounting the managed one so the gateway can"
+                " attest it",
+                agent,
+                name,
+            )
+        owned = {
+            **entry,
+            "command": managed_launch[0],
+            "args": list(managed_launch[1]),
+            "env": _managed_element_env(entry.get("env")),
+        }
         element = acp_server_element(name, owned)
         if element is not None:
             out.append(element)

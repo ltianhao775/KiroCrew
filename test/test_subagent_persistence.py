@@ -1394,7 +1394,7 @@ class TestOrphanReconciliation:
     """Verify _reconcile_orphans handles all three branches."""
 
     @pytest.mark.asyncio
-    async def test_dead_pid_with_result_tombstoned_as_delivered(self, agent_root):
+    async def test_dead_pid_with_complete_result_tombstoned_as_delivered(self, agent_root):
         from unittest.mock import MagicMock, patch
 
         from kiro_crew.subagent import SubagentManager
@@ -1403,12 +1403,13 @@ class TestOrphanReconciliation:
         sessions = MagicMock()
         manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
 
-        # Simulate orphan from prior run: dead PID, has result
+        # Simulate orphan from prior run: dead PID, has a result its run
+        # finished writing (result_complete recorded at the complete event).
         create_agent_folder("orphan1", task="old task", parent_session="dashboard:default")
         write_result_chunk("orphan1", "some result")
         from kiro_crew.subagent_persistence import update_state
 
-        update_state("orphan1", pid=99999)  # dead PID
+        update_state("orphan1", pid=99999, result_complete=True)  # dead PID
 
         with patch.object(manager, "_is_pid_alive", return_value=False):
             await manager._reconcile_orphans()
@@ -1416,6 +1417,190 @@ class TestOrphanReconciliation:
         ts = json.loads((agent_root / "orphan1" / "tombstone.json").read_text(encoding="utf-8"))
         assert ts["cause"] == "gateway_restart"
         assert ts["recovery_action"] == "result_available"
+
+    @pytest.mark.asyncio
+    async def test_dead_pid_with_partial_result_is_not_offered_as_a_result(self, agent_root):
+        """Streamed bytes without a complete event are a fragment, not an answer.
+
+        ``write_result_chunk`` appends per streamed chunk, so result.txt is
+        non-empty from the agent's first token. A restart landing mid-turn
+        therefore leaves a file that looks exactly like a finished result to
+        anyone measuring its size — which is what the parent is told to go read.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from kiro_crew.subagent import SubagentManager
+        from kiro_crew.subagent_persistence import create_agent_folder, write_result_chunk
+
+        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+
+        create_agent_folder("orphan1p", task="old task", parent_session="dashboard:default")
+        # An opening sentence, nothing more — no complete event ever arrived.
+        write_result_chunk("orphan1p", "I'll start by opening a scratch worktree")
+        from kiro_crew.subagent_persistence import update_state
+
+        update_state("orphan1p", pid=99999)
+
+        with patch.object(manager, "_is_pid_alive", return_value=False):
+            await manager._reconcile_orphans()
+
+        ts = json.loads((agent_root / "orphan1p" / "tombstone.json").read_text(encoding="utf-8"))
+        assert ts["cause"] == "gateway_restart"
+        assert ts["recovery_action"] == "partial_result"
+
+    @pytest.mark.asyncio
+    async def test_partial_orphan_notice_does_not_promise_a_result(self, agent_root):
+        """The notice is the only thing standing between a fragment and a parent."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from kiro_crew.subagent import SubagentManager
+        from kiro_crew.subagent_persistence import create_agent_folder, write_result_chunk
+
+        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+        create_agent_folder("orphan1n", task="old task", parent_session="dashboard:default")
+        write_result_chunk("orphan1n", "I'll start by opening a scratch worktree")
+        state = {"id": "orphan1n", "task": "old task", "parent_session": ""}
+
+        with patch.object(
+            manager, "_try_inject_orphan_notification", AsyncMock(return_value=False)
+        ):
+            partial = await manager._notify_orphan("orphan1n", state, "partial_result", True)
+            whole = await manager._notify_orphan("orphan1n", state, "result_available", True)
+
+        assert partial is not None and whole is not None
+        assert "Partial output saved at" in partial
+        assert "unfinished fragment" in partial
+        # The complete-result wording must not leak onto the partial notice.
+        assert "Use the read tool to retrieve it." not in partial
+        assert "Use the read tool to retrieve it." in whole
+
+    @pytest.mark.asyncio
+    async def test_a_lost_orphan_with_a_surviving_conversation_says_how_to_resume(
+        self, agent_root, tmp_path, monkeypatch
+    ):
+        """ "No result was captured" is not the whole story.
+
+        A run the restart caught before its first token has no ``result.txt``,
+        but the run's own conversation -- every turn and tool call kiro-cli
+        persisted -- is still on disk, and ``spawn_continue`` resumes it from the
+        run's ``state.json`` after a restart (that is retain-by-default's whole
+        point). A notice that says only that nothing was captured sends the parent
+        re-spawning from scratch and paying for the work twice. The notice carries
+        the run's progress and the resume handle, by the same bar ``SessionMap.get``
+        applies: the ``.json`` present AND a ``.jsonl`` holding a turn.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from kiro_crew.subagent import SubagentManager
+
+        sessions_dir = tmp_path / "kiro-sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr("kiro_crew.session_map._KIRO_SESSIONS_DIR", sessions_dir)
+        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+        create_agent_folder("orphan1r", task="old task", parent_session="dashboard:default")
+        state = {
+            "id": "orphan1r",
+            "task": "old task",
+            "parent_session": "",
+            "session_id": "sid-orphan1r",
+            "turns": 6,
+            "last_tool": "shell",
+        }
+
+        with patch.object(
+            manager, "_try_inject_orphan_notification", AsyncMock(return_value=False)
+        ):
+            gone = await manager._notify_orphan("orphan1r", state, "notification_pending", False)
+            (sessions_dir / "sid-orphan1r.json").write_text("{}", encoding="utf-8")
+            # The .json alone is what SessionMap.get PRUNES: an empty transcript.
+            # Nine bytes: one under the bar SessionMap.get prunes at.
+            (sessions_dir / "sid-orphan1r.jsonl").write_text("123456789", encoding="utf-8")
+            empty = await manager._notify_orphan("orphan1r", state, "notification_pending", False)
+            (sessions_dir / "sid-orphan1r.jsonl").write_text(
+                '{"turn": 1, "text": "hello"}\n', encoding="utf-8"
+            )
+            resumable = await manager._notify_orphan(
+                "orphan1r", state, "notification_pending", False
+            )
+
+        assert gone is not None and empty is not None and resumable is not None
+        assert "No result was captured before the restart." in gone
+        assert "spawn_continue" not in gone, "a pruned conversation must not be offered"
+        assert "spawn_continue" not in empty, "a transcript under the bar is not resumable"
+        assert "6 turn" in resumable and "shell" in resumable
+        assert "spawn_continue" in resumable and "orphan1r" in resumable
+        assert "No result was captured before the restart." in resumable
+
+        # A non-kiro backend keeps its own storage: SessionMap.get hands the sid
+        # out without a file check and the resume decides, so the handle is offered.
+        (sessions_dir / "sid-orphan1r.json").unlink()
+        (sessions_dir / "sid-orphan1r.jsonl").unlink()
+        with patch.object(
+            manager, "_try_inject_orphan_notification", AsyncMock(return_value=False)
+        ):
+            other = await manager._notify_orphan(
+                "orphan1r",
+                {**state, "provider": "other-backend"},
+                "notification_pending",
+                False,
+            )
+        assert other is not None and "spawn_continue" in other
+
+        # A run minted by spawn_continue shares its conversation with the run it
+        # continued: the handle must name that owner, not this run's own id.
+        with patch.object(
+            manager, "_try_inject_orphan_notification", AsyncMock(return_value=False)
+        ):
+            continued = await manager._notify_orphan(
+                "orphan1r",
+                {**state, "provider": "other-backend", "conversation_key": "subagent:orig0001"},
+                "notification_pending",
+                False,
+            )
+        assert continued is not None
+        assert 'spawn_continue(conversation="orig0001"' in continued
+        assert 'conversation="orphan1r"' not in continued
+
+        # ``last_tool`` is the raw command for a shell tool: agent-authored,
+        # multi-line and unbounded. The notice flattens and caps it, so a heredoc
+        # cannot put a blank line into the notice (which would split the completion
+        # card's head/body inside the command) or ship the whole script.
+        heredoc = "cat <<'EOF' > /tmp/x\n\nline one\n" + ("y" * 500) + "\nEOF"
+        with patch.object(
+            manager, "_try_inject_orphan_notification", AsyncMock(return_value=False)
+        ):
+            bounded = await manager._notify_orphan(
+                "orphan1r",
+                {**state, "provider": "other-backend", "last_tool": heredoc},
+                "notification_pending",
+                False,
+            )
+        assert bounded is not None
+        hint = bounded.split("Its conversation survived")[0]
+        assert "\n\n" not in hint
+        assert "cat <<'EOF' > /tmp/x line one" in hint
+        assert "y" * 80 not in hint and "EOF`" not in hint
+
+        # Redaction runs over the WHOLE command before the cap: a credential that
+        # straddles the 80-char boundary would otherwise be cut into a fragment too
+        # short for the PAT rule, which the later whole-message redaction cannot
+        # match, and its prefix would ship in the notice and the digest DM.
+        token = "ghp_" + "a" * 40
+        with patch.object(
+            manager, "_try_inject_orphan_notification", AsyncMock(return_value=False)
+        ):
+            secret = await manager._notify_orphan(
+                "orphan1r",
+                {
+                    **state,
+                    "provider": "other-backend",
+                    "last_tool": "curl " + "x" * 55 + " " + token,
+                },
+                "notification_pending",
+                False,
+            )
+        assert secret is not None
+        assert "ghp_" not in secret, "a PAT cut by the cap must not ship as an unredacted prefix"
 
     @pytest.mark.asyncio
     async def test_dead_pid_no_result_tombstoned_as_notified(self, agent_root):
@@ -1567,7 +1752,8 @@ class TestOrphanNotification:
 
         create_agent_folder("notif1", task="important task", parent_session="dashboard:default")
         write_result_chunk("notif1", "the answer is 42")
-        update_state("notif1", pid=99999)
+        # The run finished writing before the restart, so it recorded completion.
+        update_state("notif1", pid=99999, result_complete=True)
 
         with (
             patch.object(manager, "_is_pid_alive", return_value=False),

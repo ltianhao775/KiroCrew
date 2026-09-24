@@ -297,18 +297,16 @@ def test_record_from_dict_ignores_extra_keys() -> None:
     assert rec.job_id == "y"
 
 
-# ── cron.py: concurrent guard & _job_run_meta ────────────────────────────
+# ── cron.py: concurrent guard & run claim ────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_run_job_returns_false_when_already_executing() -> None:
-    from kiro_crew.cron import CronJob, CronService
+    from kiro_crew.cron import CronJob, CronService, _RunClaim
 
     svc = CronService.__new__(CronService)
     svc._jobs = [CronJob(id="j1", name="test", schedule="* * * * *", message="hi")]
-    svc._executing = {"j1"}
-    svc._job_run_meta = {}
-    svc._running_tasks = {}
+    svc._claims = {"j1": _RunClaim(trigger="scheduled", claimed_at=0.0)}
     svc._loop = None
     svc._file = None
 
@@ -323,22 +321,24 @@ async def test_run_job_stores_manual_trigger_meta() -> None:
 
     svc = CronService.__new__(CronService)
     svc._jobs = [CronJob(id="j1", name="test", schedule="* * * * *", message="hi")]
-    svc._executing = set()
-    svc._job_run_meta = {}
-    svc._running_tasks = {}
+    svc._claims = {}
     svc._loop = None
     svc._file = None
 
-    async def fake_run(job):
-        pass
+    seen: list[object] = []
+
+    async def fake_run(job, claim=None):
+        seen.append(claim)
 
     with patch.object(svc, "_run_job_isolated", side_effect=fake_run), patch.object(
         svc, "_synced_snapshot", lambda include_disabled=True: list(svc._jobs)
     ):
         await svc.run_job("j1")
 
-    assert "j1" in svc._job_run_meta
-    assert svc._job_run_meta["j1"][1] == "manual"
+    (claim,) = seen
+    assert claim.trigger == "manual"
+    # The wrapper's backstop releases the whole claim once the run task is done.
+    assert "j1" not in svc._claims
 
 
 # ── Run-result freshness (stale-summary fabrication regression) ──────────
@@ -389,7 +389,7 @@ class TestRunResultFreshness:
         with patch.object(svc, "_execute", side_effect=_hang), patch(
             "kiro_crew.cron._JOB_TIMEOUT_SECS", 0.05
         ):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "failure"
@@ -418,7 +418,7 @@ class TestRunResultFreshness:
         with patch.object(svc, "_execute", side_effect=_hang), patch(
             "kiro_crew.cron._JOB_TIMEOUT_SECS", 0.05
         ):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "failure"
@@ -431,7 +431,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _produce(job):
+        async def _produce(job, meta=None):
             job.set_run_result("new run output")
             job.last_status = "ok"
             job.last_error = None
@@ -441,7 +441,7 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_produce):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "success"
@@ -461,7 +461,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _script_ok(job):
+        async def _script_ok(job, meta=None):
             job.set_run_result("ok")  # interned literal, same object every run
             job.last_status = "ok"
             job.last_error = None
@@ -471,7 +471,7 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_script_ok):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "success"
@@ -489,7 +489,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _one_char(job):
+        async def _one_char(job, meta=None):
             job.set_run_result("y")
             job.last_status = "ok"
             job.last_error = None
@@ -499,7 +499,7 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_one_char):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "success"
@@ -515,7 +515,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _no_output(job):
+        async def _no_output(job, meta=None):
             job.last_status = "ok"
             job.last_error = None
 
@@ -524,7 +524,7 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_no_output):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "success"
@@ -540,12 +540,12 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _produce(job):
+        async def _produce(job, meta=None):
             job.set_run_result("run one output")
             job.last_status = "ok"
             job.last_error = None
 
-        async def _no_output(job):
+        async def _no_output(job, meta=None):
             job.last_status = "ok"
             job.last_error = None
 
@@ -554,9 +554,9 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_produce):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
         with patch.object(svc, "_execute", side_effect=_no_output):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         row1, row2 = _read_history_rows(tmp_path, job.id)
         assert row1["summary"] == "run one output"

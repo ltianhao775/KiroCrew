@@ -1,5 +1,8 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+// Live `watchCursorAway` subscriptions in this renderer; see that method.
+let cursorAwaySubscribers = 0;
+
 contextBridge.exposeInMainWorld("kirocrew", {
   platform: process.platform,
   isElectron: true,
@@ -70,6 +73,37 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // coordinate, so the renderer cannot hide or move them itself — with the header
   // collapsed they would sit over the reclaimed content.
   setFocusModeChrome: (visible) => ipcRenderer.send("focus-mode-chrome", !!visible),
+  // Focus mode: how far the cursor has travelled OUTSIDE this window, reduced to
+  // the single transition the reveal overlays care about. Call it once the
+  // pointer has left the window with an overlay open; the callback fires exactly
+  // once, with `true` when the cursor is far enough away that the overlay should
+  // be dismissed and `false` when it came back inside instead. Returns an
+  // unsubscribe that also disarms the main-process poll, so nothing polls while
+  // no overlay is waiting on an answer.
+  //
+  // This cannot be done in the page: the renderer gets no mouse events past a
+  // window edge, which is why the reveal's own dismissal has to round-trip
+  // through the main process at all. A plain browser has no bridge here.
+  //
+  // The main process keeps ONE watch per window, but several callers in this
+  // renderer can be waiting at once (the top bar, the rail, a pane relayed
+  // through this frame). So subscriptions are counted here: every subscribe
+  // (re-)arms the watch, and only the last unsubscribe disarms it -- one caller
+  // letting go must not cancel the answer another is still waiting for.
+  watchCursorAway: (cb) => {
+    const handler = (_e, away) => cb(!!away);
+    ipcRenderer.on("focus-mode:cursor-away", handler);
+    cursorAwaySubscribers += 1;
+    ipcRenderer.send("focus-mode-watch-cursor", true);
+    let live = true;
+    return () => {
+      if (!live) return;
+      live = false;
+      ipcRenderer.removeListener("focus-mode:cursor-away", handler);
+      cursorAwaySubscribers -= 1;
+      if (cursorAwaySubscribers === 0) ipcRenderer.send("focus-mode-watch-cursor", false);
+    };
+  },
   // Dev mode IPC: renderer signals main process to show/hide DevTools menu item.
   setDevMode: (enabled) => ipcRenderer.send("dev-mode-changed", !!enabled),
   // Windows custom titlebar: menu surfaces render in the dashboard so hover

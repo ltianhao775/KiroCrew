@@ -63,6 +63,8 @@ export const PROVIDER_LABEL_KEY: Record<string, string> = {
   local: 'pages.settings.sttSettings.provider_local',
   apple: 'pages.settings.sttSettings.provider_apple',
   transcribe: 'pages.settings.sttSettings.provider_transcribe',
+  // No recogniser; also where the backend lands an unknown stored provider.
+  off: 'pages.settings.sttSettings.provider_off',
 }
 
 /** Localised dropdown label for a provider id, falling back to the raw id. */
@@ -87,9 +89,13 @@ export function providerLabel(provider: string): string {
  */
 export const UNAVAILABLE_CODE_KEY: Record<string, string> = {
   stt_disabled: 'pages.settings.sttSettings.unavailable_disabled',
+  stt_provider_off: 'pages.settings.sttSettings.unavailable_provider_off',
   stt_extra_missing: 'pages.settings.sttSettings.unavailable_extra_missing',
   stt_no_wheel_for_platform: 'pages.settings.sttSettings.unavailable_no_wheel',
   stt_import_failed: 'pages.settings.sttSettings.unavailable_import_failed',
+  stt_unsupported_cpu: 'pages.settings.sttSettings.unavailable_unsupported_cpu',
+  stt_load_crashed: 'pages.settings.sttSettings.unavailable_load_crashed',
+  stt_native_probe_crashed: 'pages.settings.sttSettings.unavailable_native_probe_crashed',
   stt_model_missing: 'pages.settings.sttSettings.unavailable_model_missing',
   stt_apple_unsupported: 'pages.settings.sttSettings.unavailable_apple_unsupported',
   stt_apple_needs_toolchain: 'pages.settings.sttSettings.unavailable_apple_needs_toolchain',

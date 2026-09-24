@@ -25,6 +25,8 @@ from kiro_crew.monitoring.github_provider_errors import (
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET,
     MAX_MONITOR_CHECK_IDENTITY_CHARS,
+    PULL_REQUEST_CHECK_FIELDS,
+    PULL_REQUEST_SUPERSEDED_CHECK_FIELD,
     MonitorObservation,
     MonitorObservationStatus,
     ProviderErrorKind,
@@ -49,6 +51,20 @@ _HEAD_REVISION_RE = re.compile(r"^[0-9a-fA-F]{1,128}$")
 _PROBE_TIMEOUT_SECS = 30.0
 _REVIEW_THREAD_PAGE_SIZE = 100
 _REVIEW_THREAD_MAX_PAGES = 10
+# PR-level (issue) comments: the surface a review bot's verdict comment actually
+# lives on. The four verdicts that motivated this feature -- design-review,
+# codex-ai-review, first-principles-review, claude-ai-review -- post as PR-level
+# issue comments, NOT as review threads (measured: over 60 recently-updated open
+# PRs, 50 carry PR-level bot comments and ZERO carry an unresolved non-outdated
+# review thread). ``first:`` not ``last:``: a verdict comment is created once at
+# PR open and rewritten in place forever, so it is among the OLDEST, and
+# ``last:100`` would miss it precisely on a busy PR (measured max 309 comments).
+# Cost is a DIRECT connection, not the nested reviewThreads x comments product:
+# comments(first:100) across 25 subjects in one document is 2,500 nodes at cost 1
+# point, two orders under the 500,000-node ceiling. Paged with the same page-cap
+# shape as the thread read.
+_PR_COMMENT_PAGE_SIZE = 100
+_PR_COMMENT_MAX_PAGES = 10
 _MERGEABLE_SETTLED_STATES = frozenset({"CLEAN", "HAS_HOOKS", "UNSTABLE"})
 _MAX_PULL_REQUEST_NUMBER = 2_147_483_647
 # GitHub bounds one connection page at 100 nodes, so the row budget this adapter
@@ -56,6 +72,17 @@ _MAX_PULL_REQUEST_NUMBER = 2_147_483_647
 _ROLLUP_PAGE_SIZE = 100
 _ROLLUP_MAX_PAGES = 4
 _MAX_CHECK_ROWS = MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET * 4
+# How one group's rows fold to a single state: the most blocking wins. The terminal
+# non-blocking state ranks LAST, so a group holding one displaced row beside a live
+# one reports the live row's state, and a group of only displaced rows reports that
+# it was displaced.
+_CHECK_STATE_PRECEDENCE = (
+    "failed",
+    "pending",
+    "unknown",
+    "passed",
+    PULL_REQUEST_SUPERSEDED_CHECK_FIELD,
+)
 # One document holds many subjects, and a document that grows without a bound is
 # a request that times out rather than a batch. A call with more subjects than
 # this is spent as consecutive queries, the same way a paginated read is.
@@ -83,6 +110,12 @@ reviewThreads(first:PAGE_SIZE,after:$CURSOR){
   nodes{isResolved isOutdated}
 }
 """.replace("PAGE_SIZE", str(_REVIEW_THREAD_PAGE_SIZE)).strip()
+_PR_COMMENTS_SELECTION = """
+comments(first:PAGE_SIZE,after:$CURSOR){
+  pageInfo{hasNextPage endCursor}
+  nodes{body}
+}
+""".replace("PAGE_SIZE", str(_PR_COMMENT_PAGE_SIZE)).strip()
 # GitHub meters GraphQL in points and REST in requests, and the two budgets are
 # SEPARATE. An exhausted point budget therefore refuses every read above while
 # these two paths keep answering, which is the whole reason the fallback exists.
@@ -187,6 +220,10 @@ class GitHubPullRequestResponse:
     checks_complete: bool
     unresolved_review_threads: int
     review_threads_complete: bool
+    #: Digest over the PR-level (issue) comment bodies, or "" when there are none
+    #: or the comment read was incomplete. Set after the supplemental comment
+    #: read via ``replace``; the primary-only and REST paths leave it empty.
+    pr_comment_body_digest: str = ""
 
 
 GitHubPullRequestProbeResult = PullRequestProbeResult
@@ -368,6 +405,7 @@ class GitHubPullRequestProvider:
         graphql_live = [member for member in live if member.raw not in degraded]
         checks = self._checks(gh, host, graphql_live, heads)
         threads = self._review_threads(gh, host, graphql_live)
+        comments = self._pr_comments(gh, host, graphql_live)
         rest_checks = self._checks_rest(
             gh,
             host,
@@ -386,6 +424,7 @@ class GitHubPullRequestProvider:
             unresolved, threads_complete, threads_error = (
                 (0, False, None) if member.raw in degraded else threads[member.raw]
             )
+            comment_digest = "" if member.raw in degraded else comments[member.raw]
             if threads_error is ProviderErrorKind.RATE_LIMITED:
                 # Thread resolution is the ONE signal REST cannot express, so a
                 # refused thread read is reported as an incomplete COUNT rather
@@ -399,6 +438,7 @@ class GitHubPullRequestProvider:
                 checks_complete=checks_complete,
                 unresolved_review_threads=unresolved,
                 review_threads_complete=threads_complete,
+                pr_comment_body_digest=comment_digest,
             )
             results[member.raw] = _build_result(
                 response,
@@ -713,7 +753,7 @@ class GitHubPullRequestProvider:
                 resolved[member.raw] = ((), False, error)
                 continue
             try:
-                normalized = _normalize_checks(rows[member.raw][:_MAX_CHECK_ROWS])
+                normalized = _normalize_checks(rows[member.raw])
             except (KeyError, TypeError, ValueError):
                 resolved[member.raw] = ((), False, ProviderErrorKind.TRANSIENT)
                 continue
@@ -727,7 +767,10 @@ class GitHubPullRequestProvider:
         host: str,
         members: Sequence[_BatchSubject],
     ) -> dict[str, tuple[int, bool, ProviderErrorKind | None]]:
-        """Count every subject's unresolved review threads in shared pages."""
+        """Count each subject's unresolved, non-outdated review threads.
+
+        Returns ``(unresolved_count, complete, error)`` per subject.
+        """
         unresolved: dict[str, int] = dict.fromkeys((m.raw for m in members), 0)
         complete: dict[str, bool] = dict.fromkeys((m.raw for m in members), True)
         errors: dict[str, ProviderErrorKind | None] = dict.fromkeys((m.raw for m in members), None)
@@ -793,7 +836,85 @@ class GitHubPullRequestProvider:
             # so far is real but incomplete, and that is not a provider failure.
             complete[member.raw] = False
         return {
-            member.raw: (unresolved[member.raw], complete[member.raw], errors[member.raw])
+            member.raw: (
+                unresolved[member.raw],
+                complete[member.raw],
+                errors[member.raw],
+            )
+            for member in members
+        }
+
+    def _pr_comments(
+        self,
+        gh: str,
+        host: str,
+        members: Sequence[_BatchSubject],
+    ) -> dict[str, str]:
+        """Digest each subject's PR-level (issue) comment bodies in shared pages.
+
+        Mirrors :meth:`_review_threads` in paging shape -- page size 100, the same
+        page cap, cursor de-duplication and fail-closed handling -- but reports
+        ONLY a digest. PR-level comment completeness has no bearing on
+        review-readiness classification, so a refused, malformed or capped read is
+        never a provider error and never forces a retry: it simply yields "" and
+        emits no condition (fail-closed). The digest is over ALL comment bodies,
+        human and bot alike, because a human editing a comment in place is exactly
+        as invisible to a count and as load-bearing as a bot rewriting a verdict;
+        filtering by author would encode "only bots matter", which is false. Known
+        bounded cost: the tick after the owning session posts its own comment, the
+        digest moves once and wakes once, then dedupes.
+        """
+        bodies: dict[str, list[str]] = {member.raw: [] for member in members}
+        complete: dict[str, bool] = dict.fromkeys((m.raw for m in members), True)
+        pending = list(members)
+        cursors: dict[str, str] = {}
+        seen_cursors: dict[str, set[str]] = {member.raw: set() for member in members}
+        for _ in range(_PR_COMMENT_MAX_PAGES):
+            if not pending:
+                break
+            document, argv_tail = _batch_document(
+                pending,
+                _PR_COMMENTS_SELECTION,
+                cursors=cursors,
+            )
+            payload, _group_failure = self._graphql(gh, host, document, argv_tail)
+            if payload is None:
+                for member in pending:
+                    complete[member.raw] = False
+                break
+            round_errors = _subject_errors(payload, pending)
+            advancing: list[_BatchSubject] = []
+            for index, member in enumerate(pending):
+                node = _alias_pull_request(payload, index)
+                if node is None:
+                    complete[member.raw] = False
+                    continue
+                try:
+                    page_bodies, nodes_complete, has_next, cursor = _pr_comment_page(node)
+                except (KeyError, TypeError, ValueError):
+                    complete[member.raw] = False
+                    continue
+                bodies[member.raw].extend(page_bodies)
+                if member.raw in round_errors or not nodes_complete:
+                    complete[member.raw] = False
+                    continue
+                if not has_next or cursor is None:
+                    continue
+                if cursor in seen_cursors[member.raw]:
+                    complete[member.raw] = False
+                    continue
+                seen_cursors[member.raw].add(cursor)
+                cursors[member.raw] = cursor
+                advancing.append(member)
+            pending = advancing
+        for member in pending:
+            # The page cap was reached with more pages still advertised: an
+            # incomplete read, so no digest.
+            complete[member.raw] = False
+        return {
+            member.raw: (
+                _pr_comment_body_digest(bodies[member.raw]) if complete[member.raw] else ""
+            )
             for member in members
         }
 
@@ -1023,8 +1144,8 @@ def _run_was_cancelled(raw: object) -> bool:
     return raw.get("status") == "COMPLETED" and raw.get("conclusion") == "CANCELLED"
 
 
-def _collapse_superseded_rows(rows: list[object]) -> list[object]:
-    """Drop check rows a newer run of the same check has already replaced.
+def _mark_superseded_rows(rows: list[object]) -> list[tuple[object, bool]]:
+    """Pair every check row with whether a newer run of the same check replaced it.
 
     A host keeps a replaced round's completed rows in the rollup beside the round
     that replaced them. Counting every row then reports a failure that is not live,
@@ -1032,22 +1153,29 @@ def _collapse_superseded_rows(rows: list[object]) -> list[object]:
     supersession is the RUN a row belongs to and whether that run was cancelled --
     never the row's own conclusion, which reaches ``CANCELLED`` inside live runs too.
 
+    EVERY row is returned. A displaced row is flagged, not removed, so the state fold
+    can declassify it while the report still shows it: the rollup carries no lineage
+    edge, so a row deleted here leaves nothing behind to explain why a wake did not
+    happen, and because the fold re-runs identically on every poll that silence never
+    self-corrects. The flag is what stops the row counting; the row is what makes the
+    decision auditable.
+
     Newest is the greatest RUN ID, which increases monotonically. Not a timestamp:
     ``WorkflowRun.createdAt`` resolves only to the second, and two runs of one
     workflow on one head routinely share it -- a workflow firing on both
     ``synchronize`` and ``edited`` produces exactly that, both under the
-    ``pull_request`` event. Ordering on it leaves such a pair tied, both rows survive,
-    and the state fold then reports the replaced one, so a lane whose newest run
-    succeeded reads as a blocking failure. The run id orders them on its own.
+    ``pull_request`` event. Ordering on it leaves such a pair tied, neither row is
+    flagged, and the state fold then reports the replaced one, so a lane whose newest
+    run succeeded reads as a blocking failure. The run id orders them on its own.
 
-    Two rows of ONE run do not replace each other and both survive, because they share
-    one id: a workflow can publish a check run through the Checks API under its own
-    job's display name, so both are live at the same time and dropping either would
-    hide a live failure. No filter on conclusion either -- discarding a cancelled
-    newest run would revive the verdict of the run it superseded.
+    Two rows of ONE run do not replace each other and neither is flagged, because they
+    share one id: a workflow can publish a check run through the Checks API under its
+    own job's display name, so both are live at the same time and declassifying either
+    would hide a live failure. No filter on conclusion either -- declassifying a
+    cancelled newest run would revive the verdict of the run it superseded.
 
-    A row whose run the response did not identify is kept and takes no part in
-    choosing the winner, since it may BE the run that would supersede the others.
+    A row whose run the response did not identify is left unflagged and takes no part
+    in choosing the winner, since it may BE the run that would supersede the others.
     Over-report rather than hide a live failure.
     """
     winner: dict[tuple[object, ...], int] = {}
@@ -1060,33 +1188,41 @@ def _collapse_superseded_rows(rows: list[object]) -> list[object]:
             continue
         if key not in winner or run > winner[key]:
             winner[key] = run
-    kept: list[object] = []
+    marked: list[tuple[object, bool]] = []
     for raw in rows:
         key = _superseded_key(raw)
         if key is None or key not in winner:
-            kept.append(raw)
+            marked.append((raw, False))
             continue
         run = _check_run_of(raw)
-        if not isinstance(run, int) or run == winner[key] or not _run_was_cancelled(raw):
-            kept.append(raw)
-    return kept
+        superseded = isinstance(run, int) and run != winner[key] and _run_was_cancelled(raw)
+        marked.append((raw, superseded))
+    return marked
 
 
 def _normalize_checks(raw: object) -> tuple[GitHubCheck, ...]:
     if not isinstance(raw, list):
         raise ValueError("GitHub check rollup is malformed")
     grouped: dict[tuple[str, ...], tuple[str, list[str]]] = {}
-    for row_index, item in enumerate(_collapse_superseded_rows(raw)):
+    # The row cap is spent AFTER the mark, because the mark needs every FETCHED row to
+    # find each check's newest run -- the paged read has its own cap, so a successor
+    # beyond it is unseen here either way, and this ordering is what stops the cap from
+    # cutting a successor whose predecessor it keeps. That kept row would win its own
+    # key and be reported live, which is the phantom failure the mark exists to remove.
+    marked = _mark_superseded_rows(raw)[:_MAX_CHECK_ROWS]
+    for row_index, (item, superseded) in enumerate(marked):
         if not isinstance(item, Mapping):
             raise ValueError("GitHub check rollup is malformed")
         identity, state, group_key = _normalize_check(item)
+        if superseded:
+            state = PULL_REQUEST_SUPERSEDED_CHECK_FIELD
         if group_key is None:
             group_key = ("independent_check_run", str(row_index))
         _, candidates = grouped.setdefault(group_key, (identity, []))
         candidates.append(state)
     normalized: list[GitHubCheck] = []
     for identity, candidates in grouped.values():
-        state = min(candidates, key=("failed", "pending", "unknown", "passed").index)
+        state = min(candidates, key=_CHECK_STATE_PRECEDENCE.index)
         try:
             check = GitHubCheck(_sanitize_check_identity(identity), state)
         except ValueError:
@@ -1099,14 +1235,21 @@ def _normalize_checks(raw: object) -> tuple[GitHubCheck, ...]:
 
 
 def _bounded_checks(checks: tuple[GitHubCheck, ...]) -> tuple[tuple[GitHubCheck, ...], bool]:
-    """Bound each durable state bucket without letting one state consume the others."""
+    """Bound each live state bucket without letting one state consume the others."""
     bounded: list[GitHubCheck] = []
     complete = True
-    for state in ("failed", "passed", "pending", "unknown"):
+    for state in PULL_REQUEST_CHECK_FIELDS:
         matching = [check for check in checks if check.state == state]
         if len(matching) > MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET:
             complete = False
         bounded.extend(matching[:MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET])
+    # The displaced bucket does NOT report the board incomplete when it grows: a
+    # displaced row carries no verdict, so a head that accumulates many of them still
+    # has every live row measured, and calling it unmeasured would hold a green board
+    # pending on nothing. It is also not cut here. The total row cap already bounds it,
+    # and cutting it twice would spend the bound before the projection can announce the
+    # cut, leaving a saturated list that reads like a whole one.
+    bounded.extend(check for check in checks if check.state == PULL_REQUEST_SUPERSEDED_CHECK_FIELD)
     return tuple(sorted(bounded, key=lambda item: (item.identity, item.state))), complete
 
 
@@ -1431,6 +1574,7 @@ def _build_result(
             checks_complete=response.checks_complete,
             unresolved_review_threads=response.unresolved_review_threads,
             review_threads_complete=response.review_threads_complete,
+            pr_comment_body_digest=response.pr_comment_body_digest,
         ),
         previous_observation=previous_observation,
         response=response,
@@ -1538,8 +1682,30 @@ def _rollup_page(
     return [_flat_check_row(row) for row in rows], revision, total, has_next, cursor
 
 
-def _review_thread_page(node: Mapping[str, Any]) -> tuple[int, bool, bool, str | None]:
-    """Count one page's unresolved threads, ignoring outdated ones."""
+def _body_fingerprint(body: str) -> str:
+    """A FIXED-LENGTH stand-in for one externally-authored comment body.
+
+    This is where the bound lives. A comment body is unbounded third-party text
+    and a paged read accumulates one entry per comment across every page, so
+    retaining the body itself would let a single large comment, or many of them,
+    size the probe's own memory. Hashing at the moment of retention makes what is
+    kept 64 characters wide whatever arrives, and nothing downstream ever sees
+    the body again -- neither the aggregate digest nor the condition key.
+
+    Only the digest of the body is ever needed: the conditions built from these
+    answer "did this change", never "what does it say".
+    """
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _review_thread_page(
+    node: Mapping[str, Any],
+) -> tuple[int, bool, bool, str | None]:
+    """Count one page's unresolved, non-outdated review threads.
+
+    A malformed thread marks the page incomplete so the caller does not trust a
+    count built from a partial read.
+    """
     threads = node["reviewThreads"]
     if not isinstance(threads, Mapping):
         raise ValueError("GitHub review threads are malformed")
@@ -1556,9 +1722,64 @@ def _review_thread_page(node: Mapping[str, Any]) -> tuple[int, bool, bool, str |
         ):
             nodes_complete = False
             continue
-        unresolved += int(not thread["isResolved"] and not thread["isOutdated"])
+        if thread["isResolved"] or thread["isOutdated"]:
+            continue
+        unresolved += 1
     has_next, cursor = _page_cursor(threads.get("pageInfo"))
     return unresolved, nodes_complete, has_next, cursor
+
+
+def _pr_comment_page(node: Mapping[str, Any]) -> tuple[list[str], bool, bool, str | None]:
+    """Read one page of a pull request's PR-level (issue) comments.
+
+    Returns a fixed-length FINGERPRINT per readable non-empty body rather than
+    the body itself: the bound is applied here, at the point of retention, so a
+    309-comment pull request carrying megabytes of review prose costs 64
+    characters per comment to watch.
+
+    An EMPTY body contributes nothing, which is what the aggregate digest has
+    always done with it -- doing it here keeps the pull request with no readable
+    prose emitting no condition, and keeps this surface's unit the COMMENT.
+
+    A malformed comment marks the page incomplete so a digest built from a
+    partial read is not trusted, mirroring the thread page reader.
+    """
+    comments = node["comments"]
+    if not isinstance(comments, Mapping):
+        raise ValueError("GitHub pull request comments are malformed")
+    nodes = comments.get("nodes")
+    if not isinstance(nodes, list):
+        raise ValueError("GitHub pull request comments are malformed")
+    fingerprints: list[str] = []
+    nodes_complete = True
+    for comment in nodes:
+        if not isinstance(comment, Mapping) or not isinstance(comment.get("body"), str):
+            nodes_complete = False
+            continue
+        body = comment["body"]
+        if not body:
+            continue
+        fingerprints.append(_body_fingerprint(body))
+    has_next, cursor = _page_cursor(comments.get("pageInfo"))
+    return fingerprints, nodes_complete, has_next, cursor
+
+
+def _pr_comment_body_digest(fingerprints: list[str]) -> str:
+    """A stable digest over a pull request's PR-level comment bodies.
+
+    Takes per-comment FINGERPRINTS, never bodies, so nothing on the path from
+    read to condition key scales with how much a reviewer wrote.
+
+    Empty when no readable non-empty body was seen, so a pull request with no
+    comments emits no condition. Fingerprints are SORTED before hashing so the
+    page order they arrived in cannot move the digest, mirroring the thread
+    digest.
+    """
+    kept = sorted(fingerprints)
+    if not kept:
+        return ""
+    encoded = json.dumps(kept, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 # ``gh`` stderr classification and the process-wide ``github:api`` cooldown are

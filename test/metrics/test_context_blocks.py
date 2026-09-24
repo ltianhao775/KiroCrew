@@ -13,6 +13,7 @@ from kiro_crew.context_blocks import (
     UNCLASSIFIED_LABEL,
     USER_LABEL,
     attributable_user_chars,
+    measure_prompt,
     split_blocks,
 )
 
@@ -688,3 +689,52 @@ class TestABlockEndsAtItsOwnCloser:
             assert out["hook_context"] == len(block), f"{closer} was not treated as a closer"
             assert out[UNCLASSIFIED_LABEL] == len(orphan)
             assert sum(out.values()) == len(prompt)
+
+
+class TestDomainGrouping:
+    """Every block also carries a ``domain``, which is what a reader groups by.
+
+    One prompt reaches all five, so a mapping that silently sends a whole class
+    to ``background`` is caught here rather than read as a real context shift.
+    """
+
+    def _reading(self):
+        head = (
+            "[CRITICAL RULES]\nbe safe\n[END CRITICAL RULES]\n"
+            "[AGENT SYSTEM PROMPT]\nyou are a crew\n[END AGENT SYSTEM PROMPT]\n"
+            "[Memory]\nremembered thing\n[End of memory]\n"
+            "[Previous chat history for this tab]\nuser: earlier\n[End of history]\n"
+            "[THREAD CONVERSATION HISTORY]\nuser: in thread\n[End of thread history]\n"
+            "[CONVERSATION HISTORY]\nuser: before\n[END CONVERSATION HISTORY]\n"
+            "[CURRENT USER REQUEST]\n"
+        )
+        request = "what now"
+        prompt = head + request + "\n[REPLY FORMAT RULES]\nbe brief\n"
+        span = (len(head), len(head) + len(request))
+        return measure_prompt(prompt, user_span=span, lifecycle="fresh")
+
+    def test_each_block_is_grouped_into_its_own_domain(self):
+        domains = {label: b["domain"] for label, b in self._reading()["blocks"].items()}
+        assert domains[USER_LABEL] == "request"
+        assert domains["critical_rules"] == "contract"
+        assert domains["agent_instructions"] == "contract"
+        assert domains["conversation_replay"] == "replay"
+        assert domains["thread_history"] == "replay"
+        assert domains["history_prefix"] == "replay"
+        assert domains[REPLY_FORMAT_LABEL] == "following_interaction"
+
+    def test_a_recognised_block_outside_the_four_named_cases_is_background(self):
+        # `memory` is a first-class block with its own marker and closer; it is
+        # background because it is none of request/contract/replay/reply-format,
+        # not because the label went unrecognised.
+        assert self._reading()["blocks"]["memory"]["domain"] == "background"
+
+    def test_all_five_domains_are_reachable_from_one_prompt(self):
+        seen = {b["domain"] for b in self._reading()["blocks"].values()}
+        assert seen == {
+            "request",
+            "contract",
+            "replay",
+            "following_interaction",
+            "background",
+        }

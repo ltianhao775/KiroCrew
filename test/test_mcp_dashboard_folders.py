@@ -1653,6 +1653,7 @@ class TestTheVerifiedCallerKeyReachesTheRequest:
         ):
             for tool, args in (
                 ("session_create", {"title": "worker"}),
+                ("session_fork", {"title": "worker"}),
                 ("session_stop", {"target": "peer"}),
                 ("session_read_message", {"target": "peer"}),
             ):
@@ -1827,10 +1828,13 @@ class TestAdvertisedSet:
             "chat_tag_update",
             "chat_tag_assign",
             "session_create",
+            "session_fork",
             "session_stop",
             "session_close",
             "session_send",
             "session_read_message",
+            "session_adopt",
+            "session_release",
         }
 
 

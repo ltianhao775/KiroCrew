@@ -127,6 +127,22 @@ With `slack.reactions_enabled` on, the reaction on your message tracks the phase
 
 Slack ingests attachments on incoming messages and can upload local image references from completed replies. Outbound uploads are limited to 10 files, 10 MiB per file, and 25 MiB total per reply.
 
+## DM Sessions
+
+By default a session is scoped to a Slack **thread**, so every top-level message
+in a DM starts a fresh session and replies arrive as threaded replies. To keep
+one conversation, reply in the thread.
+
+Set `slack.dm_single_session` to `true` to treat each 1:1 DM as one continuous
+session instead: every message in that DM continues the same conversation, and a
+top-level reply posts at channel root so the DM reads as a normal chat. A
+threaded reply joins that same conversation too — in a 1:1 DM a thread is usually
+a layout choice, not a new topic — while the answer still lands inside the thread
+you asked in. Group channels and group DMs are unaffected.
+
+Off by default, because turning it on routes your next DM to a different session
+than the previous one. Existing threads keep working either way.
+
 ## OPTIONS Buttons
 
 When Kiro Crew presents choices, they render as interactive Block Kit buttons.
@@ -143,10 +159,13 @@ inert as a result, and stale allowlist entries are pruned at startup.
 
 `!dashboard` presigned links go to the owner only.
 
-## Channel Monitoring
+## Tracked channels
 
-When `slack.tracking_channels` is configured, Kiro Crew watches for new members
-joining those channels and prompts the owner to allowlist them.
+`slack.tracking_channels` is the allowlist for unattended channel delivery (for
+example, heartbeat reports) and for the startup probe that checks whether each
+tracked channel is readable. It does not grant inbound access or enable member
+allowlisting: Slack remains owner-only, and member-join events do not prompt for
+new users.
 
 ### Channel Activation Modes
 

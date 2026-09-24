@@ -13,12 +13,15 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import secrets
 import time as _time
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, AbstractSet, Any, Literal, overload
 
+from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write, replace_with_retry
 from kiro_crew.chat_attachments import (
     purge_staged_attachments,
@@ -27,6 +30,7 @@ from kiro_crew.chat_attachments import (
 )
 from kiro_crew.history_cache import _FileChangeCacheEntry
 from kiro_crew.jsonl_util import bounded_raw_records
+from kiro_crew.preview_text import speech_preview
 
 if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
@@ -53,11 +57,6 @@ def _history_facade() -> Any:
 def _facade_flock_acquire_timeout() -> float:
     """Read the one timeout with an established facade rebind seam."""
     return float(_history_facade()._FLOCK_ACQUIRE_TIMEOUT_S)
-
-
-def _facade_strip_markdown_preview(text: str) -> str:
-    """Honor post-construction patches of the facade preview helper."""
-    return _history_facade().strip_markdown_preview(text)
 
 
 def drop_persisted_tail_prefix(
@@ -711,12 +710,12 @@ class TranscriptReadProjection:
         """
         path = self._log._path(key)
         try:
-            mtime = path.stat().st_mtime
+            identity = self._log._cache_identity(path.stat())
         except OSError:
-            mtime = None
-        if mtime is not None:
+            identity = None
+        if identity is not None:
             cached = self._log._msg_cache.get(key)
-            if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+            if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
                 return cached[2]
 
         generation = self._log._cache_gen(key)
@@ -778,9 +777,9 @@ class TranscriptReadProjection:
         attempts = _history_facade()._METADATA_READ_ATTEMPTS
         for attempt in range(attempts):
             try:
-                mtime = path.stat().st_mtime
+                identity = self._log._cache_identity(path.stat())
                 cached = self._log._msg_cache.get(key)
-                if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+                if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
                     return cached[2]
                 with open(path, encoding="utf-8") as handle:
                     raw = handle.read()
@@ -822,7 +821,7 @@ class TranscriptReadProjection:
                 and flock_witness is not None
                 and flock_witness == self._log._flock_hold_witness(key)
             ):
-                self._log._msg_cache[key] = (mtime, entry_generation, messages)
+                self._log._msg_cache[key] = (identity, entry_generation, messages)
             return messages
         return []
 
@@ -836,22 +835,22 @@ class TranscriptReadProjection:
         path = self._log._path(key)
         generation = self._log._cache_gen(key)
         try:
-            mtime = path.stat().st_mtime
+            identity = self._log._cache_identity(path.stat())
         except OSError:
             return None
         cached = self._log._msg_cache.get(key)
-        if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+        if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
             return None
         recent_key = self._log._recent_cache_key(key, max_messages, roles)
         recent = self._log._recent_cache.get(recent_key)
-        if recent is not None and recent[0] == mtime:
-            return [dict(message) for message in recent[1]]
+        if recent is not None and recent[0] == identity and recent[1] == self._log._cache_gen(key):
+            return [dict(message) for message in recent[2]]
         tail = self._log._read_tail_messages(path, max_messages, roles)
         formatted = [{"role": message["role"], "content": message["content"]} for message in tail]
         self._log._publish_if_current(
             self._log._recent_cache,
             recent_key,
-            (mtime, formatted),
+            (identity, generation, formatted),
             key=key,
             gen=generation,
         )
@@ -944,8 +943,42 @@ class TranscriptReadProjection:
     ) -> tuple[str, float, bool]:
         """Return the newest preview, the recency epoch, and a stop flag.
 
-        Three values from the tail walk, because the preview text and the two
-        facts about it can come from different rows:
+        Every previewable row counts (the sessions sidebar's read). Three of the
+        four values the tail walk yields; :meth:`last_speech_info` documents it.
+        """
+        preview, epoch, stopped, _exhaustive = self._tail_walk(key, sanitize, speech_only=False)
+        return preview, epoch, stopped
+
+    def last_speech_info(
+        self,
+        key: str,
+        sanitize: Callable[[str], str] | None = None,
+    ) -> tuple[str, float, bool, bool]:
+        """Return the newest SPEECH preview, the recency epoch, a stop flag, and
+        whether the read was EXHAUSTIVE.
+
+        Speech only: rows ``is_speech_row`` accepts (user / assistant, minus
+        system notices and the workflow / sub-agent envelopes). The Crew
+        Members roster is the reader: a member's chat draws only what the
+        member says (``crew-mode.md``, "A crewmate's chat"), so its row's
+        one-line preview must quote the same thing, or a patroller whose chat
+        is empty sits beside a row quoting a shell command. The recency epoch
+        is unchanged by it -- it still reads the newest row, because a patrol
+        IS activity and the roster orders by it.
+        """
+        return self._tail_walk(key, sanitize, speech_only=True)
+
+    def _tail_walk(
+        self,
+        key: str,
+        sanitize: Callable[[str], str] | None,
+        *,
+        speech_only: bool,
+    ) -> tuple[str, float, bool, bool]:
+        """The one tail walk behind both reads above.
+
+        Four values, because the preview text and the facts about it can come
+        from different rows:
 
         - ``preview`` — the newest CONVERSATIONAL row's text, with the trailing
           stop card (and other non-previewable rows) skipped.
@@ -964,17 +997,28 @@ class TranscriptReadProjection:
           event is a stop": a bare resume that only re-arms the same stop card
           leaves the stop newest, so the flag holds until the member says
           something again.
+        - ``exhaustive`` — True when the walk reached the START of the log, so
+          an empty ``preview`` means the member has never said anything (or
+          nothing previewable). False when both tail windows were spent
+          without finding a previewable row while older rows remain unread: a
+          patroller that has written more than the widest window of machinery
+          since it last spoke reads as "" here although its speech exists
+          further back. The Crew Members roster reconcile writes an empty
+          speech-only answer into the append-only member log as the
+          authority, so it MUST NOT do so on a non-exhaustive read -- that
+          would durably erase a quote the transcript still holds.
         """
         # Function-local: dashboard.state imports kiro_crew.history at module
         # scope, which lands back here, so a top-level import would be a
         # cycle. By preview time the dashboard module is long since loaded.
         from kiro_crew.dashboard.state import is_stop_event_row
+        from kiro_crew.dashboard.system_notices import is_speech_row
 
         path = self._log._path(key)
         try:
             size = path.stat().st_size
         except OSError:
-            return "", 0.0, False
+            return "", 0.0, False, False
         windows = (
             self._log._PREVIEW_TAIL_BYTES,
             self._log._PREVIEW_TAIL_BYTES * 16,
@@ -991,15 +1035,16 @@ class TranscriptReadProjection:
                     pass
             return 0.0
 
-        # Recency carried over from a SKIPPED STOP row only. The stop-row skip
-        # below moves the preview TEXT to an earlier row, but a stop IS
+        # Recency carried over from a SKIPPED row: a stop row in both walks,
+        # and every machinery row the speech-only walk skips. The skip moves
+        # the preview TEXT to an earlier row, but a stop or a tool turn IS
         # activity — callers order by this epoch (members.py: "Order by the
         # newest MESSAGE"), and returning the previewed row's timestamp would
-        # sink a just-stopped thread below genuinely older ones. Scoped to
-        # stop rows deliberately: every OTHER non-previewable row (a
-        # zero-width-space-only quiet monitor reply, an empty content row)
-        # keeps the long-standing contract that the timestamp travels with
-        # the row the preview came from (test_preview_text.py pins it).
+        # sink a just-active thread below genuinely older ones. In the plain
+        # walk every OTHER non-previewable row (a zero-width-space-only quiet
+        # monitor reply, an empty content row) keeps the long-standing
+        # contract that the timestamp travels with the row the preview came
+        # from (test_preview_text.py pins it).
         newest_epoch = 0.0
         # Whether the NEWEST real row (first non-metadata row walking back) is
         # a stop card. `None` until the first real row is seen, so the
@@ -1015,7 +1060,7 @@ class TranscriptReadProjection:
                         handle.readline()
                     tail = handle.read().decode("utf-8", errors="replace")
             except OSError:
-                return "", 0.0, False
+                return "", 0.0, False, False
             for line in reversed(tail.splitlines()):
                 line = line.strip()
                 if not line:
@@ -1044,22 +1089,30 @@ class TranscriptReadProjection:
                     if not newest_epoch:
                         newest_epoch = _row_epoch(data)
                     continue
+                # Normalised FIRST: a structured (list) content row is speech if
+                # its text blocks say something, exactly as the slot detail
+                # renders it; handing the raw list to the predicate would read
+                # legacy structured speech as machinery and blank the roster.
                 text = self._log._content_text(data.get("content"))
+                if speech_only and not is_speech_row(data.get("role"), text, data.get("meta")):
+                    # Machinery: skipped for the TEXT, kept for the recency.
+                    if not newest_epoch:
+                        newest_epoch = _row_epoch(data)
+                    continue
                 if not text:
                     continue
-                preview = _facade_strip_markdown_preview(text)
+                # The ONE spelling of a roster preview (strip -> sanitize -> cap),
+                # shared with the live `member/message` writer in state.py so the
+                # roster read never disagrees with what the live path folded.
+                preview = speech_preview(text, sanitize, self._log._PREVIEW_MAX_CHARS)
                 if not preview:
                     continue
-                # Sanitization precedes truncation so a boundary cannot hide a
-                # credential fragment from a caller's pattern-based redactor.
-                if sanitize is not None:
-                    preview = sanitize(preview)
-                if len(preview) > self._log._PREVIEW_MAX_CHARS:
-                    preview = preview[: self._log._PREVIEW_MAX_CHARS].rstrip() + "…"
-                return preview, newest_epoch or _row_epoch(data), bool(newest_is_stop)
+                return preview, newest_epoch or _row_epoch(data), bool(newest_is_stop), True
             if size <= window:
-                break
-        return "", newest_epoch, bool(newest_is_stop)
+                # The window held the whole file: nothing previewable exists.
+                return "", newest_epoch, bool(newest_is_stop), True
+        # Both windows spent, older rows unread: "" is not an answer.
+        return "", newest_epoch, bool(newest_is_stop), False
 
     @staticmethod
     def _content_text(content: object) -> str:
@@ -1110,9 +1163,9 @@ class TranscriptReadProjection:
         for attempt in range(attempts):
             generation = self._log._cache_gen(key)
             try:
-                mtime = path.stat().st_mtime
+                identity = self._log._cache_identity(path.stat())
                 cached = self._log._meta_cache.get(key)
-                if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+                if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
                     return cached[2], True
                 with open(path, encoding="utf-8") as handle:
                     first = handle.readline().strip()
@@ -1143,7 +1196,7 @@ class TranscriptReadProjection:
             self._log._publish_if_current(
                 self._log._meta_cache,
                 key,
-                (mtime, generation, metadata),
+                (identity, generation, metadata),
                 key=key,
                 gen=generation,
             )
@@ -1269,14 +1322,147 @@ class SessionMetadataProjection:
                         exc_info=True,
                     )
                     return False
+                # The reply threads are primary content too (replies cannot be
+                # regenerated, unlike the summary caches below), so the sidecar
+                # takes the same all-or-nothing route: moved aside in ONE rename
+                # before the transcript goes, moved back if the transcript's
+                # unlink fails, purged only once nothing references it. A
+                # best-effort unlink after the transcript could leave the
+                # replies behind while the delete reported success.
+                threads_path = self._log.threads_sidecar_path(key)
+                threads_staged: Path | None = None
+                threads_dir_fd = -1
+                if threads_path.parent.exists() and platform_compat.is_link_or_junction(
+                    threads_path.parent
+                ):
+                    # A link where the sidecar directory should be would carry
+                    # this delete outside the session store: not ours to touch,
+                    # and not a state a delete may report success over.
+                    if staged is not None:
+                        restore_staged_attachments(staged, path.parent, path.stem)
+                    _HISTORY_LOGGER.warning(
+                        "delete_session: thread sidecar directory is a link for key=%s, "
+                        "not deleting",
+                        key,
+                    )
+                    return False
+                # ``Path.exists`` swallows EVERY OSError as "absent", so a sidecar
+                # the process cannot stat (EACCES, EIO, a stale mount) would read
+                # as no sidecar and the transcript would go while the replies
+                # stayed behind. Only a genuine absence lets the delete proceed
+                # without the sidecar step; anything else fails closed.
+                try:
+                    os.lstat(threads_path)
+                except FileNotFoundError:
+                    threads_present = False
+                except OSError:
+                    if staged is not None:
+                        restore_staged_attachments(staged, path.parent, path.stem)
+                    _HISTORY_LOGGER.warning(
+                        "delete_session: cannot inspect the thread sidecar for key=%s, "
+                        "not deleting",
+                        key,
+                        exc_info=True,
+                    )
+                    return False
+                else:
+                    threads_present = True
+                if threads_present:
+                    # A fresh name per attempt, and a move that REFUSES an
+                    # occupied destination: a staged sidecar left behind by an
+                    # earlier delete whose rollback failed (or by a crash) is
+                    # the only copy of those replies, and a same-named move
+                    # aside would silently write over it.
+                    threads_staged = threads_path.with_name(
+                        f"{threads_path.name}.deleting-{os.getpid()}-{secrets.token_hex(4)}"
+                    )
+                    try:
+                        if platform_compat.IS_POSIX:
+                            # Pin the directory and move the leaf relative to it,
+                            # so a parent swapped under us cannot redirect the move.
+                            # link() is the exclusive step (EEXIST on a taken
+                            # name); the unlink of the old name completes the move
+                            # under the per-key lock, so no reader sees two names.
+                            threads_dir_fd = os.open(
+                                threads_path.parent,
+                                os.O_RDONLY
+                                | getattr(os, "O_DIRECTORY", 0)
+                                | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                            os.link(
+                                threads_path.name,
+                                threads_staged.name,
+                                src_dir_fd=threads_dir_fd,
+                                dst_dir_fd=threads_dir_fd,
+                                follow_symlinks=False,
+                            )
+                            try:
+                                os.unlink(threads_path.name, dir_fd=threads_dir_fd)
+                            except OSError:
+                                # Half a move: drop the second name so the
+                                # sidecar is left exactly as it was.
+                                with contextlib.suppress(OSError):
+                                    os.unlink(threads_staged.name, dir_fd=threads_dir_fd)
+                                raise
+                        else:
+                            # os.rename refuses an existing destination on Windows.
+                            os.rename(threads_path, threads_staged)
+                    except OSError:
+                        if threads_dir_fd >= 0:
+                            os.close(threads_dir_fd)
+                        if staged is not None:
+                            restore_staged_attachments(staged, path.parent, path.stem)
+                        _HISTORY_LOGGER.warning(
+                            "delete_session: cannot move the thread sidecar aside for key=%s, "
+                            "not deleting",
+                            key,
+                            exc_info=True,
+                        )
+                        return False
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
                     if staged is not None:
                         restore_staged_attachments(staged, path.parent, path.stem)
+                    if threads_staged is not None:
+                        try:
+                            if threads_dir_fd >= 0:
+                                os.replace(
+                                    threads_staged.name,
+                                    threads_path.name,
+                                    src_dir_fd=threads_dir_fd,
+                                    dst_dir_fd=threads_dir_fd,
+                                )
+                            else:
+                                os.replace(threads_staged, threads_path)
+                        except OSError:
+                            _HISTORY_LOGGER.warning(
+                                "delete_session: thread sidecar left aside at %s for key=%s",
+                                threads_staged,
+                                key,
+                                exc_info=True,
+                            )
+                    if threads_dir_fd >= 0:
+                        os.close(threads_dir_fd)
                     return False
                 if staged is not None:
                     purge_staged_attachments(staged)
+                if threads_staged is not None:
+                    try:
+                        if threads_dir_fd >= 0:
+                            os.unlink(threads_staged.name, dir_fd=threads_dir_fd)
+                        else:
+                            threads_staged.unlink(missing_ok=True)
+                    except OSError:
+                        # Nothing references the staged bytes any more: an
+                        # orphan for an operator, never a served reply.
+                        _HISTORY_LOGGER.warning(
+                            "delete_session: staged thread sidecar %s not removed",
+                            threads_staged,
+                            exc_info=True,
+                        )
+                if threads_dir_fd >= 0:
+                    os.close(threads_dir_fd)
                 for sidecar in (
                     self._log._summary_cache_path(key),
                     self._log._intent_summary_cache_path(key),
@@ -1312,9 +1498,35 @@ class SessionMetadataProjection:
         key: str,
         fields: dict,
         guard: Callable[[dict], bool],
+        *,
+        require_existing: bool = False,
     ) -> bool:
-        """Merge fields only when the locked on-disk metadata passes a guard."""
+        """Merge fields only when the locked on-disk metadata passes a guard.
+
+        *require_existing* additionally refuses a session that has no file at
+        all. The guard cannot express that itself: :meth:`_read_metadata_status`
+        answers ``({}, True)`` for an ABSENT path -- no metadata, reported as
+        readable -- so through the dict the guard receives, a session DELETED
+        since the caller's own read and one whose file carries no metadata line
+        are the same value. :meth:`_update_metadata_locked` then upserts, so any
+        caller whose guard accepts an empty record recreates a deleted session as
+        a metadata-only line with no transcript behind it.
+
+        Decided INSIDE the lock the write takes, which is the whole point: a
+        deletion landing between a checked-then-written pair is precisely the
+        window this closes, so the caller cannot do it for itself beforehand.
+
+        Off by default, per caller rather than for everyone, because creating the
+        line is the documented behaviour some callers depend on:
+        ``bind_session_execution`` publishes a session's execution context and
+        memory store into its record, and a session whose record does not exist
+        yet must still end up carrying the mode it was admitted under. Refusing
+        there would leave a restricted session with no durable record of being
+        restricted, which is worse than the stub this flag prevents.
+        """
         with self._log._locked(key):
+            if require_existing and not self._log._path(key).exists():
+                return False
             metadata, readable = self._log._read_metadata_status(key)
             if not readable or not guard(metadata):
                 return False
@@ -1351,7 +1563,6 @@ class SessionMetadataProjection:
 
         # This hot one-line edit remains crash-atomic without paying for an
         # fsync while every other writer of the session is excluded.
-        import os
         import tempfile
 
         data = "".join(lines).encode("utf-8")

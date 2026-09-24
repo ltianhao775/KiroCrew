@@ -5,22 +5,28 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import functools
-import importlib.util
 import inspect
 import json
 import logging
 import os
-import sys
-import sysconfig
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Mapping, NamedTuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    NamedTuple,
+    overload,
+)
 
 import aiohttp
 from aiohttp import web
 
-from kiro_crew import extras, platform_compat
+from kiro_crew import extras
 from kiro_crew.agent_discovery import (
     SKILL_URI_PREFIX,
     expand_skill_uri,
@@ -32,6 +38,7 @@ from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState
 from kiro_crew.dashboard.token_auth import (
     MAX_SESSION_TTL_SECS,
+    MEMBER_CHAT_PRINCIPAL_KEY,
     _b64url_decode,
     required_peer_key_unverified,
 )
@@ -52,12 +59,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@overload
+def _redact_memory_field(val: dict) -> dict: ...
+
+
+@overload
+def _redact_memory_field(val: list) -> list: ...
+
+
+@overload
+def _redact_memory_field(val: str) -> str: ...
+
+
+@overload
+def _redact_memory_field(val: object) -> object: ...
+
+
 def _redact_memory_field(val: object) -> object:
     """Redact credentials and exfiltration URLs from a memory field.
 
     Lives here (not in ``memory.py``) so handlers that ``memory.py`` itself
     imports from -- e.g. ``cron.py`` -- can share the chain without an import
     cycle.
+
+    SHAPE-PRESERVING for a container, and the overloads above say so rather than
+    flattening every result to ``object``: a caller that hands this a dict and then
+    bounds or indexes the result would otherwise need a cast, which asserts the shape
+    instead of reading it off the function. A dict comes back a dict, a list a list
+    and a string a string.
+
+    NOT shape-preserving for bytes, which is why one type variable would be the wrong
+    tool here: binary is dropped to ``None`` rather than redacted, since it is not
+    text this chain can scan and returning it unread would put an unscanned blob on an
+    egress path. That case falls to the ``object`` overload.
     """
     if isinstance(val, (bytes, memoryview)):
         return None
@@ -97,11 +131,61 @@ SESSION_SEARCH_TEXT_FIELDS: tuple[str, ...] = ("title", "snippet")
 _MAX_BODY_BYTES = 64 * 1024
 
 
+def _declares_json(content_type: str) -> bool:
+    """Is *content_type* a media type whose payload is a JSON document?
+
+    ``application/json`` and the ``+json`` structured-suffix family
+    (``application/merge-patch+json``, ``application/ld+json``) only. The suffix
+    family is in because the app SDK already lets a caller send one -- a scoped
+    API test pins ``application/merge-patch+json`` reaching the gateway -- so
+    refusing it would break a shape the product ships.
+
+    Everything else is out, including ``text/plain`` and an ABSENT header, which
+    aiohttp reports as ``application/octet-stream``. Absent and ``text/plain``
+    are the two spellings that matter: both are CORS *simple* request types, so a
+    cross-origin page sends them with no preflight, and a plain HTML form can
+    emit either. ``application/json`` is not simple, so requiring it means the
+    browser must ask permission before the body is ever delivered.
+    """
+    ct = content_type.strip().lower()
+    return ct == "application/json" or (ct.startswith("application/") and ct.endswith("+json"))
+
+
+def _json_content_type_error(request: web.Request) -> web.Response | None:
+    """415 unless a request that HAS a body declares a JSON content type.
+
+    Checked only when a body is actually present. An empty body carries no JSON
+    document to be misread, so gating it would change the status of a bodiless
+    POST (today a 400 ``invalid_json``, or ``{}`` under ``allow_absent``) while
+    removing no attack primitive.
+
+    415 rather than 400: the body may be perfectly well-formed JSON, and what is
+    refused is the media type the client declared for it.
+
+    Runs AFTER the capped path's Content-Length precheck, so a caller who
+    declared too many bytes still gets 413 rather than being told about its
+    header instead. Both refuse before anything is read, so the order is about
+    which fact the client is told, not about work done.
+    """
+    if not request.can_read_body:
+        return None
+    if _declares_json(request.content_type or ""):
+        return None
+    return web.json_response(
+        {
+            "error": "JSON body requires Content-Type: application/json",
+            "code": "unsupported_media_type",
+        },
+        status=415,
+    )
+
+
 async def read_bounded_json(
     request: web.Request,
     max_bytes: int | None = _MAX_BODY_BYTES,
     *,
     allow_absent: bool = False,
+    require_json_content_type: bool = True,
 ) -> tuple[dict[str, Any] | None, web.Response | None]:
     """Read and parse a JSON *object* request body, capped at *max_bytes*.
 
@@ -111,6 +195,56 @@ async def read_bounded_json(
     list, string, or number for a body that is valid JSON but not an object, and
     a handler that then calls ``.get()`` on the result turns a client mistake
     into a 500.
+
+    A request that HAS a body must also DECLARE a JSON content type, or it is
+    refused 415 ``unsupported_media_type`` before the body is read -- see
+    :func:`_json_content_type_error`. Parsing a ``text/plain`` or
+    content-type-less body as JSON is what lets a cross-origin page deliver a
+    JSON command to a local endpoint with no CORS preflight; requiring the
+    header puts the preflight back. In-tree callers are unaffected: every client
+    that sends a body already sets ``application/json`` (the frontend
+    ``post``/``put``/``patch``/``del`` helpers, ``mcp_core``, ``cron_script``,
+    ``cli_*``, ``pod.runtime``, ``remote_relay``), and the bodiless requests
+    (``app_lifecycle_client``, ``cron_trigger``) are not checked.
+
+    ONE caller opts OUT, and must: ``POST /api/messaging/teams``, where
+    Microsoft's Bot Framework Connector posts activities, passes
+    ``require_json_content_type=False``. Two reasons, and the second is the
+    load-bearing one:
+
+    * Refusing a media type there is a change to an EXTERNAL contract. The route
+      is the single entry in ``token_auth.CSRF_EXEMPT_EXACT_METHODS``, so the
+      Origin barrier does not stand in front of it, and a media-type refusal
+      would be the one refusal that could silently stop an external channel.
+    * The gate cannot be enforced there ANYWAY, and enforcing it costs the byte
+      cap. ``handlers/messaging.py`` forwards this helper's error only when it is
+      a 413, because a verdict derived from body CONTENT must not precede the JWT
+      check. A 415 is therefore dropped, the parsed body is never stashed, and
+      ``teams/client.py``'s fallback re-parses with a bare ``request.json()`` --
+      on a stream this helper returned from WITHOUT reading, so the re-parse is
+      bounded only by the app-wide ``client_max_size`` instead of
+      ``TEAMS_MAX_ACTIVITY_BYTES`` (64 KiB). Opting out keeps the capped read,
+      and with it the stash, so the body is parsed exactly once and never past
+      the cap.
+
+    Which generalizes to the rule any future caller must satisfy: because the
+    415 and the declared-oversize 413 return BEFORE a single byte is read, a
+    caller that does not return every error this helper hands back must pass
+    ``require_json_content_type=False``, or it inherits an unread stream that
+    nothing bounds. Every other caller in the tree returns the error
+    unconditionally (``chat_pins`` rewrites a 400's code and then returns it),
+    so the Teams route is the only opt-out.
+
+    Which also means: this gate is a SECOND barrier, not the first one. Every
+    other unsafe-method ``/api/`` route is already refused cross-origin by
+    ``csrf_middleware``, so on those routes the 415 removes no primitive that
+    was reachable -- it holds if a route is ever added to the CSRF-exempt list,
+    or the Origin barrier is ever mis-scoped, without waiting for that mistake
+    to be exploitable. Extending the refusal to the Teams route is a separate
+    decision about an external contract, not part of this one.
+
+    The other self-authenticating webhook, ``POST /api/hooks/agent``, reads
+    through ``handlers/hooks.py::_json_object`` and is untouched by this.
 
     NOT yet the dashboard's only such guard. Four siblings survive and diverge:
     ``handlers_channel._json_object`` (same ``invalid_json``/``body_not_object``
@@ -165,6 +299,16 @@ async def read_bounded_json(
     """
     if allow_absent and not request.can_read_body:
         return {}, None
+    # A DECLARED oversize keeps its 413, which is the actionable answer for a
+    # caller sending too much and was this helper's answer before the media-type
+    # gate existed. The gate runs next, still before a single byte is read.
+    if max_bytes is not None and request.content_length and request.content_length > max_bytes:
+        return None, web.json_response(
+            {"error": "payload too large", "code": "payload_too_large"}, status=413
+        )
+    ct_error = _json_content_type_error(request) if require_json_content_type else None
+    if ct_error is not None:
+        return None, ct_error
     if max_bytes is None:
         try:
             body = await request.json()
@@ -173,10 +317,6 @@ async def read_bounded_json(
                 {"error": "invalid JSON", "code": "invalid_json"}, status=400
             )
     else:
-        if request.content_length and request.content_length > max_bytes:
-            return None, web.json_response(
-                {"error": "payload too large", "code": "payload_too_large"}, status=413
-            )
         chunks: list[bytes] = []
         received = 0
         async for chunk in request.content.iter_chunked(8192):
@@ -651,7 +791,148 @@ async def private_chat_route_refusal(request: web.Request) -> web.Response | Non
             and slot.memory_store == scope
         ):
             return None
+    # A crew member is admitted to the chat FOLDER and TAG routes it needs to
+    # organise its own worker sessions (session_create with folder=,
+    # chat_folder_file_self, chat_tag_assign), and to the read-only session LIST
+    # its folder tools use to resolve its own slot -- the surface session-control
+    # already opens to the same members. This is COARSE admission only: it lets
+    # the caller reach the handler, whose own per-resource fence
+    # (``chat_folders``/``chat_tags``' ``owner_app``/``folder_principal`` for the
+    # tree, ``member_owns_slot`` for filing/tagging and the session-list filter,
+    # ``_refuse_vocabulary_write`` for the shared tag list) is what decides which
+    # folder or session it may touch or see. Every OTHER ``/api/chat/*`` route
+    # keeps the owner-only refusal below.
+    if await _member_admitted_to_chat_folder_tag_route(request, scope):
+        return None
     return await private_owner_surface_refusal(request, "chat.control")
+
+
+#: Methods a crew-member caller is admitted for on the chat folder/tag routes.
+#: The path is matched STRUCTURALLY by :func:`_admitted_chat_route_methods`
+#: against the exact registered patterns, never by a raw prefix, so a sibling
+#: literal that shares a prefix (``/api/chat/folders/reorder``,
+#: ``/api/chat/tag-columns``) is NOT admitted and keeps the owner-only refusal.
+#:
+#: The admitted VERBS are exactly the ones a member may actually do -- a verb
+#: whose handler has no member fence is not admitted here, so the gate can never
+#: forward a request the fence would have to refuse (or, worse, one no fence
+#: covers). Concretely: a member creates folders and renames/reparents its OWN
+#: (POST + PATCH on the tree), but does NOT delete folders (delete is refused for
+#: every agent principal); it READS the shared tag vocabulary (GET) but does NOT
+#: coin/rename/delete tags (``chat_tags.api_chat_tag_delete`` has no
+#: vocabulary fence at all, so admitting DELETE would let a member remove a
+#: shared tag); it files/tags only its own or created sessions. The per-handler
+#: ownership fence (``owner_app``/``folder_principal`` for the tree,
+#: ``member_owns_slot`` for filing/tagging, ``_refuse_vocabulary_write`` for tag
+#: creation/rename) is still the authoritative gate; this set just refuses to
+#: forward anything outside a member's real capability.
+_MEMBER_CHAT_FOLDERS_METHODS = frozenset({"GET", "POST"})
+_MEMBER_CHAT_FOLDER_ID_METHODS = frozenset({"PATCH"})
+#: The reorder (sibling-position) leg of a folder move; its handler fences every
+#: row to the caller's own folder, so a member renumbers only what it owns.
+_MEMBER_CHAT_FOLDER_REORDER_METHODS = frozenset({"POST"})
+_MEMBER_CHAT_TAGS_METHODS = frozenset({"GET"})
+_MEMBER_CHAT_SLOT_FOLDER_METHODS = frozenset({"PATCH"})
+_MEMBER_CHAT_SLOT_TAGS_METHODS = frozenset({"PUT"})
+#: The session LIST is admitted read-only: the folder/tag MCP tools
+#: (chat_folder_file_self / chat_folder_move_session / chat_folder_tree) read it
+#: to resolve the caller's own slot. ``api_chat_slots`` filters the response for
+#: a member to its own + created sessions (the same set the tree read shows), so
+#: admitting GET here does not widen what a member can enumerate.
+_MEMBER_CHAT_SLOTS_METHODS = frozenset({"GET"})
+
+
+def _admitted_chat_route_methods(path: str) -> frozenset[str] | None:
+    """The methods a member is admitted for on *path*, or ``None`` if not admitted.
+
+    Structural, path-shape matching that mirrors the routes registered in
+    ``routes/sessions.py`` / ``routes/chat.py`` EXACTLY. A trailing single
+    segment on ``/folders/`` is a folder id (``{id}``); the reserved literal
+    ``/api/chat/folders/reorder`` and every ``/api/chat/tag-*`` are deliberately
+    excluded. ``/api/chat/tags/{id}`` is NOT admitted for any method -- a member
+    neither renames nor deletes shared tags -- so its DELETE (which has no
+    vocabulary fence) is refused at the gate. ``/api/chat/slots`` is the session
+    LIST only; a deeper ``/api/chat/slots/<slot>/...`` sub-resource other than
+    the fenced ``/folder`` and ``/tags`` writes is NOT matched here.
+    """
+    if path in ("/api/chat/folders", "/api/chat/folders/"):
+        return _MEMBER_CHAT_FOLDERS_METHODS
+    if path in ("/api/chat/tags", "/api/chat/tags/"):
+        return _MEMBER_CHAT_TAGS_METHODS
+    if path in ("/api/chat/slots", "/api/chat/slots/"):
+        return _MEMBER_CHAT_SLOTS_METHODS
+    if path == "/api/chat/folders/reorder":
+        # The sibling-position half of a folder MOVE. Admitted so a member's
+        # combined reparent (PATCH /folders/{id}) + reorder does not commit only
+        # the reparent and leave positioning half-applied. The reorder handler
+        # fences every row to the caller's own folder (``folder_principal`` +
+        # ``_subtree_holds_foreign_folder``), so a member can renumber only its
+        # own folders.
+        return _MEMBER_CHAT_FOLDER_REORDER_METHODS
+    id_part = _single_id_segment(path, "/api/chat/folders/")
+    if id_part is not None and id_part != "reorder":
+        return _MEMBER_CHAT_FOLDER_ID_METHODS
+    slot = _single_id_segment(path, "/api/chat/slots/", suffix="/folder")
+    if slot is not None:
+        return _MEMBER_CHAT_SLOT_FOLDER_METHODS
+    slot = _single_id_segment(path, "/api/chat/slots/", suffix="/tags")
+    if slot is not None:
+        return _MEMBER_CHAT_SLOT_TAGS_METHODS
+    return None
+
+
+def _single_id_segment(path: str, prefix: str, *, suffix: str = "") -> str | None:
+    """The single path segment between *prefix* and *suffix*, or ``None``.
+
+    Returns the segment only when *path* is exactly ``prefix<seg>suffix`` with a
+    non-empty ``seg`` that itself contains no ``/`` -- so a deeper path (a
+    sub-resource of ``{id}``/``{slot}``) does NOT match the one-segment route.
+    """
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix) :]
+    if suffix:
+        if not rest.endswith(suffix):
+            return None
+        rest = rest[: -len(suffix)]
+    if not rest or "/" in rest:
+        return None
+    return rest
+
+
+async def _member_admitted_to_chat_folder_tag_route(request: web.Request, scope: str) -> bool:
+    """Whether this verified-scope caller is a member reaching an admitted route.
+
+    ``scope`` is the store :func:`internal_memory_scope` already resolved and
+    VERIFIED for this request. Admission is the SHARED member predicate
+    (``session_control.member_admitted_to_scoped_surface``) the session-control
+    gate uses, restricted to the exact ``(method, path shape)`` pairs
+    :func:`_admitted_chat_route_methods` recognises. The config reads inside the
+    predicate are blocking, so the whole test runs off the loop in one hop and
+    fails closed.
+    """
+    allowed = _admitted_chat_route_methods(request.path)
+    if allowed is None or request.method not in allowed:
+        return False
+    from kiro_crew.dashboard import session_control as sc
+
+    session_key = request.headers.get("X-Session-Key", "").strip()
+
+    def _admit() -> bool:
+        return sc.member_admitted_to_scoped_surface(session_key, scope)
+
+    if not await asyncio.to_thread(_admit):
+        return False
+    # Carry the VERIFIED member principal onto the request so the handler's
+    # ownership fence (``chat_folders.folder_principal`` / ``member_owns_slot``)
+    # reads it WITHOUT a second, loop-blocking config read after the body-parse
+    # await -- the same "decide once on the verified scope, carry it" discipline
+    # the session-control gate applies with ``precomputed_ownership_fenced``.
+    try:
+        request[MEMBER_CHAT_PRINCIPAL_KEY] = f"member:{scope}" if scope else ""
+    except TypeError:  # a request double without item assignment
+        pass
+    return True
 
 
 async def member_scope_denied_refusal(operation: str) -> web.Response:
@@ -2694,35 +2975,15 @@ def _probe_persisted_session(slot_name: str) -> tuple[bool, str | None]:
 def _pip_install_channel_available() -> bool:
     """True when ``<gateway python> -m pip install`` can plausibly succeed.
 
-    Three environments make that command a guaranteed dead end, and surfacing
-    it there recreates the press-and-nothing-changes failure this surface
-    exists to avoid:
-
-    - the desktop app's bundled interpreter (see
-      :func:`platform_compat.is_bundled_interpreter`): pip may exist, but a
-      pip install writes into the code-signed bundle — breaking launches and
-      updates — and is discarded on every app update;
-    - an interpreter without the ``pip`` module (uv tool installs, some
-      pipx layouts);
-    - a PEP 668 externally-managed interpreter (distro/brew pythons), where
-      pip refuses to install. Checked only outside a venv: inside one, pip
-      works and deliberately ignores the marker, so a venv returns True.
+    Thin wrapper over :func:`kiro_crew.extras.pip_install_channel_available`,
+    which owns the predicate because it also renders the command the predicate
+    governs -- `doctor` asks the same question about the same command, and two
+    copies of "can pip install here" would drift apart.
 
     Touches the filesystem (``find_spec``, then the marker file), so call it
     from a worker thread on an async path.
     """
-    if platform_compat.is_bundled_interpreter():
-        return False
-    if importlib.util.find_spec("pip") is None:
-        return False
-    # PEP 668 applies to the environment pip would install into. Inside a venv
-    # pip deliberately ignores the marker, and `sysconfig.get_path("stdlib")`
-    # resolves to the BASE interpreter's directory — where distro/brew pythons
-    # place it — so checking it from a venv would misfire on the recommended
-    # install layout (venv on a Debian/Ubuntu/Homebrew python).
-    if sys.prefix != sys.base_prefix:
-        return True
-    return not (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").exists()
+    return extras.pip_install_channel_available()
 
 
 def pip_extra_install_command(extra: str) -> str:

@@ -1276,6 +1276,20 @@ def find_brew() -> str | None:
 #: distinction between "you turned this off" and "this cannot run here".
 CODE_DISABLED = "stt_disabled"
 
+#: The ``stt.provider`` value that selects no recogniser. Spelled here rather
+#: than imported, for the same reason ``dashboard.stt_stream`` spells
+#: ``PROVIDER_LOCAL``: this module keeps ``kiro_crew.config`` off its import path
+#: (every config read here is inside a function, off the event loop).
+#: ``test_stt_provider_off`` pins it equal to ``config.sections.STT_PROVIDER_OFF``.
+STT_PROVIDER_OFF = "off"
+
+#: ``stt.enabled`` is on but ``stt.provider`` is ``off``. Its own code, distinct
+#: from :data:`CODE_DISABLED`, because the two name different controls: the
+#: dashboard renders "switch it on above" for the first, and that is the wrong
+#: remedy for a user whose Enabled toggle is already on -- including everyone
+#: whose unknown stored provider the loader degraded onto ``off``.
+CODE_PROVIDER_OFF = "stt_provider_off"
+
 #: This host cannot run Apple's on-device speech at all (not macOS, or too old a
 #: macOS for the SpeechAnalyzer API). No install fixes it.
 CODE_APPLE_UNSUPPORTED = "stt_apple_unsupported"
@@ -1343,13 +1357,20 @@ def availability_detail(stt_config=None) -> stt.Availability:  # type: ignore[no
         stt_config = KiroCrewConfig.load().stt
     if not stt_config.enabled:
         return stt.Availability(False, CODE_DISABLED, "speech-to-text is turned off")
+    if stt_config.provider == STT_PROVIDER_OFF:
+        # The same "nothing runs" state as above, under a different control. `off`
+        # is also where the loader puts an unknown stored provider, so this is
+        # the sentence that tells such a user which setting to look at.
+        return stt.Availability(
+            False, CODE_PROVIDER_OFF, "the speech provider is set to off; choose a provider"
+        )
     provider = stt_config.provider
     if provider == "transcribe":
         return _aws_availability()
     if provider == "apple":
         return _apple_availability()
-    # ``local`` is the floor every other value degrades to; see
-    # :func:`transcribe_audio` for why that is answered here rather than raised.
+    # ``local``: the loader admits only selectable providers, and ``off`` was
+    # answered above, so this is the resident recogniser and nothing else.
     # The first call links the recogniser's native extension, then ``sys.modules``
     # makes it a dictionary lookup. A FAILED import is not cached, so a gateway
     # that booted without the extra picks up a later install with no restart.
@@ -1457,7 +1478,7 @@ async def transcribe_audio(audio_path: str, stt_config=None) -> str | None:  # t
     if stt_config is None:
         stt_config = await asyncio.to_thread(_load_stt_config)
 
-    if not stt_config.enabled:
+    if not stt_config.enabled or stt_config.provider == STT_PROVIDER_OFF:
         logger.debug("STT disabled in config")
         return None
 
@@ -1473,10 +1494,9 @@ async def transcribe_audio(audio_path: str, stt_config=None) -> str | None:  # t
     elif provider == "apple":
         result = await _transcribe_apple(audio_path, stt_config)
     else:
-        # ``local`` is the floor. The config loader already degrades a retired or
-        # unrecognised provider onto it with a logged reason, and landing here
-        # for anything else transcribes rather than raising, so a hand-edited
-        # config costs the user a different engine and not a dead voice path.
+        # ``local``. The config loader admits only the selectable providers: a
+        # retired name has already become ``local`` and an unknown one ``off``
+        # (refused above), so nothing else reaches this branch.
         result = await _transcribe_local(audio_path, stt_config)
 
     if result:

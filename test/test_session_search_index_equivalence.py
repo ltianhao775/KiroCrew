@@ -57,6 +57,17 @@ def _close_session_search_indexes(monkeypatch):
                     pass
 
 
+@pytest.fixture(autouse=True)
+def _no_index_quiet_window(monkeypatch):
+    """Zero the backfill quiet window: these corpora are written moments before
+    the backfill they feed, so the production deferral would skip every session
+    and the assertions below would be measuring the deferral, not the indexing.
+    """
+    from kiro_crew import history_search
+
+    monkeypatch.setattr(history_search, "_INDEX_QUIET_WINDOW_SECS", 0.0)
+
+
 # Written as escapes because this repository forbids literal Chinese characters in
 # source. CJK is not incidental here: it is the script whose gate is made entirely
 # of 1-character needles, so it exercises the distinct-character column rather than

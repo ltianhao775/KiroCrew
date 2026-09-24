@@ -179,7 +179,7 @@ MAX_TAGS = 16
 # Slug pattern: lowercase letters, digits, hyphens. 1-80 chars. No leading or
 # trailing hyphen. Single-character slugs are allowed for trivial names.
 _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?\Z")
-_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}$")
+_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}\Z")
 _VERSION_FILE_RE = re.compile(r"^v(\d+)\.html$")
 _SLUG_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
@@ -345,6 +345,49 @@ class ArtifactComment:
     # Transient: set on inbound provider mirrors that came back as tombstones so
     # merge_remote_comments can drop the local copy. Never persisted.
     deleted: bool = False
+
+
+def filter_comments_for_forward(
+    comments: _List["ArtifactComment"],
+) -> _List["ArtifactComment"]:
+    """Canonical comment-forwarding filter (comment→chat replay fix).
+
+    The single source of truth for which comments get *forwarded/counted* when
+    an artifact's feedback is sent into chat, so the UI count, the side-panel
+    submit and the agent's read all agree.
+
+    Evaluated at **thread-root granularity**: a reply inherits its root's
+    status, so resolving a thread drops the whole thread rather than leaving
+    replies whose parent is gone.
+
+    A resolved thread is the only thing dropped. Staleness is deliberately NOT
+    inferred from the anchor version: a comment anchored to an older version
+    whose quoted span still exists is live feedback nobody has addressed, and
+    dropping it would silently stop forwarding a thread the sidebar still shows
+    as open. ``anchor_orphaned`` already marks the genuinely stale case (the
+    quote is gone) and the UI warns on it, so that call stays with the human.
+    """
+    by_id = {c.id: c for c in comments}
+
+    def root_of(c: "ArtifactComment") -> "ArtifactComment":
+        # ``thread_id`` names the root directly (a root's is its own id), so it
+        # is the first choice: a nested reply whose *immediate* parent has been
+        # deleted still names its root, which a parent walk cannot reach.
+        root = by_id.get(c.thread_id)
+        if root is not None:
+            return root
+        # Fall back to the parent walk when thread_id resolves to nothing (the
+        # field defaults to ""). The `seen` set terminates a parent cycle; a
+        # parent missing from the list ends the walk, leaving the comment its
+        # own root.
+        seen: set[str] = set()
+        cur = c
+        while cur.parent_id and cur.parent_id in by_id and cur.parent_id not in seen:
+            seen.add(cur.id)
+            cur = by_id[cur.parent_id]
+        return cur
+
+    return [c for c in comments if root_of(c).status != "resolved"]
 
 
 @dataclass

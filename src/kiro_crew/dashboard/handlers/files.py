@@ -86,7 +86,10 @@ from kiro_crew.hooks import (
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
+from kiro_crew.pdf_extract import PdfExtraction, extract_pdf_segments
+from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.platform import wide_content_is_flagged
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
@@ -445,8 +448,9 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
             error="file_not_found_or_access_denied",
         )
         return web.json_response({"error": "File not found or access denied"}, status=404)
-    # Text files: check for sensitive content. Binary files: skip content scan
-    # and validate MIME against the shared BINARY_MIME_ALLOWLIST.
+    # Content is scanned whichever way it decodes: UTF-8 text below, non-UTF-8
+    # bytes through the shared ``binary_content_is_flagged``. Binary must also
+    # carry an allow-listed MIME type.
     try:
         text = raw.decode("utf-8")
         # The owner's grant covers this leg: the card renders in the owner's own
@@ -454,8 +458,20 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
         # already recorded by the tool leg, and the byte handover is recorded by
         # the download route; a third entry for rendering a card would only bury
         # the two that answer a real question.
-        if redact(text) != text and not file_delivery_consent.is_granted(
-            file_delivery_consent.CLASS_OWNER_DASHBOARD
+        #
+        # The store read goes through a thread: ``is_granted`` ends in a
+        # synchronous file read, and a coroutine that waits on storage stalls the
+        # whole gateway. Ordered after the scan so a clean file never reads it.
+        #
+        # The wide pass runs here as well as on the binary branch below: a
+        # credential written at UTF-16/UTF-32 spacing is NUL-interleaved ASCII,
+        # which is valid UTF-8, so it decodes cleanly into this branch and the
+        # contiguous-ASCII detectors in ``redact`` match none of it.
+        flagged = redact(text) != text or await asyncio.to_thread(
+            wide_content_is_flagged, raw
+        )
+        if flagged and not await asyncio.to_thread(
+            file_delivery_consent.is_granted, file_delivery_consent.CLASS_OWNER_DASHBOARD
         ):
             _sel().log_tool_invocation(
                 session_key="api",
@@ -480,6 +496,28 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
             )
             return web.json_response(
                 {"error": f"Binary file type not allowed: {guessed_type or 'unknown'}"}, status=400
+            )
+        # An allow-listed media type is a container, not a guarantee about its
+        # contents, so the same grant decides here as on the text branch above.
+        # Off the event loop: the scan is CPU work over up to the read cap, and a
+        # media file is routinely orders of magnitude larger than a text one.
+        if await asyncio.to_thread(binary_content_is_flagged, raw) and not await asyncio.to_thread(
+            file_delivery_consent.is_granted, file_delivery_consent.CLASS_OWNER_DASHBOARD
+        ):
+            _sel().log_tool_invocation(
+                session_key="api",
+                source="api",
+                tool_name="file_send",
+                tool_kind="notify",
+                outcome="denied",
+                error="binary_credential_detected",
+            )
+            return web.json_response(
+                {
+                    "error": "binary file contains embedded credentials",
+                    "code": "binary_credential_detected",
+                },
+                status=400,
             )
     # Inject the file card into the caller's chat slot so it persists in the
     # correct session. This runs even when ``state._slots`` is empty: a headless
@@ -628,63 +666,92 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
             error=f"safe_read_file_bytes rejected: {filename}",
         )
         return web.json_response({"error": "forbidden"}, status=403)
-    # For text files, scan for sensitive content; binary files served as-is
-    # against the shared BINARY_MIME_ALLOWLIST (deny-by-default).
+    # Content is scanned whichever way it decodes: UTF-8 text here, non-UTF-8
+    # bytes once the MIME allow-list below has admitted the type.
     is_text = True
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         is_text = False
-    if is_text:
-        redacted = redact(text)
-        if redacted != text:
-            # This is where the flagged bytes actually leave for the owner's
-            # browser, so a grant is honoured here AND the handover is audited --
-            # the refusal it replaces was self-evident in the 400, whereas a
-            # successful consented download would otherwise leave no trace.
-            #
-            # TWO conjuncts, and the second is not redundant. This route is absent
-            # from every ``token_auth`` bypass list, which establishes that it needs
-            # AUTHENTICATION -- not that it needs OWNER IDENTITY. A Slack
-            # allow-listed non-owner running ``!dashboard`` authenticates with
-            # ``app == ""`` and ``sub != owner_id``, so ordinary token auth admits
-            # them while ``is_owner_dashboard_request`` does not. Without the owner
-            # conjunct the grant would convert a clean 400-for-everyone into raw
-            # bytes for every authenticated caller -- widening the audience as a
-            # side effect of a control meant to narrow it, and contradicting the
-            # "owner's own authenticated browser" audience this class is scoped to.
-            from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
-                is_owner_dashboard_request,
-            )
 
-            if not (
-                file_delivery_consent.is_granted(file_delivery_consent.CLASS_OWNER_DASHBOARD)
-                and is_owner_dashboard_request(request)
-            ):
+    def _grant_permits_this_handover(granted: bool) -> bool:
+        """Whether the owner's recorded grant releases flagged bytes to THIS caller.
+
+        This is where the flagged bytes actually leave for the owner's browser, so
+        a grant is honoured here AND the handover is audited -- the refusal it
+        replaces was self-evident in the 400, whereas a successful consented
+        download would otherwise leave no trace.
+
+        *granted* arrives already resolved because reading it ends in a
+        synchronous store read, and this closure is called from a coroutine: each
+        caller resolves the grant with ``asyncio.to_thread`` inside its own
+        flagged-content branch, which keeps the read off the gateway event loop
+        and keeps a clean file from touching the store at all. What stays here is
+        the in-memory half of the test.
+
+        TWO conjuncts, and the second is not redundant. This route is absent from
+        every ``token_auth`` bypass list, which establishes that it needs
+        AUTHENTICATION -- not that it needs OWNER IDENTITY. A Slack allow-listed
+        non-owner running ``!dashboard`` authenticates with ``app == ""`` and
+        ``sub != owner_id``, so ordinary token auth admits them while
+        ``is_owner_dashboard_request`` does not. Without the owner conjunct the
+        grant would convert a clean 400-for-everyone into raw bytes for every
+        authenticated caller -- widening the audience as a side effect of a control
+        meant to narrow it, and contradicting the "owner's own authenticated
+        browser" audience this class is scoped to.
+
+        One function for both content kinds on purpose: a text file and a media
+        file carrying the same credential reach the same audience through this
+        route, so a second copy of the test is a second thing to forget.
+        """
+        from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+            is_owner_dashboard_request,
+        )
+
+        return granted and is_owner_dashboard_request(request)
+
+    def _audit_consented_handover() -> None:
+        _sel().log_tool_invocation(
+            session_key="api",
+            source="api",
+            tool_name="file_send",
+            tool_kind="download",
+            outcome="completed",
+            error="sensitive_content_delivered_with_consent",
+        )
+        file_delivery_consent.audit_decision(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            outcome="delivered",
+            detail=f"download: {path.name}",
+        )
+
+    if is_text:
+        # Two passes on this branch, not one. ``redact`` reads the correctly
+        # decoded text, which is the more accurate read of it; the wide pass reads
+        # the raw bytes, because a credential at UTF-16/UTF-32 spacing is
+        # NUL-interleaved ASCII, decodes as valid UTF-8 into this very branch, and
+        # arrives with its characters separated so no contiguous-ASCII detector
+        # matches. Short-circuited, so a file the text pass already flags pays no
+        # second scan.
+        redacted = redact(text)
+        narrow_flagged = redacted != text
+        if narrow_flagged or await asyncio.to_thread(wide_content_is_flagged, raw):
+            granted = await asyncio.to_thread(
+                file_delivery_consent.is_granted, file_delivery_consent.CLASS_OWNER_DASHBOARD
+            )
+            if not _grant_permits_this_handover(granted):
                 _sel().log_tool_invocation(
                     session_key="api",
                     source="api",
                     tool_name="file_send",
                     tool_kind="download",
                     outcome="denied",
-                    error="content_redacted",
+                    error="content_redacted" if narrow_flagged else "wide_credential_detected",
                 )
                 return web.json_response(
                     {"error": "file content was redacted; download aborted"}, status=400
                 )
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="download",
-                outcome="completed",
-                error="sensitive_content_delivered_with_consent",
-            )
-            file_delivery_consent.audit_decision(
-                file_delivery_consent.CLASS_OWNER_DASHBOARD,
-                outcome="delivered",
-                detail=f"download: {path.name}",
-            )
+            _audit_consented_handover()
     safe_name = urllib.parse.quote(path.name, safe="")
     content_type, _ = mimetypes.guess_type(path.name)
     if not content_type:
@@ -702,6 +769,33 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
         return web.json_response(
             {"error": f"Binary file type not allowed: {content_type}"}, status=403
         )
+    if not is_text:
+        # An allow-listed media type says the browser can render these bytes
+        # safely, not that a credential cannot be sitting inside them. Scanned
+        # after the allow-list so a type this route refuses outright is never
+        # scanned, and off the event loop because the scan is CPU work over up to
+        # the read cap and a media file is routinely far larger than a text one.
+        if await asyncio.to_thread(binary_content_is_flagged, raw):
+            granted = await asyncio.to_thread(
+                file_delivery_consent.is_granted, file_delivery_consent.CLASS_OWNER_DASHBOARD
+            )
+            if not _grant_permits_this_handover(granted):
+                _sel().log_tool_invocation(
+                    session_key="api",
+                    source="api",
+                    tool_name="file_send",
+                    tool_kind="download",
+                    outcome="denied",
+                    error="binary_credential_detected",
+                )
+                return web.json_response(
+                    {
+                        "error": "binary file contains embedded credentials; download aborted",
+                        "code": "binary_credential_detected",
+                    },
+                    status=400,
+                )
+            _audit_consented_handover()
     # Inline disposition for media types the browser can render
     disposition = "inline" if any(content_type.startswith(t) for t in _INLINE_DISPOSITION_PREFIXES) else "attachment"
     # SVG can contain scripts — never serve inline on the dashboard origin
@@ -872,9 +966,13 @@ def _gate_upload_file(
                 None,
             )
         text = None  # signal: skip text redaction path
-        # Scan binary content for embedded credentials (e.g. base64-encoded keys in PDFs)
-        binary_text = raw.decode("latin-1")
-        if redact(binary_text) != binary_text:
+        # An allow-listed media type is a container, not a guarantee about its
+        # contents: base64 key material inside a PDF is the case this catches.
+        # Unconditional on this leg. The owner-facing gates weigh a recorded
+        # owner decision against a positive result; this leg has a third-party
+        # audience and so has nothing to weigh, which is why it reads no store at
+        # all -- a property asserted on this function's own source.
+        if binary_content_is_flagged(raw):
             _audit_denial("binary_credential_detected")
             return (
                 web.json_response(
@@ -897,6 +995,24 @@ def _gate_upload_file(
                         {
                             "error": "file content was redacted; upload aborted",
                             "code": "content_redacted",
+                        },
+                        status=400,
+                    ),
+                    None,
+                    None,
+                )
+            # Wide-encoded credentials reach this branch rather than the binary one
+            # above: NUL-interleaved ASCII is valid UTF-8, so the decode succeeds
+            # and ``redact`` sees characters separated by NUL, which matches no
+            # detector. Unconditional here for the same reason the binary scan is:
+            # this leg has a third-party audience and no owner grant to weigh.
+            if wide_content_is_flagged(raw):
+                _audit_denial("wide_credential_detected")
+                return (
+                    web.json_response(
+                        {
+                            "error": "file contains embedded credentials",
+                            "code": "wide_credential_detected",
                         },
                         status=400,
                     ),
@@ -1128,12 +1244,29 @@ async def api_channel_upload_file(request: web.Request) -> web.Response:
 
 
 async def api_upload(request: web.Request) -> web.Response:
-    """POST /api/upload — open native file picker and return selected paths."""
+    """POST /api/upload — open native file picker and return selected paths.
+
+    The dialog binary is resolved from the fixed system directories rather than
+    PATH. A gateway's PATH can lead with an agent-writable directory (a worktree
+    venv's ``bin``, ``~/.local/bin``), so a bare argv name lets a planted shim
+    run with the gateway's environment and outside the sandbox. ``None`` is a
+    refusal, never a fallback to the bare name — that would reinstate the hazard.
+    """
     if sys.platform != "darwin":
         return web.json_response({"error": "File picker is only available on macOS"}, status=400)
 
+    osascript = platform_compat.trusted_system_bin("osascript")
+    if osascript is None:
+        return web.json_response(
+            {
+                "error": "File picker is unavailable on this system",
+                "code": "file_picker_unavailable",
+            },
+            status=501,
+        )
+
     proc = await asyncio.create_subprocess_exec(
-        "osascript",
+        osascript,
         "-e",
         "set f to choose file with multiple selections allowed\n"
         'set out to ""\n'
@@ -1786,9 +1919,23 @@ async def api_screenshot(request: web.Request) -> web.Response:
 
     macOS only — uses built-in screencapture. Linux cloud desktops
     (AL2, headless) don't have a display server so this is unavailable.
+
+    The capture binary is resolved from the fixed system directories rather than
+    PATH, for the reason :func:`api_upload` states, and an unresolvable one is a
+    refusal rather than a bare-name spawn.
     """
     if sys.platform != "darwin":
         return web.json_response({"error": "Screenshot is only available on macOS"}, status=400)
+
+    screencapture = platform_compat.trusted_system_bin("screencapture")
+    if screencapture is None:
+        return web.json_response(
+            {
+                "error": "Screenshot is unavailable on this system",
+                "code": "screenshot_unavailable",
+            },
+            status=501,
+        )
 
     screenshot_dir = _screenshot_dir()
     screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -1796,7 +1943,7 @@ async def api_screenshot(request: web.Request) -> web.Response:
     dest = screenshot_dir / f"screenshot_{ts}.png"
 
     proc = await asyncio.create_subprocess_exec(
-        "screencapture",
+        screencapture,
         "-i",
         str(dest),
         stdout=asyncio.subprocess.DEVNULL,
@@ -4086,11 +4233,22 @@ def _file_write_blocking(path: str, content: str) -> str | None:
 
 async def api_file_write(request: web.Request) -> web.Response:
     """POST /api/file-write — write file content from the markdown panel."""
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
     from kiro_crew.validation import (  # noqa: F811
         FILE_WRITE_SCHEMA,
         ValidationError,
         validate_tool_args,
     )
+
+    # Ahead of the body read and the path probe. This route rewrites any existing
+    # file off the sensitive floor, which includes the steering documents, the
+    # skills and the MCP config whose own write routes are owner-gated; leaving it
+    # open would hand a non-owner (a Slack-allowlisted user's dashboard session) every
+    # file those gates protect. Ahead of the probe too, so whether a path exists is
+    # not a non-owner's to learn from a 404.
+    owner_denied = await require_owner_dashboard_request(request, "file_write")
+    if owner_denied is not None:
+        return owner_denied
 
     # max_bytes=None: the body carries the file's whole contents, which has no
     # defensible byte ceiling.
@@ -4909,11 +5067,11 @@ _GREP_MAX_DIRS_VISITED = 20_000
 
 #: Containers the document pass extracts. Their bytes hold no searchable plain
 #: text, so the text pass skips them and this pass owns them -- no file is
-#: reported twice. ``.pdf`` is deliberately ABSENT: ``pdfplumber`` exposes no
-#: length limit, so its extraction has no memory ceiling this process can
-#: enforce. Both engines then skip a PDF as binary. Restoring it needs a bounded
-#: extractor shared with the identical exposure in ``knowledge/readers.py``.
-_GREP_DOC_EXTS = frozenset({".docx", ".pptx", ".xlsx"})
+#: reported twice. ``.pdf`` is extracted in a memory-bounded child
+#: (``kiro_crew.pdf_extract``), never in this process: ``pdfplumber`` exposes no
+#: length limit, so the only ceiling that can precede its allocation is a kernel
+#: one on a process the gateway can afford to lose.
+_GREP_DOC_EXTS = frozenset({".docx", ".pdf", ".pptx", ".xlsx"})
 #: Largest document the pass will open. Extraction is CPU-bound parsing, so
 #: this is about parse cost, not read cost.
 _GREP_DOC_MAX_BYTES = 25 * 1024 * 1024
@@ -5441,12 +5599,27 @@ def _grep_xlsx_segments(data: bytes, path: str, deadline: float) -> _DocSegments
     return tuple(segments), whole
 
 
+def _grep_pdf_segments(data: bytes, path: str, deadline: float) -> PdfExtraction:
+    """Extract a PDF in the bounded child; the caller reads ``failure`` itself.
+
+    Returned rather than folded into ``_DocSegments`` because a PDF has a third
+    outcome the other formats do not: the child was stopped by its ceiling
+    (memory, CPU, the deadline). That is a document SKIPPED, counted like one
+    over the byte cap, not a parse that ended early -- and ``_grep_docs`` is
+    where skips are counted.
+    """
+    outcome = extract_pdf_segments(data, max_chars=_GREP_DOC_MAX_CHARS, deadline=deadline)
+    if outcome.resource_failure:
+        logger.warning("file_grep: PDF %s skipped: extractor %s", path, outcome.failure)
+    return outcome
+
+
 def _grep_doc_segments(data: bytes, path: str, ext: str, deadline: float) -> _DocSegments:
     """Extract already-authorized document bytes as ``(label, text)`` segments.
 
     The label stands in for a line number: ``slide 7`` for a deck, ``Sheet1 · row
-    12`` for a worksheet. A Word file gets an EMPTY label -- its paragraphs carry
-    no location a reader could navigate to.
+    12`` for a worksheet, ``page 3`` for a PDF. A Word file gets an EMPTY label --
+    its paragraphs carry no location a reader could navigate to.
 
     Parsers receive only ``BytesIO``, so none can reopen the path after the
     safe-read identity check. ``.docx``/``.pptx`` go through
@@ -5454,6 +5627,9 @@ def _grep_doc_segments(data: bytes, path: str, ext: str, deadline: float) -> _Do
     and entity expansion. Its text is requested one character PAST the cap:
     coming back longer is the only way to tell a document cut at the cap from one
     that ended there.
+
+    ``.pdf`` is not handled here: its extractor runs out of process and can be
+    STOPPED rather than merely cut short, which ``_grep_docs`` counts as a skip.
     """
     if ext == ".xlsx":
         return _grep_xlsx_segments(data, path, deadline)
@@ -5482,7 +5658,11 @@ def _grep_doc_segments(data: bytes, path: str, ext: str, deadline: float) -> _Do
 def _grep_docs(
     root: str, query: str, deadline: float, taken: int
 ) -> tuple[list[dict], int, bool]:
-    """Document pass: (hits, documents skipped for budget, truncated).
+    """Document pass: (hits, documents skipped, truncated).
+
+    A document is skipped when it is over the byte cap or when the PDF
+    extractor child was stopped by its ceiling (memory, CPU, the deadline) --
+    either way its text was never read, and the answer is marked partial.
 
     Runs AFTER the text pass inside the SAME deadline, so a tree of large
     documents can never slow a plain-text search down. ``skipped_docs`` is what
@@ -5532,7 +5712,20 @@ def _grep_docs(
             if len(data) > _GREP_DOC_MAX_BYTES:
                 skipped += 1
                 continue
-            segments, whole = _grep_doc_segments(data, full, ext, deadline)
+            if ext == ".pdf":
+                pdf = _grep_pdf_segments(data, full, deadline)
+                if pdf.resource_failure:
+                    # The child hit a ceiling: the document was not read, so it
+                    # is a skip AND the answer is partial. A parse the child
+                    # refused is a settled answer, like a workbook that is not a
+                    # zip, and yields no segments and no flag.
+                    skipped += 1
+                    doc_truncated = True
+                    continue
+                segments = pdf.segments
+                whole = pdf.failure is not None or not pdf.truncated
+            else:
+                segments, whole = _grep_doc_segments(data, full, ext, deadline)
             if not whole:
                 doc_truncated = True
             for label, text in segments:
@@ -5756,7 +5949,25 @@ async def api_file_diff(request: web.Request) -> web.Response:
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, UnicodeDecodeError):
             return {"diff": "", "original": "", "status": "error"}
 
-    result = await asyncio.to_thread(_run)
+    def _run_redacted() -> dict:
+        # Both text fields carry file content, so they pass through the same
+        # redactor ``api_file_read`` applies to the panel's buffer. The panel's
+        # diff view compares that redacted buffer against this ``original``, so
+        # leaving one side raw makes an unchanged credential line render as a
+        # hunk, and serves a secret committed in HEAD that ``/api/file-read``
+        # masks. Redacting the assembled result covers every branch, including
+        # ones added later, and runs in this worker thread rather than on the
+        # event loop because the input is caller-sized.
+        result = _run()
+        # Deliberately NOT truncated first: slicing before the pass can cut a
+        # credential's regex-required tail, and the surviving prefix is then
+        # served as real bytes. Redacting whole text costs an unbounded scan,
+        # which is why it runs here rather than on the event loop.
+        result["original"] = redact(result.get("original", ""))
+        result["diff"] = redact(result.get("diff", ""))
+        return result
+
+    result = await asyncio.to_thread(_run_redacted)
     _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources=f"path={raw_path}")
     return web.json_response(result)
 
@@ -7148,6 +7359,24 @@ def _probe_git_dir(base: str, env: dict) -> tuple[int, str]:
     return rc, stderr
 
 
+def _is_not_a_repo_verdict(probe_stderr: str) -> bool:
+    """True when a failed :func:`_probe_git_dir` is Git's own absence verdict.
+
+    This is the ONE classification contract the status and log routes share:
+    Git's English ``fatal: not a git repository`` line (the probe runs with
+    ``LC_ALL=C``) is confirmed absence and answers ``repo: false``. Every other
+    nonzero probe -- sandbox refusal, spawn failure, dubious ownership,
+    permission failure, timeout, kill, corrupt metadata -- is an operational
+    outage and answers 503, because an empty listing or an empty commit list is
+    exactly what a clean or unborn repository legitimately returns, so spelling
+    an outage that way is indistinguishable from a healthy answer.
+    """
+    return any(
+        line.lstrip().startswith("fatal: not a git repository")
+        for line in probe_stderr.lower().splitlines()
+    )
+
+
 def _run_git_bounded(
     args: list[str],
     cwd: str,
@@ -7446,10 +7675,7 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         # failure remains an operational outage unless the directory vanished.
         probe_rc, probe_err = _probe_git_dir(base, _env)
         if probe_rc != 0:
-            if any(
-                line.lstrip().startswith("fatal: not a git repository")
-                for line in probe_err.lower().splitlines()
-            ):
+            if _is_not_a_repo_verdict(probe_err):
                 return {"repo": False, "files": []}
             return {"_status_unavailable": True}
 
@@ -8047,14 +8273,22 @@ async def api_project_git_log(request: web.Request) -> web.Response:
             # panel can open them.
             "-c", "core.quotePath=false",
         ]
-        _env = {**os.environ, "GIT_ATTR_NOSYSTEM": "1"}
+        _env = {
+            **os.environ,
+            "GIT_ATTR_NOSYSTEM": "1",
+            # The probe's verdict match reads Git's English diagnostic.
+            "LC_ALL": "C",
+            "LANGUAGE": "C",
+        }
 
-        # Check if it's a repo
-        probe_rc, _probe_out, _ = _run_git_bounded(
-            [*_git_cmd, "rev-parse", "--git-dir"], cwd=base, env=_env, timeout=5,
-        )
+        # Same discovery boundary as the status route: Git's not-a-repository
+        # verdict is confirmed absence; any other probe failure is an outage,
+        # not an empty history.
+        probe_rc, probe_err = _probe_git_dir(base, _env)
         if probe_rc != 0:
-            return {"repo": False, "commits": []}
+            if _is_not_a_repo_verdict(probe_err):
+                return {"repo": False, "commits": []}
+            return {"_log_unavailable": True}
 
         # Same filter-driver refusal as the status handler (defense in depth:
         # ``git log`` does not run clean filters, but one uniform invariant --
@@ -8101,6 +8335,10 @@ async def api_project_git_log(request: web.Request) -> web.Response:
         return {"repo": True, "commits": commits}
 
     result = await asyncio.to_thread(_run)
+    # Same vanished-directory re-check as the status route: a project directory
+    # deleted between the isdir gate and the spawn is absence, not an outage.
+    if await asyncio.to_thread(_project_directory_absent, base):
+        return web.json_response({"repo": False, "commits": []})
     _log_refusal = result.pop("_log_filter_refused", "")
     if _log_refusal:
         return web.json_response(
@@ -8115,6 +8353,14 @@ async def api_project_git_log(request: web.Request) -> web.Response:
                 ),
                 "code": "git_log_filter_refused",
                 "cause": _log_refusal,
+            },
+            status=503,
+        )
+    if result.pop("_log_unavailable", False):
+        return web.json_response(
+            {
+                "error": "Couldn't read the commit history.",
+                "code": "git_log_unavailable",
             },
             status=503,
         )

@@ -39,7 +39,11 @@ from typing import Any, Callable, NoReturn, Optional
 from kiro_crew import platform_compat
 from kiro_crew.executors import configure_default_executor, subprocess_executor
 from kiro_crew.jsonl_util import bounded_records, rotate_jsonl_at
-from kiro_crew.mcp_caller import CallerContext, _parent_pid
+from kiro_crew.mcp_caller import (
+    POOLING_REQUIRES_TENANT_NONCE,
+    CallerContext,
+    _parent_pid,
+)
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.mcp_gateway.hashing import (
@@ -814,6 +818,39 @@ def must_degrade_unshareable(poolable: bool, capabilities: list[str]) -> bool:
     which is what it wanted.
     """
     return not poolable and "poolable_ack" not in capabilities
+
+
+def must_degrade_nonce_blind(
+    server: str, poolable: bool, capabilities: list[str]
+) -> bool:
+    """Should this connection abandon the gateway rather than pool without a nonce?
+
+    The mirror of :func:`must_degrade_unshareable`. That one guards the stub that
+    asked for a PRIVATE backend; this one guards the stub that asked for a POOLED
+    one, and only for the servers in
+    :data:`~kiro_crew.mcp_caller.POOLING_REQUIRES_TENANT_NONCE`. Such a backend
+    keeps per-tenant state for callers the gateway cannot name and separates it by
+    the per-connection nonce, so one pooled process serving several unnamed
+    connections holds a single namespace for all of them as soon as no nonce
+    arrives.
+
+    Nothing downstream can catch that. At the backend an absent tenant block is
+    equally what a 1:1 topology with no gateway looks like, where the per-process
+    fallback separates sessions exactly as far as they really are separate. The
+    handshake is the one place the two are distinguishable, because the daemon
+    actually serving the frames says whether it mints a nonce.
+
+    Degrading is not a consolation prize: an exclusive backend is the topology in
+    which that per-process fallback is correct, so the separation the pooled path
+    would have lost is restored rather than approximated.
+
+    Scoped to the named servers deliberately. Every other pooled stub is unharmed
+    by a nonce-blind daemon, and degrading all of them would spend one process per
+    session on any host whose daemon outlived a package upgrade.
+    """
+    if server not in POOLING_REQUIRES_TENANT_NONCE:
+        return False
+    return poolable and "tenant_nonce" not in capabilities
 
 
 class FallbackRequestedError(Exception):
@@ -2070,6 +2107,27 @@ async def _reconnect(
             )
             return None
 
+        # The mirror case on this path, refused for the reason the check above is
+        # refused here rather than degraded: ``initialize`` is long consumed, so
+        # no clean per-session exec remains. It belongs on the reconnect path at
+        # all because the endpoint a reconnect binds to need not be the
+        # generation that answered the first register -- a nonce-capable daemon
+        # can be replaced by an adopted one between two attempts, and pooling on
+        # without a nonce would put every unnamed co-tenant of this server in one
+        # namespace.
+        if must_degrade_nonce_blind(
+            str(payload.get("server_name") or ""), poolable, _caps
+        ):
+            await _safe_close(writer)
+            logger.warning(
+                "stub reconnect: the new gateway generation mints no "
+                "per-connection tenant nonce and this server separates unnamed "
+                "co-tenants by it; refusing rather than pooling without it "
+                "pool=%s",
+                pool_label,
+            )
+            return None
+
         if "ensure_backend" in _caps:
             # Admission BEFORE the replay, as at cold start. Without it the
             # replayed ``initialize`` is the daemon's first frame from this
@@ -2706,6 +2764,28 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             "handshake: gateway did not advertise poolable_ack and this server is "
             "not shareable; falling back to a per-session exec rather than risk "
             "being pooled pool=%s",
+            pool_label,
+        )
+        await _safe_close(writer)
+        fallback_exec(args)
+        return 1  # unreachable
+
+    # The mirror case: pooling ASKED FOR, behind a daemon that mints no
+    # per-connection nonce. This server separates the co-tenants the gateway
+    # cannot name by that nonce, so without it one pooled backend holds one
+    # namespace for all of them -- and the backend cannot tell that from the 1:1
+    # topology where its per-process fallback is right. Same reachability as
+    # above: the manager adopts any daemon answering ``pong``. Degrading is the
+    # honest answer rather than a loss, because an exclusive backend is exactly
+    # where that per-process fallback separates sessions correctly, and
+    # ``initialize`` is still unread so the exec is clean.
+    if must_degrade_nonce_blind(args.server, bool(args.poolable), _caps):
+        reason = "gateway mints no per-connection tenant nonce"
+        await alog_fallback(reason, payload["stub_uuid"], pool_label, args)
+        logger.warning(
+            "handshake: gateway did not advertise tenant_nonce and this server "
+            "separates unnamed co-tenants by it; falling back to a per-session "
+            "exec rather than pooling without it pool=%s",
             pool_label,
         )
         await _safe_close(writer)

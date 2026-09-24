@@ -473,6 +473,8 @@ interface ChatInputProps {
   onUploadFiles?: (files: File[]) => void
   /** Whether file actions are in progress */
   uploading?: boolean
+  /** Abort the upload in flight; turns the upload spinner into a cancel control */
+  onCancelUpload?: () => void
   /** Pending file paths (images + non-images) for preview strip */
   pendingFiles?: string[]
   /** Pending folder references for the preview strip: RELATIVE paths with trailing slash, derived from `@rel/` composer tokens (a path reference handed to the agent, not an upload) */
@@ -529,8 +531,33 @@ interface ChatInputProps {
    * backend's served default), not a pin. The chip then carries the same
    * ` · default` marker and explanatory tooltip the agent chip uses for its
    * inherited case, so a served model does not read as something the user
-   * chose. A pinned chip has nothing to explain. */
+   * chose. A pinned chip has nothing to explain. Yields to
+   * `modelIsJevRouted` below, which describes the same unpinned slot more
+   * specifically. */
   modelIsInheritedDefault?: boolean
+  /**
+   * True when THIS turn's model is Jev's to pick: the slot names no model
+   * (`auto`, or the empty string a freshly dispatched slot carries) and the Jev
+   * preview is on, so `model.route` puts the turn in a tier and runs it on that
+   * tier's model.
+   *
+   * The chip then names the POLICY (`Auto (Jev)`) in place of `modelName`, rather
+   * than an id with a marker beside it. A routed session's model changes from turn
+   * to turn, so naming one makes a chip that reads like a pin and is stale by the
+   * next reply; the model a given turn actually ran on is on that turn's routing
+   * receipt, which is per-turn and cannot go stale. It is also the exact label the
+   * picker highlights for this slot (`jevRouteShownModel`), so the chip and the
+   * open menu say the same word for the same choice.
+   *
+   * Hosts compute it from the SAME `jevRouteOffered()` the picker's row is drawn
+   * from (`lib/jevRoute.ts`) against the slot's raw `model`, which is what the
+   * routing gate reads. One condition, so the chip cannot say Auto for a turn that
+   * routed, nor Auto (Jev) for one that did not.
+   *
+   * Wins over `modelIsInheritedDefault`: both describe a slot that pinned nothing,
+   * and this one names WHO picks instead, which is the more specific fact and the
+   * one that costs money. */
+  modelIsJevRouted?: boolean
   /**
    * Picker openers (agent, model, project, and `onSessionControlClick` below).
    * Each hands the host the chip's click-time rect AND the chip element itself:
@@ -644,6 +671,13 @@ interface ChatInputProps {
   /** Identity of the transcript row the follow-up options were derived from.
    *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
   followUpSourceKey?: string | null
+  /** Labels whose follow-up dispatch is outstanding. Only a host that actually
+   *  dispatches a chip passes this. */
+  followUpPendingOptions?: ReadonlySet<string> | null
+  /** Labels whose click the dispatch would refuse; this is what dims. */
+  followUpRefusedOptions?: ReadonlySet<string> | null
+  /** Detail of the last failed chip dispatch, or null when none failed. */
+  followUpError?: string | null
   /** Collapsed paste blocks backing `⌜🗒 Pasted …⌟` tokens in `value`. */
   pasteBlocks?: PasteBlock[]
   /** Replace the current list of paste blocks (add/remove). */
@@ -907,6 +941,7 @@ function ChatInput({
   onScreenshot,
   onUploadFiles,
   uploading = false,
+  onCancelUpload,
   pendingFiles = [],
   pendingDirs = [],
   resizedInfo,
@@ -922,6 +957,7 @@ function ChatInput({
   agentLabel,
   agentIsInheritedDefault,
   modelIsInheritedDefault,
+  modelIsJevRouted,
   agentSource,
   modelName,
   onAgentClick,
@@ -968,6 +1004,9 @@ function ChatInput({
   quickSend,
   followUpLayout,
   followUpSourceKey,
+  followUpPendingOptions,
+  followUpRefusedOptions,
+  followUpError,
   pasteBlocks = [],
   onPasteBlocksChange,
   showFullPastes = false,
@@ -1998,6 +2037,43 @@ function ChatInput({
         <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.collapse_composer')}</div>
         <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.collapse_composer_desc')}</div>
       </div>
+    </button>
+  ) : null
+  /**
+   * The exit from an upload in flight, and the reason it REPLACES the attach
+   * control rather than sitting beside it.
+   *
+   * The bottom icon row is already at `max-two-buttons-per-row`: two blocking
+   * findings drove Sketch off it and into an overflow precisely to keep it at
+   * two (see `collapseMenuRow` above), so a third sibling here would regrow the
+   * row the same rule just shrank, on the narrowest viewport, in both layouts.
+   *
+   * Replacing costs nothing, because the attach control is already inert while
+   * `uploading`: its `htmlFor` is dropped and the pointer branch is `disabled`.
+   * So the slot holds no action to displace, and the thing the user is already
+   * looking at while they wait becomes the thing they press to stop.
+   *
+   * The spinner is kept, but BEHIND the glyph rather than as a second icon.
+   * A 9px X inside an 18px spinner read to a blind reviewer as "a 'lines'
+   * icon, the kind that usually means a menu", and they said they would press
+   * it to find out what it was, which discards minutes of a 512 MB upload with
+   * no undo. So the X carries the meaning at a legible size with a destructive
+   * hover tint, and the liveness is a faint ring that cannot be mistaken for
+   * the glyph. The tint matters on the pointer path for a second reason: this
+   * slot was inert mid-upload on main, so a click that used to do nothing now
+   * ends the transfer, and the control has to stop reading as the attach
+   * button's spot doing attach things.
+   */
+  const uploadCancelControl = uploading && onCancelUpload ? (
+    <button
+      type="button"
+      onClick={onCancelUpload}
+      className="relative w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all bg-transparent border-none text-muted hover:text-danger hover:bg-danger/10"
+      aria-label={i18nT('components.chatInput.cancel_upload')}
+      title={i18nT('components.chatInput.cancel_upload')}
+    >
+      <Loader2 size={28} strokeWidth={1.5} className="animate-spin absolute inset-0 m-auto opacity-30" />
+      <X size={16} strokeWidth={2.5} />
     </button>
   ) : null
   /**
@@ -3546,7 +3622,7 @@ function ChatInput({
 
       {/* Ghost follow-up bubbles floating above input */}
       {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
-          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} />
+          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} pendingOptions={followUpPendingOptions} refusedOptions={followUpRefusedOptions} error={followUpError} />
       )}
 
       {/* Tip / folder-suggestion band — LAST above the composer so it always
@@ -4079,7 +4155,7 @@ function ChatInput({
           />
         )}
 
-        {optimizing && <span className="absolute inset-0 flex items-start px-4 pt-3 text-sm text-white font-medium pointer-events-none z-10 bg-black/60 rounded-2xl"><Sparkles size={14} className="inline mr-1 text-warn" /> {i18nT('components.chatInput.optimizing_prompt')}</span>}
+        {optimizing && <span className="optimize-overlay absolute inset-0 flex items-center justify-center backdrop-blur-md pointer-events-none z-10 rounded-2xl"><span className="optimize-overlay-pill inline-flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium text-text"><Sparkles size={15} className="text-accent animate-pulse shrink-0" /> {i18nT('components.chatInput.optimizing_prompt')}</span></span>}
         {/* The textarea fallback is seamless for typing (draft intact), but the
             failure itself must be user-visible, not only a console line: the
             person who opted into the editor should know they are no longer in
@@ -4235,7 +4311,7 @@ function ChatInput({
           <div className="flex items-center gap-0.5 min-w-0">
             {onUploadFiles && (
               <div className="relative shrink-0" ref={plusWrapRef}>
-                {directFilePicker ? (
+                {uploadCancelControl || (directFilePicker ? (
                   /* Association is intentionally absent while uploads disable the control. */
                   <label
                     htmlFor={uploading ? undefined : fileInputId}
@@ -4259,7 +4335,7 @@ function ChatInput({
                   >
                     {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} className={`transition-transform ${plusOpen ? 'rotate-45' : ''}`} />}
                   </button>
-                )}
+                ))}
                 {!directFilePicker && plusOpen && plusRect && createPortal(
                   <div
                     ref={plusMenuRef}
@@ -5090,22 +5166,29 @@ function ChatInput({
               // reads exactly like a pin. A pinned chip keeps the plain hint.
               title={isRunning
                 ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsInheritedDefault
-                  ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                  : i18nT('components.chatInput.model_2', { name: modelName })}
+                : modelIsJevRouted
+                  ? i18nT('pages.chatPage.model_auto_jev_description')
+                  : modelIsInheritedDefault
+                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                    : i18nT('components.chatInput.model_2', { name: modelName })}
               aria-label={isRunning
                 ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-                : modelIsInheritedDefault
-                  ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-                  : i18nT('components.chatInput.model_2', { name: modelName })}
+                : modelIsJevRouted
+                  ? i18nT('pages.chatPage.model_auto_jev_description')
+                  : modelIsInheritedDefault
+                    ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+                    : i18nT('components.chatInput.model_2', { name: modelName })}
             >
               <span className="truncate max-w-[180px]">
-                {modelName}
+                {modelIsJevRouted ? i18nT('components.modelDropdownList.auto_jev') : modelName}
               </span>
-              {modelIsInheritedDefault && (
-                // Outside the truncating span: a long provider-prefixed id must
-                // ellipsize its own tail, never the marker that tells a served
-                // default apart from a pin.
+              {/* Outside the truncating span: a long provider-prefixed id must
+                  ellipsize its own tail, never the marker beside it. A routed chip
+                  takes NO marker -- its label is already the policy, and a second
+                  word next to it would be a marker on a name that is not a model.
+                  So the two unpinned states differ by KIND (a policy vs an id with
+                  a marker), not by two adjectives a reader has to tell apart. */}
+              {!modelIsJevRouted && modelIsInheritedDefault && (
                 <>
                   <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
                   <span className="opacity-60 shrink-0">{i18nT('components.agentSelector.default')}</span>

@@ -887,7 +887,13 @@ export default function ProjectScaffolderPage() {
                 <SendBtn onClick={create} disabled={busy !== '' || cannotConfirm || (selectedCount === 0 && scan.root_existing)}>
                   {busy === 'create'
                     ? i18nT('apps.projectScaffolder.projectScaffolderPage.creating')
-                    : i18nT('apps.projectScaffolder.projectScaffolderPage.create_folders')}
+                    // Nothing ticked issues the same root-only create the
+                    // empty-scan branch issues, so it reads the same way there
+                    // rather than promising folders plural. The gated case below
+                    // is excluded: it creates nothing, and its reason line says so.
+                    : selectedCount === 0 && !scan.root_existing
+                      ? i18nT('apps.projectScaffolder.projectScaffolderPage.create_the_root_folder_only')
+                      : i18nT('apps.projectScaffolder.projectScaffolderPage.create_folders')}
                 </SendBtn>
               </div>
               {selectedCount === 0 && scan.root_existing && (

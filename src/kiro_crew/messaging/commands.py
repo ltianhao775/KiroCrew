@@ -61,6 +61,7 @@ from kiro_crew.cron import (
     format_schedule,
     get_local_tz,
 )
+from kiro_crew.messaging.queue_drain import entries_queued_by
 from kiro_crew.messaging.queue_receipt import ReceiptQueue, ReceiptSurface
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.security import redact
@@ -79,8 +80,9 @@ logger = logging.getLogger(__name__)
 #: Sent when the cooperative cancel reached a live turn.
 STOP_REPLY_CANCELLED = "🛑 Stopped."
 
-#: Sent when there was no live turn -- the queue is still cleared, and saying so
-#: is what distinguishes "nothing to stop" from "the stop did not work".
+#: Sent when there was no live turn -- the caller's own queued messages are still
+#: cleared, and saying so is what distinguishes "nothing to stop" from "the stop did
+#: not work".
 STOP_REPLY_IDLE = "🛑 Nothing was running — queue cleared."
 
 
@@ -109,11 +111,29 @@ async def stop_running_turn(
     *,
     queue: ReceiptQueue,
     surface: ReceiptSurface,
+    owner: str,
 ) -> str:
-    """Abort the in-flight turn, drop the queue, finalize the receipt.
+    """Abort the in-flight turn, drop the caller's queued messages, finalize the receipt.
 
     Returns the reply text the channel should send; the send itself is the only
     address-shaped part and stays with the caller.
+
+    **The queue clear is the CALLER's, not the session's.** ``owner`` is the token
+    :func:`kiro_crew.messaging.queue_drain.owner_token` builds for the person who typed
+    the command, and only entries carrying it are dropped. Under
+    ``messaging.dm_scope = "unified"`` ``build_dm_session_key`` reduces a direct chat's
+    bucket to ``unified:{agent}``, dropping the channel and the user, so every
+    allow-listed person's DM on every transport resolves to one key and one queue: a
+    whole-queue clear here discards messages other people sent and are still owed an
+    answer to, and flips their receipt to a cancellation they never asked for. The
+    argument is REQUIRED, with no default, so a channel wired up later cannot inherit
+    that by leaving it out; a channel that genuinely cannot name its principal passes
+    ``""``, which clears nothing rather than everything.
+
+    The RUNNING turn is still cancelled whoever it belongs to, which is what the caller
+    asked for and what every transport's Stop has always done. Telling one person's turn
+    from another's is not possible from here: a session records the asyncio task holding
+    it, not the sender the task is answering.
 
     **The cancel is cooperative before it is fatal.** ``cancel(wait_ack_timeout=0)``
     writes an ACP ``session/cancel`` notification and returns without waiting, so
@@ -150,8 +170,8 @@ async def stop_running_turn(
                     exc_info=True,
                 )
     async with queue.lock:
-        sessions.clear_queue(session_key)
-        await queue.finish_cancelled_locked(session_key, surface)
+        sessions.clear_queue(session_key, entries_queued_by(owner))
+        await queue.finish_cancelled_locked(session_key, surface, owner)
     return STOP_REPLY_CANCELLED if cancelled_turn else STOP_REPLY_IDLE
 
 

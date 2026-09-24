@@ -29,11 +29,17 @@ function stubElectron() {
       this.loadedUrl = "";
       this.shown = false;
       this._events = {};
+      this._webContentsEvents = {};
       this.sent = [];
       // did-finish-load fires synchronously so the activation handshake in
-      // createOverlayFor runs and its set-active sends are observable.
+      // createOverlayFor runs and its set-active sends are observable. Other
+      // navigation events stay controllable for the error-document tests.
       this.webContents = {
-        on: (ev, cb) => { if (ev === "did-finish-load") cb(); },
+        on: (ev, cb) => {
+          this._webContentsEvents[ev] = cb;
+          if (ev === "did-finish-load") cb();
+        },
+        emit: (ev, ...args) => this._webContentsEvents[ev]?.(...args),
         send: (ch, ...args) => this.sent.push({ ch, args }),
       };
       created.push(this);
@@ -46,6 +52,7 @@ function stubElectron() {
     once(ev, cb) { this._events[ev] = cb; }
     on(ev, cb) { this._events[ev] = cb; }
     showInactive() { this.shown = true; }
+    hide() { this.shown = false; }
     isVisible() { return this.shown; }
     isDestroyed() { return this.destroyed; }
     destroy() { this.destroyed = true; }
@@ -292,6 +299,158 @@ test("no overlay is opened before a gateway origin is known", () => {
   }
 });
 
+test("a gateway error document stays hidden until a healthy reload", () => {
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    overlay.setOverlayTarget("http://localhost:5476", "stale");
+    overlay.openPetWindow();
+    const win = stub.created[0];
+    assert.strictEqual(win.shown, true, "the healthy companion starts visible");
+    win.setIgnoreMouseEvents(false);
+
+    win.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      403,
+    );
+    win.webContents.emit("did-finish-load");
+    assert.strictEqual(win.shown, false, "the full-display error document stays hidden");
+    assert.deepStrictEqual(
+      win.ignoreMouse,
+      { ignore: true, opts: { forward: true } },
+      "a failed full-display overlay must stop intercepting clicks immediately",
+    );
+    assert.strictEqual(overlay._hasBlankedOverlay(), true, "the failed overlay is recoverable");
+
+    overlay.setOverlayTarget("http://localhost:5476", "fresh");
+    assert.strictEqual(overlay.rearmBlankedCompanionWindows(), 1, "only the failed overlay reloads");
+    assert.match(win.loadedUrl, /[?&]token=fresh(?:&|$)/, "the reload uses the accepted credential");
+
+    win.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      200,
+    );
+    win.webContents.emit("did-finish-load");
+    assert.strictEqual(win.shown, true, "a healthy companion document may reveal the overlay");
+    assert.strictEqual(overlay._hasBlankedOverlay(), false, "success clears the failure latch");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("a main-frame transport failure hides the overlay without hiding for harmless failures", () => {
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    overlay.setOverlayTarget("http://localhost:5476", "cred");
+    overlay.openPetWindow();
+    const win = stub.created[0];
+
+    win.webContents.emit(
+      "did-fail-load",
+      {},
+      -106,
+      "ERR_INTERNET_DISCONNECTED",
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      false,
+    );
+    assert.strictEqual(win.shown, true, "a sub-frame failure leaves the companion visible");
+    assert.strictEqual(overlay._hasBlankedOverlay(), false);
+
+    win.webContents.emit(
+      "did-fail-load",
+      {},
+      -3,
+      "ERR_ABORTED",
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      true,
+    );
+    assert.strictEqual(win.shown, true, "a superseded load is not an error document");
+    assert.strictEqual(overlay._hasBlankedOverlay(), false);
+
+    win.webContents.emit(
+      "did-fail-load",
+      {},
+      -102,
+      "ERR_CONNECTION_REFUSED",
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      true,
+    );
+    win.webContents.emit("did-finish-load");
+    assert.strictEqual(win.shown, false, "Chromium's full-display error document stays hidden");
+    assert.strictEqual(overlay._hasBlankedOverlay(), true);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("the hidden notification owner stays inert on failure and re-arms after a healthy probe", () => {
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    overlay.setOverlayTarget("http://localhost:5476", "stale");
+    overlay.openPetWindow();
+    const brain = stub.created[2];
+    assert.deepStrictEqual(
+      brain.sent.map(({ ch }) => ch),
+      ["crew-companion:set-owner", "crew-companion:set-active"],
+      "the healthy brain initializes as notification owner",
+    );
+
+    brain.sent.length = 0;
+    brain.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      403,
+    );
+    brain.webContents.emit("did-finish-load");
+    assert.deepStrictEqual(brain.sent, [], "an HTTP error document cannot become the owner");
+
+    overlay.setOverlayTarget("http://localhost:5476", "fresh");
+    assert.strictEqual(
+      overlay.rearmBlankedCompanionWindows(),
+      1,
+      "the failed brain reloads without reopening healthy overlays",
+    );
+    assert.match(brain.loadedUrl, /[?&]token=fresh(?:&|$)/);
+    brain.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      200,
+    );
+    brain.webContents.emit("did-finish-load");
+    assert.deepStrictEqual(
+      brain.sent.map(({ ch }) => ch),
+      ["crew-companion:set-owner", "crew-companion:set-active"],
+      "the recovered document resumes notification ownership",
+    );
+
+    brain.sent.length = 0;
+    brain.webContents.emit(
+      "did-fail-load",
+      {},
+      -102,
+      "ERR_CONNECTION_REFUSED",
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      true,
+    );
+    brain.webContents.emit("did-finish-load");
+    assert.deepStrictEqual(brain.sent, [], "a transport error document also stays inert");
+
+    overlay.setOverlayTarget("http://localhost:5476", "newer");
+    assert.strictEqual(overlay.rearmBlankedCompanionWindows(), 1);
+    assert.match(brain.loadedUrl, /[?&]token=newer(?:&|$)/);
+  } finally {
+    stub.restore();
+  }
+});
+
 // ── the page URL ────────────────────────────────────────────────────────────
 
 test("the page URL mirrors the file layout, and omits an empty credential", () => {
@@ -312,6 +471,54 @@ test("the page URL mirrors the file layout, and omits an empty credential", () =
 });
 
 // ── the reconcile rule ──────────────────────────────────────────────────────
+
+test("a successful reconcile re-arms failed companion windows with the accepted credential", async () => {
+  const stub = stubElectron();
+  const server = require("node:http").createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify([{ name: "crew-companion", enabled: true }]));
+  });
+  let index = null;
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const loaded = loadModules();
+    const { overlay } = loaded;
+    index = loaded.index;
+    overlay.setOverlayTarget(origin, "stale");
+    overlay.openPetWindow();
+    const win = stub.created[0];
+    const brain = stub.created[2];
+    for (const failed of [win, brain]) {
+      failed.webContents.emit(
+        "did-fail-load",
+        {},
+        -102,
+        "ERR_CONNECTION_REFUSED",
+        `${origin}/app-windows/crew-companion/pet.html`,
+        true,
+      );
+    }
+    assert.strictEqual(overlay._hasBlankedOverlay(), true, "the failed overlay starts latched");
+
+    index.initCrewCompanion({
+      backendUrl: origin,
+      fetchLocalToken: async () => "fresh",
+      glog: () => {},
+    });
+    await settle();
+
+    assert.match(win.loadedUrl, /[?&]token=fresh(?:&|$)/, "the reconcile reloads the overlay");
+    assert.match(brain.loadedUrl, /[?&]token=fresh(?:&|$)/, "the reconcile reloads the owner");
+  } finally {
+    index?.shutdownCrewCompanion();
+    await new Promise((resolve) => server.close(resolve));
+    stub.restore();
+  }
+});
 
 test("an inconclusive probe leaves the windows exactly as they are", async () => {
   const stub = stubElectron();

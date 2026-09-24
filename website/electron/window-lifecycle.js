@@ -7,10 +7,15 @@ const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry")
 const { createRendererRecovery } = require("./renderer-recovery");
 const { createHangRecovery } = require("./hang-recovery");
 const { armSplashHistoryClear, fileShellPageBasename } = require("./splash-history");
-const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
+const { hideToTray, cancelPendingTrayHide, shouldKeepAppHidden } = require("./hide-to-tray");
 const { attachHtmlFullScreen } = require("./html-fullscreen");
+const {
+  watchFullScreenTransitions,
+  repairStalledFullScreenExit,
+} = require("./fullscreen-transition-watch");
 const { createDisplayMediaHandler } = require("./display-media");
 const { applyFocusModeChrome } = require("./focus-chrome");
+const { createFocusCursorWatch } = require("./focus-cursor");
 const {
   createPermissionRequestHandler,
   createPermissionCheckHandler,
@@ -32,7 +37,10 @@ const { createBrowserOps } = require("./browser-ops");
 const { runAnnotateOp } = require("./browser-annotate");
 const { createAgentCommandChannel } = require("./browser-agent-channel");
 const { attachContextMenu } = require("./context-menu");
-const { validateRemoteSettings } = require("./validation");
+const {
+  parseRemoteCrewFields,
+  saveRemoteCrewConfig,
+} = require("./remote-crew-setup");
 const { getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
 const { openPathHardened } = require("./open-path");
 const { DEFAULT_REMOTE_BIN, DEFAULT_REMOTE_PATH } = require("./remote-token");
@@ -146,6 +154,11 @@ function createWindowLifecycle(options) {
   let micDialogOpen = false;
   let sessionSecurityConfigured = false;
   let appMenu = null;
+  // The fullscreen-transition watch for the current main window. Its `pending()`
+  // is what keeps a close-to-tray exit from abandoning a transition AppKit is
+  // still animating, which is the cause of the orphan overlay rather than a
+  // symptom of it.
+  let fullScreenWatch = null;
 
   // The primary window owns both the cheap memory trajectory and the bounded
   // process-wide cage trace. Keeping record, crash flush, and quit stop behind
@@ -502,6 +515,15 @@ function createWindowLifecycle(options) {
           },
         }),
         getContentBounds: () => win.getContentBounds(),
+        // Keyboard focus belongs to exactly one child view of the BaseWindow.
+        // When the embedded page holds it as its view is hidden or released,
+        // the dashboard view takes it back — otherwise every text input in the
+        // dashboard stays deaf while pointer events keep working.
+        focusHost: () => {
+          if (!win.isDestroyed() && !view.webContents.isDestroyed()) {
+            view.webContents.focus();
+          }
+        },
         addView: (child) => win.contentView.addChildView(child),
         removeView: (child) => win.contentView.removeChildView(child),
         // Chrome the embedded page needs but the module must not import Electron
@@ -830,6 +852,13 @@ function createWindowLifecycle(options) {
     // Native themeSource is process-global, so a focused connection window must
     // refresh it from its own dashboard before native chrome is painted.
     win.on("focus", () => syncNativeTheme(view, win));
+    // On re-activation the platform re-resolves which child view receives
+    // keystrokes and may pick a hidden browser view again; each panel heals
+    // that by handing focus back to the dashboard view (see browser-view.js
+    // header note 3). A visible or unfocused panel is left alone.
+    win.on("focus", () => {
+      for (const entry of browserPanels.values()) entry.manager.reclaimFocus();
+    });
 
     // Same-origin windows remain in-app. Cross-origin web URLs and the audited
     // custom-scheme allowlist go to the OS; every other target fails closed.
@@ -938,6 +967,63 @@ function createWindowLifecycle(options) {
     mainWindow.on("move", persistDebounced);
     mainWindow.on("enter-full-screen", persist);
     mainWindow.on("leave-full-screen", persist);
+
+    // Journal the terminal events so a stalled transition is legible in
+    // gateway-launch.log; until this existed a frozen fullscreen exit left no
+    // evidence anywhere. The watch below is the only detector the main process
+    // has for that stall (fullscreen-transition-watch.js explains why), and its
+    // repair is the only thing that clears the AppKit overlay short of a quit.
+    mainWindow.on("enter-full-screen", () => {
+      glog(`fullscreen: entered bounds=${JSON.stringify(mainWindow.getBounds())}`);
+    });
+    mainWindow.on("leave-full-screen", () => {
+      glog(`fullscreen: left bounds=${JSON.stringify(mainWindow.getBounds())}`);
+    });
+    fullScreenWatch = watchFullScreenTransitions(mainWindow, {
+      isMac: IS_MAC,
+      onStall: ({ target, fullScreen, visible, elapsedMs }) => {
+        glog(
+          `fullscreen: ${target ? "enter" : "exit"} transition did not complete` +
+            ` after ${elapsedMs}ms (isFullScreen=${fullScreen} visible=${visible})`,
+        );
+        if (target) return; // an unfinished ENTER has no known overlay to clear
+        const outcome = repairStalledFullScreenExit({
+          app,
+          win: mainWindow,
+          isMac: IS_MAC,
+          keepHidden: () => shouldKeepAppHidden(mainWindow),
+        });
+        glog(
+          `fullscreen: stalled exit repair hidden=${outcome.hidden}` +
+            ` unhideScheduled=${outcome.unhideScheduled}`,
+        );
+      },
+      onArm: ({ target }) => {
+        glog(`fullscreen: ${target ? "enter" : "exit"} transition started`);
+      },
+      // A transition abandoned mid-animation orphans its overlay just as a stall
+      // does, and its replacement fires normally so nothing else notices. The
+      // close path no longer causes this (hide-to-tray serialises its exit), but
+      // a user toggling fullscreen twice inside one animation still can, and
+      // AppKit gives no way to reach the overlay other than this repair.
+      onAbort: ({ target, fullScreen, visible, elapsedMs }) => {
+        const keepHiddenNow = shouldKeepAppHidden(mainWindow);
+        glog(
+          `fullscreen: ${target ? "enter" : "exit"} transition abandoned after ${elapsedMs}ms` +
+            ` (isFullScreen=${fullScreen} visible=${visible} pendingTrayHide=${keepHiddenNow})`,
+        );
+        const outcome = repairStalledFullScreenExit({
+          app,
+          win: mainWindow,
+          isMac: IS_MAC,
+          keepHidden: () => shouldKeepAppHidden(mainWindow),
+        });
+        glog(
+          `fullscreen: abandoned transition repair hidden=${outcome.hidden}` +
+            ` unhideScheduled=${outcome.unhideScheduled}`,
+        );
+      },
+    });
 
     // A 403 means the gateway secret may have rotated. Re-enter through the
     // same local-then-remote token order used at boot.
@@ -1050,9 +1136,25 @@ function createWindowLifecycle(options) {
     mainWindow.on("close", (event) => {
       if (!isQuitting()) {
         event.preventDefault();
-        // macOS must leave its native fullscreen Space before hiding or the
-        // Space becomes an orphaned black surface.
-        hideToTray(mainWindow);
+        // macOS must leave its native fullscreen Space before hiding or the Space
+        // becomes an orphaned black surface, and the hide that follows is an
+        // app-level one: AppKit may have left a full-display overlay on screen
+        // that only `app.hide()` can reach (see hide-to-tray.js).
+        glog(`close: hiding to tray (fullScreen=${mainWindow.isFullScreen()})`);
+        hideToTray(mainWindow, {
+          log: glog,
+          // isFullScreen() already reports the target while AppKit is still
+          // exiting. Carry the watch target so the helper attaches to that exit
+          // instead of issuing another toggle or treating the window as stable.
+          transitionTarget: fullScreenWatch ? fullScreenWatch.pending() : null,
+          // The exit must not be issued while AppKit is still animating; the watch
+          // is what knows how long the window has been still. Its terminal-exit
+          // clock also covers AppKit's final order-in after pending() clears.
+          quietFor: () => (fullScreenWatch ? fullScreenWatch.quietFor() : Infinity),
+          exitSettlingFor: () => (
+            fullScreenWatch ? fullScreenWatch.exitSettlingFor() : Infinity
+          ),
+        });
         return;
       }
       if (saveTimer) {
@@ -1065,9 +1167,24 @@ function createWindowLifecycle(options) {
     return mainWindow;
   }
 
+  // A tray hide out of fullscreen hides the whole APP (hide-to-tray.js explains
+  // why: it is the only call that also orders out AppKit's abandoned overlay).
+  // A hidden app ignores `win.show()`, so every user-intent show has to unhide
+  // the app first. Harmless when the app was never hidden, and macOS-only
+  // because `app.hide()` is.
+  function unhideApp() {
+    if (!IS_MAC || typeof app.show !== "function") return;
+    try {
+      app.show();
+    } catch {
+      /* best effort — the window show below is what the user asked for */
+    }
+  }
+
   function showMainWindow({ focus = false } = {}) {
     if (!mainWindow || mainWindow.isDestroyed()) return false;
     cancelPendingTrayHide(mainWindow);
+    unhideApp();
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     if (focus) mainWindow.focus();
@@ -1079,14 +1196,14 @@ function createWindowLifecycle(options) {
     // An activate racing a fullscreen-exit hide must win before isVisible is
     // consulted, otherwise the deferred handler hides the window afterwards.
     cancelPendingTrayHide(mainWindow);
+    unhideApp();
     if (!mainWindow.isVisible()) mainWindow.show();
     return true;
   }
 
   function createTray() {
     const showFromTray = () => {
-      cancelPendingTrayHide(mainWindow);
-      mainWindow?.show();
+      showMainWindow({ focus: true });
     };
     const nightly = identityFamily(app.getVersion()) === "nightly";
     const iconFile = nightly && fs.existsSync(path.join(__dirname, "icon-nightly.png"))
@@ -1166,7 +1283,7 @@ function createWindowLifecycle(options) {
         function save() {
           document.title = JSON.stringify({
             host: document.getElementById('h').value.trim(),
-            bin: document.getElementById('b').value.trim(),
+            binPath: document.getElementById('b').value.trim(),
             remotePort: document.getElementById('rp').value.trim(),
             remotePath: document.getElementById('pa').value.trim(),
           });
@@ -1187,40 +1304,29 @@ function createWindowLifecycle(options) {
     });
     promptWin.on("closed", () => {
       try {
-        if (savedTitle && savedTitle.startsWith("{")) {
-          const {
-            host,
-            bin,
-            remotePort: remotePortValue,
-            remotePath,
-          } = JSON.parse(savedTitle);
-          if (host) {
-            const error = validateRemoteSettings(
-              host,
-              bin,
-              remotePortValue,
-              remotePath,
-            );
-            const parent = focused && !focused.isDestroyed() ? focused : null;
-            if (error) {
-              dialog.showMessageBox(parent, {
-                type: "error",
-                title: "Invalid Input",
-                message: error,
-              });
-              return;
-            }
-          }
-          setRemoteHostConfig(store, focusedPort, {
-            host,
-            binPath: bin,
-            remotePort: remotePortValue,
-            remotePath,
-          });
+        const fields = parseRemoteCrewFields(savedTitle);
+        if (fields) {
+          const { host } = fields;
           const parent = focused && !focused.isDestroyed() ? focused : null;
-          const message = host
-            ? `Remote host for :${focusedPort} set to ${host}`
-            : `Remote host for :${focusedPort} cleared (using local token)`;
+          if (!host) {
+            // Clearing belongs to this surface: the shared writer stores a crew
+            // and refuses an empty host.
+            setRemoteHostConfig(store, focusedPort, {});
+            const cleared = `Remote host for :${focusedPort} cleared (using local token)`;
+            console.log(cleared);
+            dialog.showMessageBox(parent, { message: cleared, type: "info" });
+            return;
+          }
+          const { saved, error } = saveRemoteCrewConfig(store, focusedPort, fields);
+          if (!saved) {
+            dialog.showMessageBox(parent, {
+              type: "error",
+              title: "Invalid Input",
+              message: error,
+            });
+            return;
+          }
+          const message = `Remote host for :${focusedPort} set to ${host}`;
           console.log(message);
           dialog.showMessageBox(parent, { message, type: "info" });
         }
@@ -1314,6 +1420,7 @@ function createWindowLifecycle(options) {
     // The tray reaches this during a deferred fullscreen hide; showing a modal
     // is user intent and must cancel that pending hide first.
     cancelPendingTrayHide(mainWindow);
+    unhideApp();
     mainWindow.show();
 
     const css = await getModalCSS();
@@ -1617,6 +1724,7 @@ function createWindowLifecycle(options) {
     const win = focusedDashboardWindow();
     if (!win) return;
     cancelPendingTrayHide(win);
+    unhideApp();
     if (win.isMinimized()) win.restore();
     win.show();
     win.focus();
@@ -1743,6 +1851,18 @@ function createWindowLifecycle(options) {
     // AppKit drops declared drag regions when button visibility mutates;
     // applyFocusModeChrome re-declares them after changing the native chrome.
     applyFocusModeChrome(win, visible, { positionTrafficLights });
+  }
+
+  // Off-window cursor distance for a focus-mode reveal. Every platform, unlike
+  // handleFocusMode's macOS-only traffic lights: the renderer stops receiving
+  // mouse events the moment the pointer crosses a window edge wherever it runs,
+  // so the dismissal distance can only be measured here.
+  const focusCursorWatch = createFocusCursorWatch({ screen, log: glog });
+
+  function handleWatchFocusCursor(sender, watching) {
+    const win = windowForWebContents(sender);
+    if (!win) return;
+    focusCursorWatch.watch(win, watching);
   }
 
   function handleWindowControl(sender, action, senderFrame) {
@@ -2060,6 +2180,7 @@ function createWindowLifecycle(options) {
     chrome: {
       setThemeAccent,
       focusMode: handleFocusMode,
+      watchFocusCursor: handleWatchFocusCursor,
       windowControl: handleWindowControl,
       setThemeMode,
       setTitlebarMode,

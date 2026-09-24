@@ -309,14 +309,11 @@ def test_MUTATION_a_following_reader_would_read_through_the_link(tmp_path: pathl
     """Give the nofollow reader an ordinary following open and the link is read through."""
     mod = load_build(
         mutate=(
-            # The open sits in a conditional, because the reader takes an optional anchor
-            # root. The mutated property is unchanged: without the no-follow flags an
-            # ordinary open reads the link through.
-            # One open, no conditional: the anchored variant and its opener stack were
-            # removed as production-dead. The property is unchanged -- without the
-            # no-follow flags an ordinary open reads the link through.
-            "fd = os.open(str(path), os.O_RDONLY | _NOFOLLOW_READ_FLAGS)",
-            "fd = os.open(str(path), os.O_RDONLY)",
+            # The reader borrows its descriptor from the shared no-reparse opener, so the
+            # mutation swaps that borrow for a plain following open. The mutated property is
+            # unchanged: without a no-follow open the link is read through to its target.
+            "        fd = open_file_no_reparse(path, nonblocking=True)",
+            "        fd = os.open(path, os.O_RDONLY)",
         )
     )
     real = tmp_path / "real.json"
@@ -1304,46 +1301,251 @@ def test_MUTATION_a_path_rmtree_would_leave_the_window(tmp_path: pathlib.Path, m
 
 
 @pytest.mark.skipif(os.name != "posix", reason="uses a symlink to stand in for a junction")
-def test_the_nofollow_reader_fails_closed_when_o_nofollow_is_unavailable(
+def test_the_nofollow_reader_refuses_a_redirect_without_a_path_check(
     tmp_path: pathlib.Path, monkeypatch
 ) -> None:
-    """With O_NOFOLLOW forced to 0 (the Windows case), a linked path is refused, not read."""
+    """The redirect refusal is the OPEN's, so no by-name verdict is taken before the read.
+
+    A verdict taken on the path and then acted on by a separate open is a window a concurrent
+    writer wins, and on a platform whose junction can name a UNC share the read at the far end
+    of that window is an outbound SMB/NTLM exchange. The reader borrows
+    ``platform_compat.open_file_no_reparse``, which refuses the redirect in the operation that
+    opens the name, so the path predicate must not be consulted at all -- forced to raise here,
+    which turns any surviving pre-check into a failure rather than a silent pass.
+    """
     mod = load_build()
-    # Force the Windows condition: no working O_NOFOLLOW. The reader must then lstat-refuse
-    # a reparse point before the open instead of following it.
-    monkeypatch.setattr(mod.os, "O_NOFOLLOW", 0, raising=False)
-    monkeypatch.setattr(mod, "_NOFOLLOW_READ_FLAGS", 0, raising=False)
+
+    def _must_not_run(_probe):
+        raise AssertionError("the reader must not judge the path before opening it")
+
+    monkeypatch.setattr(mod, "_is_redirecting_entry", _must_not_run)
     real = tmp_path / "real.txt"
     real.write_text("secret\n", encoding="utf-8")
     link = tmp_path / "spec.txt"
     os.symlink(real, link)
     assert (
         mod._read_text_nofollow(link) is None
-    ), "O_NOFOLLOW unavailable: the reader must fail closed on a reparse point, not follow it"
+    ), "a redirect at the read path must be refused by the open, not read through"
     assert mod._read_text_nofollow(real) == "secret\n", "an ordinary file still reads"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="uses a symlink to stand in for a junction")
-def test_MUTATION_without_the_fail_closed_guard_the_windows_reader_would_follow(
-    tmp_path: pathlib.Path, monkeypatch
+def test_MUTATION_without_the_shared_opener_the_reader_stops_rather_than_approximating(
+    tmp_path: pathlib.Path,
 ) -> None:
-    """Drop the fail-closed reparse check and the O_NOFOLLOW-less reader follows the link."""
+    """Make the shared module unimportable and the reader refuses instead of reading.
+
+    Fail-closed is the direction that matters: a local approximation of the refusal is the
+    check-then-open window itself, so an environment without the shared opener gets no read.
+    """
     mod = load_build(
         mutate=(
-            '    if not getattr(os, "O_NOFOLLOW", 0) and _is_redirecting_entry(path):\n        return None\n',
-            "",
+            "        from kiro_crew.platform_compat import open_file_no_reparse",
+            "        raise ImportError('simulated standalone environment')",
         )
     )
-    monkeypatch.setattr(mod.os, "O_NOFOLLOW", 0, raising=False)
-    monkeypatch.setattr(mod, "_NOFOLLOW_READ_FLAGS", 0, raising=False)
     real = tmp_path / "real.txt"
     real.write_text("secret\n", encoding="utf-8")
-    link = tmp_path / "spec.txt"
-    os.symlink(real, link)
-    assert mod._read_text_nofollow(link) == "secret\n", (
-        "guard removed + O_NOFOLLOW unavailable: the reader follows the link, proving the "
-        "fail-closed check is what refuses it on that platform"
+    assert mod._read_text_nofollow(real) is None, (
+        "without the shared opener the reader must refuse; reading anyway would mean it fell "
+        "back to an open with no no-follow guarantee"
     )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a POSIX O_RDONLY open of a directory succeeds")
+def test_the_leaf_opener_hands_back_no_directory_descriptor(tmp_path: pathlib.Path) -> None:
+    """A directory at a read path yields None, not a descriptor its callers cannot wrap.
+
+    The two platforms disagree about where a directory surfaces. The shared opener's Windows
+    branch reads the directory attribute off the handle and raises; a POSIX ``O_RDONLY`` open
+    of a directory succeeds and yields a usable descriptor. Deciding it in the opener is what
+    makes the two answers the same, and what keeps the leak below out of reach.
+    """
+    mod = load_build()
+    a_dir = tmp_path / "a_dir"
+    a_dir.mkdir()
+    assert (
+        mod._open_leaf_no_reparse(a_dir) is None
+    ), "a directory is not a leaf read; the opener must refuse it rather than pass the fd on"
+
+    a_file = tmp_path / "a_file.txt"
+    a_file.write_text("body\n", encoding="utf-8")
+    fd = mod._open_leaf_no_reparse(a_file)
+    assert fd is not None, "CONTROL: an ordinary file must still open, or this pins nothing"
+    os.close(fd)
+
+
+def _descriptor_ledger(mod, monkeypatch):
+    """Track every leaf descriptor the build module opens, without moving it to another branch.
+
+    All three leaf opens hand their descriptor to ``_dir_fd_closed`` before any reader touches
+    it, so wrapping that one authority sees all three; the wrapper calls straight through, so
+    the verdict stays the module's own. ``os.close`` and ``os.fdopen`` are wrapped beside it
+    because a descriptor is accounted for either by a close or by a successful ``fdopen``,
+    which TAKES OWNERSHIP and closes through the file object instead of through ``os.close``.
+
+    ``os.open`` is deliberately NOT wrapped. ``_dir_fd_supported`` asks
+    ``os.open in os.supports_dir_fd``, and a wrapper is not a member of that set, so wrapping
+    it answers False and routes every reader down the by-name fallback -- a spy that picks the
+    branch it is supposed to be watching, and whose leaf open then happens inside
+    ``platform_compat`` where this ledger cannot see it at all.
+
+    A close of a descriptor the ledger is not holding (a parent directory fd from the
+    anchoring walk) is ignored rather than subtracted, so a reissued number cannot cancel a
+    real strand recorded under the same number.
+    """
+    real_os = mod.os
+    real_verdict = mod._dir_fd_closed
+    outstanding: dict[int, int] = {}
+
+    def release(fd: int) -> None:
+        if outstanding.get(fd):
+            outstanding[fd] -= 1
+            if not outstanding[fd]:
+                del outstanding[fd]
+
+    class _LedgerOs:
+        def close(self, fd):
+            release(fd)
+            return real_os.close(fd)
+
+        def fdopen(self, fd, *args, **kwargs):
+            fh = real_os.fdopen(fd, *args, **kwargs)
+            if kwargs.get("closefd", True):
+                release(fd)
+            return fh
+
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+    def ledger_verdict(fd: int) -> bool:
+        outstanding[fd] = outstanding.get(fd, 0) + 1
+        return real_verdict(fd)
+
+    monkeypatch.setattr(mod, "os", _LedgerOs())
+    monkeypatch.setattr(mod, "_dir_fd_closed", ledger_verdict)
+    return outstanding
+
+
+def _stranded(outstanding: dict) -> int:
+    """Leaf descriptors still held: opened, then neither closed nor handed to an owner."""
+    return sum(outstanding.values())
+
+
+def _release_held(outstanding: dict) -> None:
+    """Close whatever the ledger is still holding, so a FAILING assertion strands nothing.
+
+    Belongs in a ``finally``: the descriptors exist by the time the reads are driven, and an
+    assertion that fires before the closing loop would leave them open for the remainder of
+    the worker process -- the same defect these tests are about, committed by the test.
+    """
+    for fd, count in list(outstanding.items()):
+        for _ in range(count):
+            try:
+                os.close(fd)
+            except OSError:
+                break
+        outstanding.pop(fd, None)
+
+
+@_posix_only
+def test_a_directory_at_a_read_path_strands_no_descriptor(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """Reading a directory path leaves every descriptor the module opened accounted for.
+
+    ``os.fdopen`` raises ``IsADirectoryError`` BEFORE the wrapper it would return owns the
+    fd, so a reader written as ``with os.fdopen(fd, ...)`` never reaches a close for it. Both
+    opener paths are exercised: the anchored walk, which is the one that runs on a platform
+    with ``dir_fd``, and the by-name fallback the Windows branch would take.
+    """
+    root = tmp_path / "root"
+    (root / "a_dir").mkdir(parents=True)
+    marker_dir = tmp_path / "marker_dir"
+    marker_dir.mkdir()
+    rounds = 8
+
+    mod = load_build()
+    held = _descriptor_ledger(mod, monkeypatch)
+    try:
+        for _ in range(rounds):
+            assert (
+                mod._read_bytes_openat(root, pathlib.Path("a_dir")) is None
+            ), "a directory is not a readable member; the anchored reader must answer None"
+            assert (
+                mod._marker_is_ours(marker_dir) is False
+            ), "a directory at the marker path is not a marker this run wrote"
+        if mod._dir_fd_supported():
+            # The fourth leaf open: a read relative to a descriptor the caller already holds.
+            # The held fd pins the directory, not the name inside it, so this is the same
+            # window.
+            dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                for _ in range(rounds):
+                    assert (
+                        mod._read_regular_leaf_fd(dir_fd, "a_dir") is None
+                    ), "a directory under a held descriptor is not a regular leaf to read"
+            finally:
+                os.close(dir_fd)
+        anchored = _stranded(held)
+        assert anchored == 0, (
+            f"the anchored readers stranded {anchored} descriptor(s) over {rounds} rounds: "
+            "the fd os.fdopen refused to wrap reaches no close"
+        )
+    finally:
+        _release_held(held)
+
+    mod = load_build()
+    monkeypatch.setattr(mod, "_dir_fd_supported", lambda: False)
+    held = _descriptor_ledger(mod, monkeypatch)
+    try:
+        for _ in range(rounds):
+            assert (
+                mod._read_bytes_openat(root, pathlib.Path("a_dir")) is None
+            ), "the by-name fallback must answer None for a directory too"
+            assert (
+                mod._marker_is_ours(marker_dir) is False
+            ), "the marker fallback must answer False for a directory too"
+        fallback = _stranded(held)
+        assert (
+            fallback == 0
+        ), f"the fallback readers stranded {fallback} descriptor(s) over {rounds} rounds"
+    finally:
+        _release_held(held)
+
+
+@_posix_only
+def test_MUTATION_without_the_directory_verdict_each_read_strands_a_descriptor(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """Report every descriptor as a file and the strand count rises by one per read.
+
+    This is what proves the test above discriminates: with the verdict reversed every
+    reader's ANSWER is still correct, and the descriptor that reaches no close is the only
+    observable difference. One anchor covers all three leaf opens because they share one
+    authority -- which is the reason the verdict was factored into one.
+    """
+    mod = load_build(
+        mutate=("        if not stat.S_ISDIR(os.fstat(fd).st_mode):", "        if True:")
+    )
+    root = tmp_path / "root"
+    (root / "a_dir").mkdir(parents=True)
+    rounds = 8
+
+    held = _descriptor_ledger(mod, monkeypatch)
+    try:
+        for _ in range(rounds):
+            assert mod._read_bytes_openat(root, pathlib.Path("a_dir")) is None, (
+                "the mutation leaves the verdict alone -- which is the point: the answer looks "
+                "right while the descriptor is stranded"
+            )
+        stranded = _stranded(held)
+        assert stranded == rounds, (
+            f"expected one stranded descriptor per read ({rounds}), counted {stranded}; a 0 "
+            "here means the mutation changed nothing and the test above is proving nothing"
+        )
+    finally:
+        _release_held(held)
 
 
 @_posix_only
@@ -1788,11 +1990,11 @@ def test_the_chain_walk_runs_before_the_resolving_fence(
 def test_the_marker_fallback_refuses_a_redirect_at_the_marker_path(
     tmp_path: pathlib.Path, monkeypatch
 ) -> None:
-    """The branch without dir_fd must judge the marker path before opening it.
+    """The branch without dir_fd must let the OPEN decide the marker verdict.
 
     The anchored branch opens with ``O_NOFOLLOW`` and answers False on ELOOP, so a redirect at
     the marker path is not this run's marker. The fallback branch has no anchoring, so the same
-    verdict has to come from an ``lstat`` before the open. What the answer authorises is why it
+    verdict has to come from the open itself. What the answer authorises is why it
     matters: a True here says this build owns the staging directory, and that permits the
     recursive delete of it.
 

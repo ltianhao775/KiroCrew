@@ -34,8 +34,9 @@ the narrowing check fails.
 ## Stage 1 — the vocabulary, in the leaf
 
 Everything a consumer needs to *name* your harness goes in
-`src/kiro_crew/acp_backends.py`, which imports no ACP and therefore may be
-imported by anything:
+`src/kiro_crew/agent_sdk/backends.py`, the import-light leaf behind the Agent SDK
+boundary. `src/kiro_crew/acp_backends.py` is a compatibility re-export shim; new
+code should import the Agent SDK path so the registry keeps one owner:
 
 | Add | Why there |
 |---|---|
@@ -44,18 +45,23 @@ imported by anything:
 | `PROVIDER_LABEL_<NAME>` in `acp/types.py` | A closed mapping; an absent label means Kiro, so a harness without one persists as a Kiro session and has its transcript pruned for want of a Kiro session file (H11). |
 | an entry in `POLICY_ID_BY_BACKEND` | A governance rule is written by a human as an identifier. The mapping is what makes the id nameable in a deny rule **before** anything registers it — so this is required even for a dormant harness. |
 
-`acp/types.py` re-exports the vocabulary, so existing callers keep their import
-site. Do not define the constants there: it is a forbidden root for the SDK
-boundary gate, and a definition there is a definition consumers cannot reach
-without crossing it.
+`acp/types.py` and the top-level shim re-export the vocabulary, so existing callers
+keep their import sites. Do not define the constants there: both are compatibility
+surfaces, while `agent_sdk/backends.py` is the capability owner enforced by the SDK
+boundary gate.
 
 ## Stage 2 — an explicit decision for every capability set
 
-Every capability set needs a decision. **"Inherited the default" is not a decision** — a
+Every manually-authored capability set needs a decision. **"Inherited the default" is not a decision** — a
 capability is granted by opt-in membership, never by negation (H6), so a set you
 do not think about is a set you have silently opted out of. That is usually
 right, and it must still be deliberate, because the review lane and the tests
-both read the membership as a claim. `ACP_BACKENDS_KNOWN` is not one of them: it
+both read the membership as a claim. The authoritative inventory and disposition
+for every `ACP_BACKENDS_*` set is the module-level table in
+`agent_sdk/backends.py`; keep this onboarding table synchronized with it.
+`ACP_BACKENDS_SELF_SERVED_ACP` is derived from `ACP_BACKEND_LAUNCH`, so its
+Stage 3 row is the decision rather than a second membership edit.
+`ACP_BACKENDS_KNOWN` is not one of the capability decisions: it
 is the membership floor, not a capability. Neither is
 `backends_retired_by_host_logout()`: whether a host logout may retire your running
 child is a fact about how you sign in, so it is declared in Stage 5 and projected
@@ -68,16 +74,26 @@ vocabulary.
 | `ACP_BACKENDS_SESSION_SHARING` | One process may serve several sessions. Wrong membership hands a second session to a process that cannot hold it. |
 | `ACP_BACKENDS_STEER` | The `_session/steer` extension. A steer sent to a non-implementer answers `-32601`. |
 | `ACP_BACKENDS_INTERNAL_SANDBOX` | The harness sandboxes itself, so Kiro Crew's own wrapper stands down. Security-relevant: wrong membership hands isolation to a layer that never starts (H7). |
+| `ACP_BACKENDS_POD_HOME_REMAP` | A pod-spawned child may have `$HOME` relocated onto the pod tree so home-derived OAuth artifacts remain pod-scoped. Keep this separate from internal-sandbox membership because the two claims have different security effects. |
 | `ACP_BACKENDS_ACP_RUNTIME` | Driven through `AcpRuntime` — one process demultiplexing N sessions — rather than its own per-session `AcpClient` spawn branch. Every reader takes the frozenset itself: `AcpProvider.is_acp_runtime_backend` for the FOREGROUND start path, and `session._bg_runtime_backends`, which intersects it with the set below and with selectability. Membership states the TRANSPORT and nothing more — the kiro-family `cli.json` effort and Tool Search overlay is gated on `ACP_BACKENDS_KIRO_SLASH_COMMANDS` at every site that writes, reads or clears it, so a member reading no such file never collects one. |
 | `ACP_BACKENDS_SESSION_EVICTION` | The teardown verb Crew SENDS this harness evicts the session from the adapter's own session map, freeing what it held. Multiplexing is not that claim: a harness can serve N sessions perfectly and still have no verb that disposes one, and the gap shows only on a process that outlives many sessions, where every non-evicting teardown leaves its session addressable with its context resident. Every path that creates and destroys sessions on a shared process reads this set — `session._bg_runtime_backends` (title generation, suggestions, folders and nav each take their own ephemeral `sessionId`, many per conversation, at a rate the operator never controls), `AcpSessionProvider.new_conversation` (warm pooled reuse) and the runtime's entitlement probe — so a harness that has not declared eviction reaches none of them and leaks on none of them. Declare it from the verb Crew SENDS, measured, rather than from what the adapter advertises, and mind the delivery: codex-acp advertises `session/close` and `session/delete`, and for as long as Crew sent it `session/cancel` the same sessionId kept serving a prompt whose `cachedReadTokens` showed the context survived, so codex was out. Crew now sends `session/close` as a request, after which the sessionId stops answering (measured live against codex-acp 1.11.0; the same verb as a notification is ignored and evicts nothing), so codex is in. A gated live test re-runs that measurement on every install with the adapter, which is what lets the membership stand on a fact rather than a memory. |
+| `ACP_BACKENDS_HARNESS_OWNED_SESSIONS` | The harness owns persisted session records and can restore from a `sessionId` without a Crew-side transcript or `_kiro.dev/session_file`. |
+| `ACP_BACKENDS_LOAD_WITHOUT_MODES` | A successful restore response may omit `modes`; membership prevents that valid load from being mistaken for a failed restore and replaced by a fresh session. |
+| `ACP_BACKENDS_RESUME_WITHOUT_LOAD` | The harness restores with standard ACP `session/resume` and advertises `sessionCapabilities.resume`, rather than using `session/load`. Membership selects both the capability key and verb. |
 | `ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION` | Model switching lands as a config option rather than a protocol call. |
 | `ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION` | Reasoning-effort push, same channel shape. |
 | `ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS` | The ids the harness ADVERTISES are `<model>[<effort>]` pairs its `model` option does not accept whole, so an exhausted spelling ladder falls through to two writes (bare model, then the effort). A non-member's refused bracketed id stays refused: claude's `[1m]` is a context WINDOW that must reach the wire intact, and opencode's `provider/model` ids carry no suffix at all, so neither may inherit a split it never advertised. Membership also gates the "adapter mismatch, not an account restriction" wording in `AcpModelUnavailable`, because "advertised implies entitled" is established only for a harness whose advertised list IS its entitlement. |
-| `ACP_BACKENDS_KIRO_SLASH_COMMANDS` | Receives `_kiro.dev/commands/execute`, **and** gets the workspace `cli.json` overlay written for it. Membership decides both, so a non-member must not collect an overlay it never reads and the membership-gated clear can never remove. |
+| `ACP_BACKENDS_KIRO_SLASH_COMMANDS` | Receives `_kiro.dev/commands/execute`, and gets the workspace `cli.json` effort overlay written for it. Tool Search uses the narrower set below rather than inheriting this membership. |
+| `ACP_BACKENDS_TOOL_SEARCH_OVERLAY` | Reads Tool Search keys from the workspace `cli.json` overlay. A harness that takes those settings elsewhere must not collect a file it never reads. |
+| `ACP_BACKENDS_CLIENT_META_SETTINGS` | Takes feature settings from `initialize.clientCapabilities._meta.kiro.settings`; currently this is the KAS Tool Search channel. |
 | `ACP_BACKENDS_MARKDOWN_AGENT_SPECS` | The harness loads an agent defined as ONE markdown file (`~/.kiro/agents/<name>.md`, YAML frontmatter + body as prompt), the v3 / Kiro IDE form Crew's roster lists for every backend. Answered through the harness seam `reads_markdown_agent_specs` (`MembershipHarness`). A non-member that fails to activate such an agent has the activation guard explain the markdown file and name the members, instead of the generic "rewrite the JSON spec" advice; it is never refused BEFORE the spawn, so the Kiro path gains no gate (H13). KAS is the only member today: Crew parses the file and hands it over the wire. |
+| `ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY` | The host reads agent specs only from the user-level directory, so the broker-overlay lookup must not be scoped to a project checkout that the harness never consults. Callers use `overlay_project_scope()` rather than testing a harness id. |
 | `ACP_BACKENDS_SESSION_MCP_ARRAY` | The harness reads its MCP surface from the `session/new` array rather than from Crew's agent spec. A non-member that is added here gets an empty array and works with every Crew tool silently absent. |
+| `ACP_BACKENDS_META_IDENTITY` | Tool-call frames carry a harness-specific `_meta` identity that can classify calls whose ACP `kind` is absent. Membership opts into fail-closed refusal when a frame has neither identity channel. |
+| `ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE` | The agent spec's own `mcpServers` reach the session through a channel other than the `session/new` array, so unresolved-`@server` checks count those declarations as mounted. |
 | `ACP_BACKENDS_MEMBER_DISPATCH` | Crew's member-dispatch tools are mounted into a channel-member session, with the auto-approve grant that goes with them. A harness with no per-session mount to ride is excluded, which withholds only the extra grant. |
-| `ACP_BACKENDS_PRIVATE_MEMORY_MCP` | Direct private member MCP tools execute inside the member's OS sandbox. Kiro, Claude Code and KAS are members. Codex and unknown or merely selectable backends fail before private runtime creation. Membership does not waive the separate OS sandbox checks. |
+| `ACP_BACKENDS_MEMBER_CAPABILITIES` | The harness can load an enrolled member's full saved agent spec at spawn. This is distinct from session sharing and per-session member dispatch; membership in either does not prove full-spec loading. |
+| `ACP_BACKENDS_SIDE_READONLY` | A Side Chat turn may execute read-only tools under the derived `<agent>--readonly` spec. A harness with an independent pre-approval surface stays out until every tool call is proven to reach this policy. |
 | `ACP_BACKENDS_COMPACT` | The manual `/compact` entry points are offered. A non-member refuses the manual command up front rather than stranding the status waiter on a harness that emits no compaction status of its own. |
 | `ACP_BACKENDS_INLINE_COMPACTION` | A strict subset: the compaction finishes INSIDE the `session/prompt` turn, so `wait_for_compaction()` answers `completed` from the capability instead of from the queue. A non-member's result arrives separately and must be awaited. Awaiting a member strands for the full timeout; telling a non-member it is done acknowledges a compaction that has not happened. |
 | `ACP_BACKENDS_HARNESS_MANAGED_COMPACTION` | The harness compacts on its OWN initiative and reports it on its ACP surface, so Crew's context meter falls back below the threshold without Crew acting. This is what makes declining a non-member of `ACP_BACKENDS_COMPACT` honest rather than merely quiet. |
@@ -86,6 +102,8 @@ vocabulary.
 | `ACP_BACKENDS_SEED_LOCAL_SETTINGS` | A local settings file is seeded at spawn **and re-seeded on `set_model`**, so a warm-pool claim does not leave a stale model or allowlist behind. A harness with no such file is not a member. |
 | `ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD` | The dashboard's MCP sync leaves running sessions alone after a config write, because the harness reconciles the agent file itself. Membership is version-gated per process by `mcp_hot_reload_supported`, not granted by the harness name alone. |
 | `ACP_BACKENDS_STRUCTURED_REFUSAL` | The harness reports a model-side refusal with a **reason** — on the Kiro path a `_kiro.dev/metadata` frame with `stopReason: CONTENT_FILTERED` and a `refusal {category, explanation, recommendedModel}` object — and `acp/_dispatch.parse_refusal` is consulted on that frame. Every harness still lands on the same `RefusalInfo` and the same dashboard card; a non-member's card just has no category line. A harness whose refusal wire carries a reason in a different shape adds a parser and joins here — it must not widen the metadata reader to guess. |
+| `ACP_BACKENDS_HOOKS_LIST` | The child's agent may ask its CLIENT for the hooks matching a trigger, over `_kiro/hooks/list` and `_kiro/hooks/sessionStart`; membership authorizes the session dispatch loop to answer them from Kiro Crew's own script-hook store. A non-member is answered `-32601` like any other method it does not serve, which is why membership is the gate rather than the method name: the answers carry operator-authored hook commands. Membership does not make the channel live — the handshake capability that would make an agent use it is separate. |
+| `ACP_BACKENDS_HOST_AUTH_CALLBACK` | The child may request a Kiro Crew access token through `_kiro/auth/getAccessToken`; membership authorizes the reader loop to answer from Kiro Crew's credential vault. This is distinct from logout retirement. |
 
 Not every per-harness fact is a membership SET. Which `configId` carries the
 reasoning effort is a per-harness *spelling* -- `effort` for claude-agent-acp,
@@ -139,7 +157,7 @@ to a set's consumers:
 
 | Bucket | What it means | Where |
 |---|---|---|
-| user-facing | Switching harness changes what the user can DO, and the absence is a LOSS: a control disappears, a command is refused, tools are missing from a session. | `USER_FACING_LINES`, rendered available / not available |
+| user-facing | Switching harness changes what the user can DO, and the absence is a LOSS: a control disappears, a command is refused, tools are missing from a session. | `USER_FACING_LINES`, rendered available / not available / not measured |
 | security | It moves a confinement or credential boundary: which layer confines the agent, whether Crew hands its own credential to the child, how an unclassifiable approval is answered. | `SECURITY_LINES`, stated only when it HOLDS, rendered OUTSIDE every disclosure |
 | operator | It says where something LIVES: whose disk holds the transcript, which side supplies the model list, which channel carries a command. | `OPERATOR_LINES`, stated only when it HOLDS |
 | off-card | The only difference is which code path runs, OR the card cannot honestly project the membership. Two tests: if the membership were wrong, would the user see a missing feature or a BUG? A defect is not a capability. And can this card establish the fact at all? A version-gated membership cannot be marked available by a projection that holds no version. | `OFF_CARD_SETS`, with the reason per set |
@@ -157,10 +175,32 @@ and claims nothing about a harness that carries its own. If your harness has an
 equivalent mechanism under another name, say so in the set's comment: that is what
 decides whether its line is a loss or a note.
 
-**The card is two-level on purpose.** A `frozenset` carries one bit, so "does it
-differently" and "nobody measured it" cannot be told apart from "cannot", and a
-graded level would have to be authored per harness per capability. The one
-genuinely graded fact is Stage 4's routing, rendered from `Routing`'s own five
+**The card has three levels, and a projection can only derive two of them.** A
+`frozenset` carries one bit, so available / not available is the whole of what
+membership answers: "does it differently" and "cannot" reach the card as the same
+absence. The third level is NOT MEASURED, and it is DECLARED rather than derived —
+`DECLARED_UNMEASURED` in `backend_cards.py` names a harness, a line and a reason, for
+the cells where Crew has no answer yet instead of a negative one.
+
+Admissibility is narrow and `test_backend_cards` enforces it, because a table that
+grew freely would be the per-harness prose the card exists to remove:
+
+- an entry is allowed only where the deciding set's OWN comment says the gap is
+  evidence — "unclassified", "no driven capture". The test reads that comment;
+- "a decision is missing" does not qualify. codex has no member dispatch because
+  nobody decided to mount session control into its threads, so the feature does not
+  work and the cross is the true mark. Unmeasured is for an unknown ANSWER;
+- an entry may not name a MEMBER of the deciding set, so a declaration can soften a
+  negative and never overrule a measured capability;
+- `available` stays false on the wire for an unmeasured line, so a consumer reading
+  that field alone is never handed a promise, and the panel counts the line as
+  neither half of "supports N of M".
+
+So: if your set's comment declines a capability for want of a measurement, add the
+cell with its reason. If it declines because the harness cannot, leave the cross —
+telling those two apart is the entire reason the third level exists.
+
+The one genuinely graded fact is Stage 4's routing, rendered from `Routing`'s own five
 mechanisms — and it, like the security notes, is never hidden behind a disclosure.
 
 ## Stage 3 — the spawn path
@@ -303,10 +343,10 @@ to be fencing your credential before Stage 7 lets an operator choose you.
 
 | Field | What it commits the host to |
 |---|---|
-| `entitlement_source` | One of `host_identity_store` or `own_credential_file`. The doctor row and the logout policy branch on it, so a third spelling fails a test rather than reading as a harness nobody has an answer for; a harness entitled by the ambient cloud environment adds the third when it exists. |
+| `entitlement_source` | One of `host_identity_store`, `own_credential_file` or `host_vault`. The doctor row and the logout policy branch on it, so a fourth spelling fails a test rather than reading as a harness nobody has an answer for; a harness entitled by the ambient cloud environment adds the fourth when it exists. `host_vault` means Crew holds the key and hands it to your process as an environment variable at spawn — pick it only when the harness genuinely resolves its credential from the inherited environment AND withholds that class of variable from the children it spawns itself, both verified against the harness rather than assumed. |
 | `credential_leaves` | The home-relative leaves you STORE, spliced onto the read-gate floor so an agent's file tools can read none of them. Empty when your entitlement is the host store: those locations are the host's, declared in `identity_stores.py`, and re-declaring them would hand a driver a say over the host's own store. |
 | `home_override_env_vars` | The variables that relocate your credential `$HOME`. Every declared leaf is re-anchored under each of them, which is what keeps a relocated token fenced. |
-| `adapter_own_leaves` | The leaf your own child must still read. A SUBSET of `credential_leaves`, and enforced as one: a driver may only ask the mask to spare a leaf its own declaration put on the floor, and `__post_init__` raises otherwise. Know what you are declaring: the spared leaf is readable by the harness's shell too (same process tree, and the shell gate matches no paths by design), so this is the operator's token for that vendor exposed to the model — the posture every enforced harness ships today, tracked in #10438. Declare `()` if the harness can authenticate without the file (a keyless local model; Linux presents a masked file as empty) and say so in `sign_in_remedy`. |
+| `adapter_own_leaves` | The leaf your own child must still read. A SUBSET of `credential_leaves`, and enforced as one: a driver may only ask the mask to spare a leaf its own declaration put on the floor, and `__post_init__` raises otherwise. Know what you are declaring: the spared leaf is readable by the harness's shell too (same process tree, and the shell gate matches no paths by design), so this is the operator's token for that vendor exposed to the model — the posture four enforced harnesses ship today, tracked in #10438. **Check first whether you can avoid it.** Declare `()` and `entitlement_source = host_vault` when the harness resolves a credential from its inherited environment and scrubs that class of variable from its own children: Crew then feeds the key from its vault and your credential files stay masked for the whole tree, which is strictly tighter than a carve-out. The DeepSeek Harness is the worked example. Also declare `()` if the harness can authenticate without the file at all (a keyless local model; Linux presents a masked file as empty) and say so in `sign_in_remedy`. |
 | `sign_in_remedy` | A finished sentence, server-owned and rendered verbatim wherever it appears. Untranslated on purpose — a translated per-harness string is a per-harness edit to thirteen locale files by construction, and the harness nobody remembers to add is exactly the one that needs the sentence. |
 | `host_logout_retires_children` | Whether a host logout may retire your already-running children. True only alongside `host_identity_store`; the other pairing is refused, because a logout says nothing about a store you never read. |
 
@@ -516,12 +556,12 @@ fails the one that matters. It is `ACP_BACKENDS_KNOWN` and it is NOT selectable.
 | 2 capability sets | Decided for every set. In the model channel, the effort channel and the advertised-model capture; in the session MCP array, which is the first membership won by a PROBE rather than by the advertisement (it advertises `mcpCapabilities: {"http": true}`, and stdio is ACP v1's baseline rather than an omission — a stdio entry naming an unrunnable command comes back as a failed MCP handshake, so the transport mounted). Out of steer, both compaction sets, the internal sandbox and member dispatch. |
 | 3 spawn path | Done — one binary plus a profile selector, `dsh --profile acp`, resolved override → mise → PATH. The ACP package is a plugin with no executable, so what resolves is the HOST that boots the profile it lives in. |
 | 4 handshake | Done — `PROTOCOL_VERSION_DEEPSEEK`, its own literal, integer `1`, captured off its own wire. |
-| 5 auth declaration | Done — `own_credential_file`, and less auth than any harness so far: `authMethods: []` and an `authenticate` that returns immediate success, so the ACP layer authenticates nothing and the secret it needs is a PROVIDER key. Two leaves on the floor, `~/.dsh/.credentials.yaml` and the `~/.dsh/.env` fallback, `DSH_HOME` re-anchored, `adapter_own_leaves` EMPTY. |
+| 5 auth declaration | Done — `host_vault`, the third entitlement source, constructed here. Less auth than any harness so far at the ACP layer: `authMethods: []` and an `authenticate` that returns immediate success, so that layer authenticates nothing and the secret it needs is a PROVIDER key. Two leaves on the floor, the writable credential file and the `.env` fallback under `DSH_HOME`, re-anchored. `adapter_own_leaves` is EMPTY and stays empty across the routing change: this harness resolves a provider key from its inherited environment above both files, so Crew feeds the key from its own vault (`agent.deepseek_env`) and the mask keeps both leaves for the whole process tree. |
 | 6 install probe | Done — no probe of its own; `_probe_self_served` reads this harness's record, which names `dsh` and `npm i -g @deepseek-ai/dsh`, with `restart_required` from the spawn path's own cache. Naming the HOST binary rather than the ACP package is why the command is data in the record: that package is a plugin with no executable, so advice naming it would not produce a runnable harness. |
-| 7 selectability | **Not selectable.** Named in `NOT_SHIPPED_SELECTABLE` with its reason. |
-| routing | `UNVERIFIED`, on observation rather than for want of looking. |
-| residual | The whole of it. Crew's PreToolUse gate does not run for what a session does, and there is no compensating mask either, because the mask is gated on `ENFORCED_ROUTINGS`. |
-| 8 live spill | Reached, and it is what produced the verdict: a live turn, and a corpus live for six of the seven required classes. The seventh is synthesized, because the harness produced no `session/request_permission` frame in four captures. |
+| 7 selectability | **Selectable**, as of the gate plugin. `NOT_SHIPPED_SELECTABLE` is now empty. |
+| routing | `VERIFIED_GATE_EXTENSION` with `Readback.LOAD_MARKER`. |
+| residual | Two, both named rather than closed. The read-back's witness is Crew's own plugin rather than the harness, because this harness's ACP profile publishes nothing to ask. And the env-fed key is still IN the harness process's environment, so in `danger-full-access` — where the composition mounts no pid-namespace isolation — a shell child could read it out of `/proc`. Escalating to that mode is itself a `session/request_permission` this routing's gate sees, so it is two gated steps rather than the one ungated `open()` a credential carve-out would have left. |
+| 8 live spill | Reached twice. #10373 reached it for six of the seven required classes; the seventh is live now, captured off the same harness with the gate plugin composed. |
 
 Two things this run produced that the checklist did not ask for.
 
@@ -554,30 +594,102 @@ raised a permission request. Do not let a setting's existence stand in for the
 observation — a harness with a permission vocabulary is not the same as a harness
 that asks, and only the wire can tell you which you have.
 
-The onward consequence is worth naming because it is a benefit. `UNVERIFIED` keeps
-this harness outside `ENFORCED_ROUTINGS`, so `adapter_own_leaves` must be empty,
-so it removes nothing from the OS credential deny list for its process tree. A
-harness shipping `bash` with a carve-out is a harness whose shell can `open()` the
-carved-out token; retreating to the honest verdict avoided that by construction
-rather than by a second control.
+The onward consequence was named as a benefit at the time: `UNVERIFIED` kept this
+harness outside `ENFORCED_ROUTINGS`, so `adapter_own_leaves` had to be empty, so it
+removed nothing from the OS credential deny list for its process tree. Enforcing the
+routing turns the mask ON, and the checklist's rule is that an enforced harness must
+name its own token store or be masked out of its own auth — which on a harness
+shipping `bash` would put a carve-out its shell can `open()` back. **It did not have
+to.** The harness's own credential layering resolves a provider key from the
+INHERITED PROCESS ENVIRONMENT above both of its files, and its subprocess layer
+scrubs every inherited name matching `/KEY|PASSWORD|SECRET|TOKEN/i` before spawning
+any child — so Crew feeds the key from its own secret vault
+(`agent.deepseek_env` → `acp/client.py`), declares `entitlement_source =
+host_vault`, and both leaves stay masked for the whole tree. That is what the third
+entitlement source is for, and it is the general lesson: **the rule is "name your
+own leaf OR be fed from the vault", and the second branch is the one to check
+first.** The alternative reading — that enforcement obliges a carve-out — is the one
+that would have shipped the wider posture.
 
-**The unselectable state is conditional, not terminal, and it is worth saying what
-would lift it.** Stage 7 becomes passable when a tool call reaches Kiro Crew's gate
-per call rather than only when the model asks to escalate. Three routes would do it,
-in ascending cost. The harness could route its sandbox's own decision through the
-approval seam instead of deciding it internally, which would make every in-policy
-action ask and put this harness on the same footing as OpenCode — an upstream change,
-and the cheapest if it happens. Or a Kiro Crew plugin could be composed into the
-harness's `approval/request` waterfall as the terminal answerer, which would make
-every request Crew's to decide — that means shipping a plugin into a third-party
-composition, a new kind of artifact for this repository. Or the sandbox mode could be
-pinned to a posture where the actions Crew cares about are all escalations, which is
-the weakest of the three because it depends on the model choosing to ask.
+One more rule rides on that branch: **a property of the harness the vault route rests
+on is VERIFIED at spawn, not mirrored as a constant.** Crew's copy of the scrub class
+(`/KEY|PASSWORD|SECRET|TOKEN/i`) is the validator's first filter for a mapping, but a
+harness release that narrows or drops its scrub would forward the key into every
+shell with no in-band signal. So the read-back probe sets each configured name to a
+canary (never the key — the probe boots a plugin host that needs none), and the gate
+plugin spawns one trivial child through the harness's own `ctx.subprocess` service and
+records per name whether it reached that child; Crew refuses the session when any did,
+when a name was not even set (nothing verified), or when the plugin checked a set
+other than the one Crew configured (`child_env` in the marker, judged by
+`tool_gate._deepseek_child_env_issue`). The check spawns through the harness's OWN
+subprocess seam because the property belongs to that seam — a child spawned any other
+way would say nothing about it.
 
-Until one of those exists the verdict stands. What must NOT happen is the fourth
-route: reading the approval policy back and calling it routed. That verifies a real
-setting about the wrong thing, and it would go green through every gate in this
-document.
+What is left is smaller and differently shaped: the key is in the harness process's
+environment, so in `danger-full-access` (no pid-namespace isolation) a shell child
+could read it through `/proc`. Reaching that mode is itself a
+`session/request_permission` the gate sees, so it costs two gated steps rather than
+one ungated read. An unrouted harness could make neither trade, which is exactly why
+#10373 declined to.
+
+**Stage 7 was lifted by the second of the three routes this section predicted, with
+one correction worth recording.** The prediction was a plugin composed into the
+harness's `approval/request` waterfall "as the terminal answerer, which would make
+every request Crew's to decide". That is the wrong end of the pipeline. The
+harness's ACP bridge is ALREADY an answerer in that waterfall, and answering ahead
+of it would have replaced the frame Crew wants with a decision Crew made locally.
+What was missing was an ASKER: the harness answers its own `tools/pre-execute`
+waterfall (`packages/core/tools`), and a plugin returning `{kind: 'ask'}` there
+makes the harness's tools core resolve the call through `ctx.approval`, which the
+bridge then answers by emitting `session/request_permission`. Crew adds one hop at
+the top and reuses the harness's whole existing path below it, including its
+fail-closed contract on both hops — `ask` "runs only after an approval service
+returns `allowed-once` and otherwise denies", and `ApprovalOutcome` normalizes a
+missing, throwing or non-conforming answerer to `unavailable`. So the artifact is
+smaller than predicted and re-implements none of the harness's own semantics. When
+a route looks like "answer the question Crew cares about", check first whether the
+harness will ASK it given a nudge; the asker seam is usually cheaper and always
+leaves the harness's own fail-closed behaviour in charge.
+
+The load marker verifies the route below that asker as well as the asker itself.
+The probe discards both plugin-controlled output streams and reads only that marker
+through a non-following, nonblocking descriptor. The read accepts a regular file of
+at most 64 KiB, asks for one byte beyond its fstat size to catch growth, and parses
+JSON only after those checks; a link, FIFO, directory, oversize file or changing file
+is the same malformed-marker routing refusal. At marker-write time the plugin
+enumerates the root Cordis bus's
+`approval/request` listeners and records each listener's loader entry id and module
+plus its plugin-runtime name; Crew admits only the singleton owned by
+`@deepseek-ai/dsh-acp`. Cordis exposes no public listener-enumeration API and wraps
+callbacks in reflection proxies, so the root `_hooks` owner context is the strongest
+identity available; a missing or malformed internal shape refuses rather than
+degrading to a name-only check. The marker also records the composed approval
+default, which must be `ask` (no session exists yet, so a per-session override is not
+reachable), and the tool presentation the tools service actually composed
+(`tools.mode`), which must be `native`: the overlay pins it, but the pin winning is a
+layer-ordering fact observed at one version, and the snapshot is what turns it into a
+verified property — a plugin that rewrites the composed mode to `ptc` after the pin
+is refused, as a live run shows. The final `--patch` overlay reasserts the stock
+approval row, policy and enabled ACP row after operator layers. `applyEntryPatches`
+treats each row's `name` as a match guard rather than an assignment, so it cannot
+overwrite a replaced module; the owner read-back is the fail-closed half for that
+case. The marker is the PROBE's alone and is published atomically (written beside its
+path, renamed onto it) because the probe holds the harness's stdin open until it
+exists — stdin EOF is the profile's shutdown, and that shutdown disposes the
+subprocess service the child-env proof spawns through, so an EOF handed over at boot
+would end the proof under itself. The session the probe speaks for names no marker
+path and the plugin skips the write when none is named.
+
+Two things that shape carries for a NEXT harness of the same kind. The read-back is
+a new `Readback` member rather than a new `Routing` one, because the guarantee is
+identical to pi's and only the question differs — and the difference is data beside
+the routing table, so a third harness is a row. And the read-back is honestly the
+weaker of the two: pi's witness is pi's own command registry, while this one is a
+marker Crew's plugin writes, so it attests that Crew's code ran rather than that
+the harness reports it running. That is stated at
+`agent_sdk.backends.Readback.LOAD_MARKER` rather than glossed, because the
+alternative — inventing a private ACP method to ask over — would have broken this
+profile's own declared invariant of adding no method, capability or `_meta` field.
 
 There is one further gap this run recorded rather than closed, in
 `tool_gate.ENFORCED_ROUTINGS`'s own comment: `is_enforced()` answers both "does a
@@ -602,7 +714,7 @@ permission gate of its own costs — the case none of the routing members descri
 | Stage | State |
 |---|---|
 | 1 vocabulary | Done — `ACP_BACKEND_PI`, in `ACP_BACKENDS_KNOWN`, `PROVIDER_LABEL_PI`, policy name mapped, its own model-registry namespace. |
-| 2 capability sets | Decided for every set, each on what the harness advertised or what a capture showed: in the model channel and the advertised-model capture (a `model` select whose values are `provider/model` ids out of pi's own `models.json`), out of the effort channel (the option beside it is `thought_level`, a different id and vocabulary), in the harness-owned-sessions set (a `session/load` replays the conversation and answers with `modes`, so NOT in the load-without-modes set), out of steer, out of both compaction sets (a `/compact` built-in exists but its turn shape is unobserved, so the exclusion is conservative and says so), and OUT of the session MCP array for a reason worse than absence — see below. |
+| 2 capability sets | Decided for every set, each on what the harness advertised or what a capture showed: in the model channel and the advertised-model capture (a `model` select whose values are `provider/model` ids out of pi's own `models.json`), IN the effort channel under its own spelling (the option beside it is `thought_level`, off…xhigh — a different id, recorded in `EFFORT_CONFIG_OPTION_IDS`, and a vocabulary whose one gap against Crew's ladder is folded in `EFFORT_CONFIG_OPTION_VALUES`; and because this harness serves the operator's own model ids, that advertised option is also what answers whether a level applies at all — `ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION`, the set that keeps the model registry from reporting no effort control on every session here), in the harness-owned-sessions set (a `session/load` replays the conversation and answers with `modes`, so NOT in the load-without-modes set), out of steer, out of both compaction sets (a `/compact` built-in exists but its turn shape is unobserved, so the exclusion is conservative and says so), and OUT of the session MCP array for a reason worse than absence — see below. |
 | 3 spawn path | Done — TWO components. The `pi-acp` adapter is resolved on the Node-entry ladder (`PI_ACP_BIN` override → project-local `node_modules` with the SDK marker → mise → PATH) and the `pi` agent on the plain-binary ladder (`PI_ACP_PI_COMMAND` override → mise → PATH). Both are resolved because Crew's gate launcher execs `pi` by absolute path, and the not-found message names whichever half is absent. |
 | 4 handshake | Done — `PROTOCOL_VERSION_PI`, its own literal, integer `1`, captured off pi-acp 0.0.33's wire. |
 | 5 auth declaration | Done — `own_credential_file`, `~/.pi/agent/auth.json` on the floor with `PI_CODING_AGENT_DIR` re-anchored (it moves the whole agent directory, so the default final-segment spelling is right), that leaf spared for its own child, not retired by a host logout, and a remedy that names an action without asserting a state. Verified on disk: a key planted in that file under a scratch `PI_CODING_AGENT_DIR` is what `pi auth check --credentials` reports back. |

@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import sys
 import threading
@@ -3274,6 +3275,186 @@ class TestTerminalWsIntegration:
     group serializes the heavy PTY tests, matching the gateway-test pattern.
     """
 
+    @pytest.fixture(autouse=True)
+    def _isolated_terminal_shell(self, monkeypatch, tmp_path):
+        """Keep ordinary PTY tests out of the operator's login profiles.
+
+        A developer may auto-attach every interactive login to an existing tmux
+        session. Letting these transport tests start the configured ``bash -l``
+        would then write payloads such as the multibyte boundary probe into that
+        live pane. The shim keeps a Bash basename so the readiness-marker branch
+        is still exercised, but the real shell starts without system or user
+        profiles. Tests whose subject is login-profile behavior explicitly move
+        ``HOME`` to their own synthetic profile; those calls retain the shipped
+        login-shell path.
+        """
+        if not terminal.platform_compat.IS_POSIX:
+            yield None
+            return
+
+        # Resolve Bash from a fixed set of system directories rather than the
+        # developer's PATH: a PATH-planted wrapper named ``bash`` is exactly the
+        # kind of interposer this fixture exists to keep away from the test
+        # payload, so selecting the shell through the ambient PATH would reopen
+        # that door. The trusted list still covers the ordinary developer host
+        # (``/bin`` and ``/usr/bin`` on Linux, ``/opt/homebrew/bin`` and
+        # ``/usr/local/bin`` for a Homebrew Bash on macOS), so the readiness
+        # marker branch keeps exercising the same real Bash.
+        _TRUSTED_BASH_PATH = os.pathsep.join(
+            (
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+                # NixOS and Nix-managed hosts expose the system Bash here rather
+                # than under /bin or /usr/bin.
+                "/run/current-system/sw/bin",
+            )
+        )
+        real_bash = shutil.which("bash", path=_TRUSTED_BASH_PATH)
+        if real_bash is None:
+            # This is an AUTOUSE fixture on the whole PTY-integration class, so a
+            # no-op or a skip here would silently hand the sibling tests back to
+            # the shipped resolver, which spawns ``$SHELL -l`` under the ambient
+            # HOME (the test harness pins KIROCREW_HOME, not HOME) -- exactly the
+            # side-effect this fixture exists to prevent, with no assertion left
+            # to witness it. Fail loudly instead: a host with no Bash in any
+            # trusted location must extend the list above, not run these tests
+            # unisolated.
+            raise RuntimeError(
+                "no Bash found in a trusted system location "
+                f"({_TRUSTED_BASH_PATH!r}); extend the trusted list for this host "
+                "rather than running the PTY integration tests unisolated"
+            )
+
+        ambient_home = tmp_path / "ambient-home"
+        ambient_home.mkdir()
+        profile_sentinel = tmp_path / "ambient-profile-ran"
+        profile_marker = b"__KIROCREW_AMBIENT_PROFILE_RAN__"
+        # The profile ALSO installs a PROMPT_COMMAND hook: a developer whose
+        # login profile sets PROMPT_COMMAND (e.g. an auto tmux attach, a
+        # `history -a`) is the exact case that must not fire inside the transport
+        # tests. A `--noprofile --norc` shell never sources this file, so neither
+        # the profile body nor the PROMPT_COMMAND it would install ever runs.
+        prompt_command_sentinel = tmp_path / "ambient-prompt-command-ran"
+        prompt_command_marker = b"__KIROCREW_AMBIENT_PROMPT_COMMAND_RAN__"
+        (ambient_home / ".bash_profile").write_text(
+            "printf '__KIROCREW_AMBIENT_PROFILE_RAN__\\n'\n"
+            f": > {shlex.quote(str(profile_sentinel))}\n"
+            "export PROMPT_COMMAND="
+            + shlex.quote(
+                "printf '__KIROCREW_AMBIENT_PROMPT_COMMAND_RAN__\\n'; "
+                f": > {shlex.quote(str(prompt_command_sentinel))}"
+            )
+            + "\n"
+        )
+
+        shim_dir = tmp_path / "isolated-shell"
+        shim_dir.mkdir()
+        shim = shim_dir / "bash"
+        shim.write_text("#!/bin/sh\n" f"exec {shlex.quote(real_bash)} --noprofile --norc -i\n")
+        shim.chmod(0o755)
+
+        ambient_home_text = str(ambient_home)
+        original_resolve = terminal._resolve_shell
+        original_resolve_with_fences = terminal._resolve_shell_with_fence_shells
+        monkeypatch.setenv("HOME", ambient_home_text)
+        # The readiness helper deliberately preserves a PROMPT_COMMAND exported
+        # by a real gateway. Generic tests must not execute the developer's
+        # exported hook; the dedicated preservation test installs its own value
+        # after this fixture runs.
+        monkeypatch.delenv("PROMPT_COMMAND", raising=False)
+        # An operator may export an ABSOLUTE HISTFILE from their own dotfiles.
+        # Pinning HOME does not contain it: Bash reads HISTFILE straight from the
+        # environment, and the interactive teardown flushes history on SIGHUP, so
+        # a stale absolute value would write these tests' commands outside
+        # tmp_path. Point it inside the temp home to keep the run self-contained.
+        monkeypatch.setenv("HISTFILE", str(ambient_home / ".bash_history"))
+
+        def _profiles_are_under_test() -> bool:
+            return os.environ.get("HOME") != ambient_home_text
+
+        def _resolve(cfg):
+            if not terminal.platform_compat.IS_POSIX or _profiles_are_under_test():
+                return original_resolve(cfg)
+            return str(shim), None
+
+        def _resolve_with_fences(cfg):
+            if not terminal.platform_compat.IS_POSIX or _profiles_are_under_test():
+                return original_resolve_with_fences(cfg)
+            return str(shim), None, {}
+
+        monkeypatch.setattr(terminal, "_resolve_shell", _resolve)
+        monkeypatch.setattr(terminal, "_resolve_shell_with_fence_shells", _resolve_with_fences)
+        yield {
+            "marker": profile_marker,
+            "sentinel": profile_sentinel,
+            "prompt_command_marker": prompt_command_marker,
+            "prompt_command_sentinel": prompt_command_sentinel,
+            "shell": shim,
+        }
+
+    @pytest.mark.skipif(
+        terminal.platform_compat.IS_WINDOWS,
+        reason="POSIX login-profile isolation; Windows uses ConPTY",
+    )
+    @pytest.mark.asyncio
+    async def test_default_shell_does_not_source_ambient_profiles(
+        self,
+        monkeypatch,
+        tmp_path,
+        _isolated_terminal_shell,
+    ):
+        """The ordinary integration shell cannot execute an ambient profile."""
+        isolation = _isolated_terminal_shell
+        assert isolation is not None
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        output = bytearray()
+        ready_seen = False
+        try:
+            async with TestClient(TestServer(app)) as client:
+                async with client.ws_connect("/api/ws/terminal/profile-isolation") as ws:
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + 15
+                    while loop.time() < deadline:
+                        msg = await ws.receive(timeout=deadline - loop.time())
+                        if msg.type == web.WSMsgType.BINARY:
+                            output.extend(msg.data)
+                        elif msg.type == web.WSMsgType.TEXT:
+                            if json.loads(msg.data).get("type") == "ready":
+                                ready_seen = True
+                                break
+                        elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                            break
+                    await ws.close()
+        finally:
+            spawned = registry.get("profile-isolation")
+            if spawned is not None:
+                await terminal._kill_session(spawned)
+
+        assert ready_seen, "isolated Bash never emitted its readiness marker"
+        assert registry["profile-isolation"].shell == str(isolation["shell"])
+        assert isolation["marker"] not in bytes(output)
+        assert not isolation["sentinel"].exists()
+        # A PROMPT_COMMAND set by the ambient login profile (e.g. a developer's
+        # auto tmux attach) must not fire either: --noprofile --norc never
+        # sources the profile that would export it.
+        assert isolation["prompt_command_marker"] not in bytes(
+            output
+        ), "the ambient profile's PROMPT_COMMAND ran inside the isolated shell"
+        assert not isolation["prompt_command_sentinel"].exists()
+
     @pytest.mark.asyncio
     async def test_ws_spawn_and_disconnect(self, monkeypatch, tmp_path):
         """Connect via WS, spawn a PTY, then disconnect — session stays in registry."""
@@ -3450,10 +3631,11 @@ class TestTerminalWsIntegration:
         shell that writes line by line hands the reader whole lines and every
         read then lands on a character boundary by accident — an earlier version
         of this test passed against the corrupting code for exactly that reason.
-        A single unbroken run of 3-byte characters longer than one 4096-byte read
-        cannot be split cleanly, since 4096 is not a multiple of 3."""
-        char = "中"
-        count = 3000  # 9000 bytes: at least two reads, neither aligned
+        The repeated token starts with a 4-byte ghost emoji and is 9 bytes in
+        total. A 4096-byte read retains one byte of the next token, so the read
+        boundary cuts through that emoji instead of landing between code points."""
+        token = "👻Kiro!"
+        count = 1000  # 9000 bytes: at least two reads, first splits the emoji
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
         monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
@@ -3467,7 +3649,7 @@ class TestTerminalWsIntegration:
         async with TestClient(TestServer(app)) as client:
             async with client.ws_connect("/api/ws/terminal/multibyte") as ws:
                 await ws.send_bytes(
-                    f"printf '{char}%.0s' $(seq 1 {count}); printf 'DO''NE\\n'\n".encode()
+                    f"printf '{token}%.0s' $(seq 1 {count}); printf 'DO''NE\\n'\n".encode()
                 )
                 seen = b""
                 for _ in range(400):
@@ -3481,7 +3663,7 @@ class TestTerminalWsIntegration:
             await terminal._kill_session(registry["multibyte"])
 
         assert "\ufffd".encode() not in seen, "a read boundary corrupted a character"
-        assert seen.count(char.encode()) >= count
+        assert seen.count(token.encode()) >= count
 
     @pytest.mark.asyncio
     async def test_submitted_line_invalidates_the_cwd_memo(self, monkeypatch, tmp_path):

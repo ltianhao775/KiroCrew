@@ -70,34 +70,32 @@ function StatusIndicator({ label }: { label: string }) {
   )
 }
 
-/**
- * True when a failed credit-meter save was the owner gate refusing, not a
- * transient failure.
- *
- * Enabling this field is owner-only (handlers/core.py refuses with 403 and the
- * standard `owner_only` code). The generic line ends "you can try again", which
- * for a non-owner is a loop: the retry can never succeed. Duck-typed on
- * `status` and the body rather than `instanceof ApiError`, the same way
- * `isNotFoundError` is, so a suite that mocks `api/client` still reaches this
- * branch.
- */
-function isOwnerOnlyRefusal(err: unknown): boolean {
-  const e = err as { status?: unknown; body?: unknown } | null
-  return (
-    typeof e === 'object' &&
-    e !== null &&
-    e.status === 403 &&
-    String(e.body ?? '').includes('owner_only')
-  )
-}
-
 export function DisplayPanel() {
   const ime = useImeGuard()
   const { language, detected: detectedLanguage, setLanguage, syncFailed: langSyncFailed } = useLanguage()
   const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily } = useZoomCtx()
   // Shortcut label for the zoom hint/description: ⌘ on macOS, Ctrl elsewhere.
   const modKey = /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl'
-  const { preference, setTheme, colorTheme, setColorTheme, allThemes, loadCustomThemes, themeSwitching, overridesDropReport } = useTheme()
+  const {
+    preference,
+    setTheme,
+    colorTheme,
+    setColorTheme,
+    allThemes,
+    loadCustomThemes,
+    themeSwitching,
+    overridesDropReport,
+    installedThemeLoadFailed,
+  } = useTheme()
+  // The load-error notice is shown only for a pack that is actually unstyled.
+  // `installedThemeLoadFailed` is derived in the provider from the selection,
+  // the catalog and the detail map, so a failed reload whose last good detail
+  // is still in the map (render-cache seed or carry-forward) is false: the
+  // theme stays on screen and no notice contradicts it. The copy names the way
+  // out that exists for this pack: an installed pack can be reinstalled, an
+  // editor-created one can only be edited or swapped.
+  const showThemeLoadError = installedThemeLoadFailed
+  const isInstalledTheme = allThemes.find((t) => t.value === colorTheme)?.installed === true
   const { uiMode, setUIMode } = useUIMode()
   const editor = useThemeEditor()
   const termFont = useTerminalFont()
@@ -167,7 +165,6 @@ export function DisplayPanel() {
   type KirocrewCfg = {
     dashboard?: {
       recent_tint_count?: number
-      usage_text_scrape_enabled?: boolean
       terminal?: { shell?: string; completion?: { enabled?: boolean } }
     }
   }
@@ -278,54 +275,6 @@ export function DisplayPanel() {
     onSupersede: () => setCompletionError(null),
   }))
 
-  // ── Billed credit-meter fallback (server-side; dashboard.usage_text_scrape_enabled) ──
-  // Copies the terminal-completion toggle directly above: same ['kirocrewConfig']
-  // query, same `api.patchConfig` write, same per-path overlay, same
-  // onFailure/onSupersede error line. Before this the key was declared in the
-  // schema but missing from the PATCH allowlist, so no control could have saved
-  // it at all (see handlers/core.py `_EDITABLE_CONFIG`).
-  //
-  // `=== true` is not a UI default, it MIRRORS the backend's own coercion:
-  // config/loader.py stores this field as `_safe_bool(..., False)` and
-  // config/sections.py:357 defines `_safe_bool` as "return value only when it
-  // is a real bool, else default". So a hand-edited `"true"` string is read as
-  // OFF by the gate, and must render OFF here too — the same reasoning the
-  // completion toggle above applies with its `!== false` (its default is on,
-  // ours is off). A config that has never carried the key renders OFF, so
-  // installing this control changes nothing until the user flips it.
-  //
-  // No restart prompt, which the issue asked about: the reader calls
-  // `KiroCrewConfig.load()` per check and the config cache is keyed on
-  // `_config_fingerprint()` (st_mtime_ns + st_size + st_mode), whose docstring
-  // says any edit busts it — so the next refresh interval already sees the new
-  // value. A banner promising a restart would be a false instruction.
-  //
-  // Locked for the round-trip (`scrapeMut.isPending`), like the shell field
-  // below and unlike the completion toggle above. The overlay's token guard
-  // already keeps the DISPLAYED value and the cache write coherent, but it
-  // cannot order two PATCHes in flight: rapid on-off clicks are ordinary, and
-  // if they land out of order the server keeps `true` after the user's final
-  // `false`. For this key that is not a cosmetic revert, it is billed refreshes
-  // the user switched off, so the second click is made unrepresentable instead.
-  const serverScrape = mcQ.data?.dashboard?.usage_text_scrape_enabled === true
-  const shownScrape = overlay.shown('dashboard.usage_text_scrape_enabled', serverScrape)
-  const [scrapeError, setScrapeError] = useState<string | null>(null)
-  const scrapeMut = useMutation(overlay.mutationOpts<boolean>({
-    queryKey: ['kirocrewConfig'],
-    mutationFn: (value: boolean) => api.patchConfig('dashboard.usage_text_scrape_enabled', value),
-    path: () => 'dashboard.usage_text_scrape_enabled',
-    displayValue: v => v,
-    applyToCache: (cached, value) =>
-      setConfigPathValue(cached as KirocrewCfg, 'dashboard.usage_text_scrape_enabled', value),
-    onFailure: err =>
-      setScrapeError(
-        isOwnerOnlyRefusal(err)
-          ? i18nT('pages.settings.displayPanel.credit_usage_scrape_owner_only')
-          : i18nT('pages.settings.displayPanel.credit_usage_scrape_save_failed'),
-      ),
-    onSupersede: () => setScrapeError(null),
-  }))
-
   // ── Install theme (Level 0) from a local folder or a GitHub repo ──
   const [installType, setInstallType] = useState<'github' | 'local'>('github')
   const [installValue, setInstallValue] = useState('')
@@ -404,32 +353,6 @@ export function DisplayPanel() {
               { value: 'cli', label: 'CLI' },
             ]}
             onChange={v => setUIMode(v as 'chat' | 'cli')} />
-          {/* The credit pill's data source. It sits on Display because the pill
-              is dashboard chrome and the issue asked for it here; the closest
-              boolean of the same family (link_previews, also opt-in and also
-              off for a non-display reason) lives on the Chat tab, so this is
-              the reporter's placement rather than that sibling's.
-
-              `description` is a bare i18nT() call, not an element: the settings
-              extractor reads it only as a string literal or a t() call
-              (scripts/settingsExtract.ts `extractStringProp`), so wrapping it
-              would drop this row's description from the command-palette
-              registry with no type error. The sentence reuses the cost
-              disclosure the account modal already ships in every locale
-              (components.kiroAccountModal.credit_usage_scrape_disabled). */}
-          <SettingsToggle
-            label={i18nT('pages.settings.displayPanel.credit_usage_scrape')}
-            description={i18nT('pages.settings.displayPanel.credit_usage_scrape_desc')}
-            checked={shownScrape}
-            onChange={v => scrapeMut.mutate(v)}
-            disabled={scrapeMut.isPending || !mcQ.isSuccess}
-            configKey="dashboard.usage_text_scrape_enabled"
-          />
-          {/* A rejected write rolls the switch back, which is honest but silent
-              about why. No hand-off: `shellDraft` and `installValue` elsewhere
-              on this panel are unsaved local state the navigation would
-              discard — same rule as the language notice above. */}
-          <ErrorNotice message={scrapeError} variant="inline" />
         </SettingsCard>
       </SettingsSection>
 
@@ -571,6 +494,25 @@ export function DisplayPanel() {
               never be attributed to the wrong pack. */}
           {overridesDropReport && colorTheme === `custom-${overridesDropReport.slug}` && (
             <ThemeDroppedRulesNotice report={overridesDropReport} />
+          )}
+          {/* The active custom theme's detail fetch failed AND no last good
+              detail is in the map, so its variables and branding are not on
+              screen: say so and name the way out instead of leaving the picker
+              showing a theme that is not applied. `installedThemeLoadFailed` is
+              derived by the provider (listed pack, detail absent from the map),
+              so a failed reload with the render-cache seed still applied keeps
+              the screen themed and gets no notice. Two copies: an installed pack
+              can be reinstalled; an editor-created pack has no install source,
+              so it is told to edit or pick another. The flag is the provider's
+              trigger only; the rejection is never shown. No hand-off:
+              the `shellDraft` and `installValue` fields further down this panel
+              are unsaved local state, and the navigation unmounts the panel. */}
+          {showThemeLoadError && (
+            <ErrorNotice
+              message={isInstalledTheme
+                ? i18nT('pages.settings.displayPanel.installed_theme_could_not_be_loaded')
+                : i18nT('pages.settings.displayPanel.custom_theme_could_not_be_loaded')}
+            />
           )}
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.mode')} description={i18nT('pages.settings.displayPanel.light_or_dark_appearance_for_the_dashboard')} value={preference}
             options={[

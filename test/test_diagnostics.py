@@ -24,7 +24,7 @@ import pytest
 import yaml
 
 from conftest import make_dir_link, requires_symlinks
-from kiro_crew import beacon, diagnostics
+from kiro_crew import beacon, diagnostics, release_channel
 from kiro_crew.dashboard.handlers import diagnostics as dh
 from kiro_crew.diagnostics import BundleResult
 
@@ -45,6 +45,22 @@ _SECRETS = (
 )
 
 
+def _pin_provenance(monkeypatch, *, distribution=None, recorded=None) -> None:
+    """Answer the two release-provenance probes in-process.
+
+    ``release_channel.provenance`` reads the installed distribution's metadata
+    version and the ``$KIROCREW_HOME/channel`` record beside the version stamp.
+    Both are host state -- the developer running this suite may follow a lane
+    and has SOME ``kirocrew`` dist-info installed -- so every bundle test pins
+    them, defaulting to "nothing beyond the version stamp", which is what a
+    source checkout and a desktop install with no record look like.
+    """
+    monkeypatch.setattr(
+        release_channel, "distribution_version", lambda: distribution, raising=False
+    )
+    monkeypatch.setattr(release_channel, "recorded_channel", lambda: recorded, raising=False)
+
+
 def _isolate(monkeypatch, home: Path) -> None:
     """Point the collector at a temp home and stub host-specific probes."""
     home.mkdir(parents=True, exist_ok=True)
@@ -53,6 +69,7 @@ def _isolate(monkeypatch, home: Path) -> None:
     monkeypatch.setattr(diagnostics, "_kiro_cli_chat_log", lambda: None)
     monkeypatch.setattr(diagnostics, "_kiro_cli_extra_logs", lambda: [])
     monkeypatch.setattr(diagnostics, "_kiro_cli_version", lambda: "kiro-cli 2.14.2")
+    _pin_provenance(monkeypatch)
 
 
 def test_collect_bundle_redacts_and_zips(tmp_path, monkeypatch):
@@ -378,6 +395,7 @@ class TestTerminalIssueUrlSurvivesRedaction:
         from kiro_crew import diagnostics
 
         monkeypatch.setattr(diagnostics, "_kiro_cli_version", lambda: "kiro-cli 2.14.2")
+        _pin_provenance(monkeypatch)
 
     def _result(self, tmp_path):  # type: ignore[no-untyped-def]
         from kiro_crew import diagnostics
@@ -459,14 +477,16 @@ class TestTerminalIssueUrlSurvivesRedaction:
     ],
 )
 def test_channel_covers_both_version_spellings(monkeypatch, version, expected):
-    """``_channel`` must answer for desktop SemVer AND wheel PEP 440 stamps.
+    """The report's lane must follow desktop SemVer AND wheel PEP 440 stamps.
 
     The SemVer half mirrors ``auto-update.js`` ``channelForVersion``; the PEP
     440 half exists because ``build-wheel.yml`` rewrites ``__version__`` to the
-    wheel version, which spells the same prerelease without a hyphen.
+    wheel version, which spells the same prerelease without a hyphen. With no
+    metadata and no record, the pipeline's own spelling is the whole evidence.
     """
     monkeypatch.setattr(diagnostics, "__version__", version)
-    assert diagnostics._channel() == expected
+    _pin_provenance(monkeypatch)
+    assert diagnostics._provenance().channel == expected
 
 
 def test_prerelease_wheel_is_never_reported_as_stable(monkeypatch):
@@ -477,9 +497,10 @@ def test_prerelease_wheel_is_never_reported_as_stable(monkeypatch):
     arrived indistinguishable from a supported build's — the opposite of the
     point of having a prerelease channel.
     """
+    _pin_provenance(monkeypatch)
     for version in ("0.1.4rc4", "0.1.4.dev20260807061500"):
         monkeypatch.setattr(diagnostics, "__version__", version)
-        assert diagnostics._channel() != "stable", version
+        assert diagnostics._provenance().channel != "stable", version
 
 
 def test_channel_never_returns_the_old_prerelease_name(monkeypatch):
@@ -488,9 +509,10 @@ def test_channel_never_returns_the_old_prerelease_name(monkeypatch):
     An insider build could report it, so its bug reports would arrive tagged with
     a lane nobody triages by. Every answer must be a key of the label map.
     """
+    _pin_provenance(monkeypatch)
     for version in ("0.1.4", "0.1.4-insider.1", "0.1.4-nightly.20260807t0615"):
         monkeypatch.setattr(diagnostics, "__version__", version)
-        assert diagnostics._channel() in diagnostics._CHANNEL_LABELS
+        assert diagnostics._provenance().channel in diagnostics._CHANNEL_LABELS
 
 
 @pytest.mark.parametrize(
@@ -550,6 +572,247 @@ def test_issue_url_does_not_prefill_the_search_attestation(tmp_path, monkeypatch
     assert "search" not in parse_qs(urlsplit(r.github_issue_url).query)
 
 
+# ── Trusted release-channel provenance ───────────────────────────────────────
+#
+# A packaged build can carry TWO identities: the running ``__version__`` may be
+# a repackager's plain four-part build stamp (``0.7.0.5``, the shape the
+# BUILD_VERSION rule admits -- and that rule REFUSES a stamp over a prerelease
+# base, so stamping strips the marker by construction), while the installed
+# distribution's metadata still says ``0.7.0rc7``. Classifying the stamp alone
+# reports every such insider build as Stable, exposes the wrapper-internal
+# stamp in the public version field, and attaches ``channel: stable`` at
+# create time, where the reporter cannot take it back.
+
+
+def _prefill(url: str) -> tuple[list[str], list[str], list[str]]:
+    params = parse_qs(urlsplit(url).query)
+    return params["version"], params["channel"], params["labels"]
+
+
+class TestReportProvenance:
+    """The prefilled report comes from trusted provenance, never from a guess."""
+
+    def test_packaged_insider_build_reports_its_public_release(self, tmp_path, monkeypatch):
+        """The reporter's case: plain wrapper stamp, rc distribution, insider record."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0.5")
+        _pin_provenance(monkeypatch, distribution="0.7.0rc7", recorded="insider")
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        assert _prefill(r.github_issue_url) == (
+            ["0.7.0"],
+            ["Insider (prerelease)"],
+            ["bug,channel: insider"],
+        )
+        assert "0.7.0.5" not in r.github_issue_url
+
+    def test_packaged_insider_build_needs_no_channel_record(self, tmp_path, monkeypatch):
+        """A desktop install writes no ``channel`` file; the rc marker in the
+        distribution metadata is provenance enough for an insider build."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0.5")
+        _pin_provenance(monkeypatch, distribution="0.7.0rc7", recorded=None)
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        assert _prefill(r.github_issue_url) == (
+            ["0.7.0"],
+            ["Insider (prerelease)"],
+            ["bug,channel: insider"],
+        )
+
+    def test_absent_provenance_prefills_not_sure_and_no_channel_label(self, tmp_path, monkeypatch):
+        """A build stamp says nothing about its lane. With no distribution
+        metadata and no record, the honest dropdown answer is the form's own
+        ``Not sure`` -- and no ``channel:`` label, because a create-time label
+        outlives whatever the reporter later picks in the dropdown."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0.5")
+        _pin_provenance(monkeypatch, distribution=None, recorded=None)
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        assert _prefill(r.github_issue_url) == (["0.7.0"], ["Not sure"], ["bug"])
+
+    def test_contradictory_provenance_prefills_not_sure(self, tmp_path, monkeypatch):
+        """A stable record over a prerelease build -- a promoted-stable install
+        (promotion never re-stamps) or a lane switch not yet applied -- is a
+        contradiction, and the report guesses neither side."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0rc7")
+        _pin_provenance(monkeypatch, distribution="0.7.0rc7", recorded="stable")
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        assert _prefill(r.github_issue_url) == (["0.7.0rc7"], ["Not sure"], ["bug"])
+
+    def test_stable_release_is_unchanged(self, tmp_path, monkeypatch):
+        """Pin: a real stable release still files as Stable with its label."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0")
+        _pin_provenance(monkeypatch, distribution="0.7.0", recorded=None)
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        assert _prefill(r.github_issue_url) == (["0.7.0"], ["Stable"], ["bug,channel: stable"])
+
+    @pytest.mark.parametrize(
+        ("version", "option", "label"),
+        [
+            ("0.7.0-insider.4", "Insider (prerelease)", "channel: insider"),
+            ("0.7.0-nightly.20260907t061500", "Nightly", "channel: nightly"),
+        ],
+    )
+    def test_desktop_prerelease_keeps_its_lane_over_unstamped_metadata(
+        self, tmp_path, monkeypatch, version, option, label
+    ):
+        """Pin: ``packaging/build-desktop.sh`` pip-installs the checkout, whose
+        ``pyproject.toml`` version the desktop lanes never stamp, so a desktop
+        insider or nightly build carries a plain ``0.7.0`` in its dist-info
+        beside the stamped ``__version__``. Plain metadata is silence, not a
+        stable claim: the build's own marker decides, and the public version
+        stays the pipeline's spelling."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", version)
+        _pin_provenance(monkeypatch, distribution="0.7.0", recorded=None)
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        assert _prefill(r.github_issue_url) == ([version], [option], [f"bug,{label}"])
+
+    def test_terminal_link_carries_the_same_provenance(self, tmp_path, monkeypatch):
+        """``kirocrew doctor --bundle`` prints the bounded variant; it must not
+        answer differently from the dashboard's link."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0.5")
+        _pin_provenance(monkeypatch, distribution="0.7.0rc7", recorded=None)
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+        url = diagnostics.terminal_issue_url(r)
+
+        assert _prefill(url) == (["0.7.0"], ["Insider (prerelease)"], ["bug,channel: insider"])
+        assert "0.7.0.5" not in url
+
+    def test_private_bundle_keeps_the_wrapper_stamp(self, tmp_path, monkeypatch):
+        """The stamp is not lost, it moves: the bundle the reporter drags in is
+        private, so it records both identities and the resolved lane."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0.5")
+        _pin_provenance(monkeypatch, distribution="0.7.0rc7", recorded=None)
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        with zipfile.ZipFile(r.zip_path) as z:
+            versions = z.read("versions.txt").decode()
+            manifest = json.loads(z.read("manifest.json"))
+        for line in (
+            "kirocrew_version: 0.7.0.5",
+            "release: 0.7.0",
+            "distribution_version: 0.7.0rc7",
+            "channel: insider",
+            "channel_record: absent",
+        ):
+            assert line in versions, line
+        assert manifest["kirocrew_version"] == "0.7.0.5"
+        assert manifest["release"] == "0.7.0"
+        assert manifest["distribution_version"] == "0.7.0rc7"
+        assert manifest["channel"] == "insider"
+        assert manifest["channel_record"] is None
+        # Private keeps the stamp; the public field is still the folded release.
+        assert _prefill(r.github_issue_url)[0] == ["0.7.0"]
+        assert "0.7.0.5" not in r.github_issue_url
+
+    def test_private_bundle_records_the_channel_record(self, tmp_path, monkeypatch):
+        """The ``$KIROCREW_HOME/channel`` record is evidence, so both private
+        surfaces name it verbatim -- the manifest as the same value the
+        resolver weighed, not a re-derivation."""
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0.5")
+        _pin_provenance(monkeypatch, distribution="0.7.0rc7", recorded="insider")
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        with zipfile.ZipFile(r.zip_path) as z:
+            versions = z.read("versions.txt").decode()
+            manifest = json.loads(z.read("manifest.json"))
+        assert "channel_record: insider" in versions
+        assert manifest["channel_record"] == "insider"
+        assert manifest["distribution_version"] == "0.7.0rc7"
+        assert manifest["channel"] == "insider"
+
+    def test_private_bundle_names_an_unknown_lane_as_unknown(self, tmp_path, monkeypatch):
+        _isolate(monkeypatch, tmp_path / "home")
+        monkeypatch.setattr(diagnostics, "__version__", "0.7.0.5")
+        _pin_provenance(monkeypatch, distribution=None, recorded=None)
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+        with zipfile.ZipFile(r.zip_path) as z:
+            versions = z.read("versions.txt").decode()
+            manifest = json.loads(z.read("manifest.json"))
+        assert "channel: unknown" in versions
+        assert "distribution_version: unavailable" in versions
+        assert manifest["channel"] == "unknown"
+        # A silent source is JSON null in the manifest, a sentinel word only in
+        # the text file a human reads.
+        assert manifest["distribution_version"] is None
+        assert manifest["channel_record"] is None
+
+    def test_one_bundle_is_written_from_one_resolution(self, tmp_path, monkeypatch):
+        """``set_release_channel`` is served on the event loop while
+        ``collect_bundle`` runs in a worker thread, so the ``channel`` record
+        can change between two reads of it. The bundle must not carry a
+        ``versions.txt``, a ``manifest.json`` and an issue link that each read
+        the record at a different moment: one resolution, taken before any
+        member is written, feeds all three (and the terminal link)."""
+        _isolate(monkeypatch, tmp_path / "home")
+        before = release_channel.Provenance(
+            version="0.7.0rc7",
+            release="0.7.0rc7",
+            distribution="0.7.0rc7",
+            recorded="insider",
+            channel="insider",
+        )
+        # The same build after a stable record landed mid-collection: the
+        # sources now disagree, so a later read resolves to no lane at all.
+        after = before._replace(recorded="stable", channel=None)
+        calls: list[int] = []
+
+        def flipping() -> release_channel.Provenance:
+            calls.append(1)
+            return before if len(calls) == 1 else after
+
+        monkeypatch.setattr(diagnostics, "_provenance", flipping)
+
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+        terminal = diagnostics.terminal_issue_url(r)
+
+        with zipfile.ZipFile(r.zip_path) as z:
+            versions = dict(
+                line.split(": ", 1) for line in z.read("versions.txt").decode().splitlines()
+            )
+            manifest = json.loads(z.read("manifest.json"))
+        seen = (
+            versions["channel"],
+            versions["channel_record"],
+            manifest["channel"],
+            manifest["channel_record"],
+            _prefill(r.github_issue_url)[1],
+            _prefill(terminal)[1],
+        )
+        assert seen == (
+            "insider",
+            "insider",
+            "insider",
+            "insider",
+            ["Insider (prerelease)"],
+            ["Insider (prerelease)"],
+        ), f"one bundle, mixed provenance (versions.txt, manifest, url, terminal): {seen}"
+        assert len(calls) == 1, f"provenance resolved {len(calls)} times for one bundle"
+        assert r.provenance == before
+
+
 # ── Template / label-vocabulary drift guards ─────────────────────────────────
 #
 # Dropdown prefill matches option text VERBATIM and silently no-ops on a miss,
@@ -582,6 +845,9 @@ def test_channel_options_exist_in_the_issue_template():
         )
     # Every channel the classifier can return must be prefillable.
     assert set(diagnostics._CHANNEL_OPTIONS) == set(diagnostics._CHANNEL_LABELS)
+    # The fallback for unknown or contradictory provenance is the form's OWN
+    # option, so it is subject to the same verbatim-match pin.
+    assert release_channel.UNKNOWN_CHANNEL_FORM_OPTION in options
 
 
 def test_install_options_exist_in_the_issue_template():

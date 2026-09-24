@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import chatReducer, {
+  appendQueuedMessage,
+  editQueuedMessage,
+  queueEntryAttachments,
   setActiveSlot,
   sseChatMessage,
   hydrateSlotMessages,
@@ -277,6 +280,78 @@ describe('slot-detail hydration is centralized (shared hydrateQueuedBubbles path
     // stale 'qOld' bubble alongside 'qNew'.
     expect(queued.map((m) => m.content)).toEqual(['fresh'])
     expect(queued[0].meta?.queueId).toBe('qNew')
+  })
+})
+
+describe('queue entries carry their attachment lists onto the queued row', () => {
+  // The server echoes each entry's `meta.files` / `meta.dirs` on the
+  // slot-detail queue item and the `queue_push` frame; both hydration paths
+  // put them on the row's meta so a cancel can restore a spaced path exactly.
+  const spaced = '/Users/me/Desktop/My Report.pdf'
+  const detail = (queue: Array<{ content: string; queueId: string; ts: string; files?: string[]; dirs?: string[] }>) => ({
+    key: 'active',
+    messages: [{ role: 'user', content: 'hi', cls: '' }],
+    running: false,
+    stopping: false,
+    hasMore: false,
+    total: 1,
+    queue,
+  })
+
+  it('slot-detail hydration keeps the lists on the row meta, and omits them when absent', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(
+      switchSlot.fulfilled(
+        detail([
+          { content: `x\n[attached_file 1] ${spaced}`, queueId: 'q1', ts: 't', files: [spaced], dirs: ['/srv/d'] },
+          { content: 'plain', queueId: 'q2', ts: 't' },
+        ]),
+        'r',
+        'active',
+      ),
+    )
+    const queued = store.getState().chat.messages.filter((m) => m.role === 'queued')
+    expect(queued[0].meta).toEqual({ queueId: 'q1', files: [spaced], dirs: ['/srv/d'] })
+    expect(queued[1].meta).toEqual({ queueId: 'q2' })
+  })
+
+  it('a queue_push frame puts its meta lists on the row, keeping only well-formed lists', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(appendQueuedMessage({ slot: 'active', content: 'x', ts: 't', queue_id: 'q1', meta: { files: [spaced], dirs: 'not-a-list', sendId: 's-1' } }))
+    store.dispatch(appendQueuedMessage({ slot: 'active', content: 'y', ts: 't', queue_id: 'q2' }))
+    const queued = store.getState().chat.messages.filter((m) => m.role === 'queued')
+    expect(queued[0].meta).toEqual({ queueId: 'q1', files: [spaced] })
+    expect(queued[1].meta).toEqual({ queueId: 'q2' })
+  })
+
+  it('a server queue_edit frame replaces the row lists; an empty set clears them; an optimistic edit keeps them', () => {
+    const other = '/tmp/other.txt'
+    const store = makeStore()
+    store.dispatch(setActiveSlot('active'))
+    store.dispatch(appendQueuedMessage({ slot: 'active', content: `[attached_file 1] ${other}\n[attached_file 2] ${spaced}`, ts: 't', queue_id: 'q1', meta: { files: [other, spaced] } }))
+    const row = () => store.getState().chat.messages.find((m) => m.role === 'queued')!
+    // Optimistic local edit: the client cannot know how the server pruned the
+    // lists, so it changes the text only.
+    store.dispatch(editQueuedMessage({ slot: 'active', queue_id: 'q1', content: `[attached_file 2] ${spaced}` }))
+    expect(row().meta).toEqual({ queueId: 'q1', files: [other, spaced] })
+    // The server's frame: the edit removed marker 1, so the survivor is
+    // renumbered and the list shrinks with it -- the row takes both.
+    store.dispatch(editQueuedMessage({ slot: 'active', queue_id: 'q1', content: `[attached_file 1] ${spaced}`, attachments: { files: [spaced] } }))
+    expect(row().content).toBe(`[attached_file 1] ${spaced}`)
+    expect(row().meta).toEqual({ queueId: 'q1', files: [spaced] })
+    // Every marker gone: the frame carries no meta, and the reducer clears.
+    store.dispatch(editQueuedMessage({ slot: 'active', queue_id: 'q1', content: 'just text', attachments: {} }))
+    expect(row().meta).toEqual({ queueId: 'q1' })
+  })
+
+  it('queueEntryAttachments drops anything but a non-empty list of strings', () => {
+    expect(queueEntryAttachments(undefined)).toEqual({})
+    expect(queueEntryAttachments({ files: [] })).toEqual({})
+    expect(queueEntryAttachments({ files: [spaced, 42] })).toEqual({})
+    expect(queueEntryAttachments({ files: [spaced, ''] })).toEqual({})
+    expect(queueEntryAttachments({ files: [spaced], dirs: ['/a'] })).toEqual({ files: [spaced], dirs: ['/a'] })
   })
 })
 

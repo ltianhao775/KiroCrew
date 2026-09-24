@@ -32,7 +32,6 @@ const trace = (over: Partial<ContextTrace> = {}): ContextTrace => ({
   totals: { loaded_skill: 4000, history: 6000 },
   injected_chars: 10000,
   user_chars: 0,
-  estimated_other_chars: 0,
   peak_context_used: 12000,
   context_window: 200000,
   window_days: 14,

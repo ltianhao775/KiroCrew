@@ -17,12 +17,19 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import pathlib
+import re
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew import subagent as subagent_module
+from kiro_crew.subagent import (
+    _RUN_ID_HEX_CHARS,
+    SubagentInfo,
+    SubagentManager,
+)
 from kiro_crew.subagent_scale import SubagentEventCoalescer
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
@@ -482,6 +489,125 @@ class TestBatchIdentity:
         assert events[0][2]["outcome"] == "stopped"
 
     @pytest.mark.asyncio
+    async def test_stage_owned_queued_stop_holds_its_parent_report_barrier(self):
+        """The next stage waits until its queued predecessor reports stopped."""
+        from kiro_crew.subagent import stage_boundary_owner_for_run
+
+        report_started = asyncio.Event()
+        release_report = asyncio.Event()
+        announced: list[SubagentInfo] = []
+
+        async def on_done(info):  # type: ignore[no-untyped-def]
+            announced.append(info)
+            report_started.set()
+            await release_report.wait()
+
+        parent = "dashboard:one"
+        owner = "stage-owner"
+        mgr = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx(),
+            on_done=on_done,
+        )
+        mgr._queue = [
+            {
+                "task": "stage-owned queued task",
+                "_preassigned_id": "q-stage-stop",
+                "parent_session_key": parent,
+                "_stage_boundary_owner": owner,
+            }
+        ]
+        mgr._emit_queue_depth = MagicMock()
+
+        assert await mgr.cancel("q-stage-stop") is True
+        await report_started.wait()
+        barrier = asyncio.create_task(mgr.wait_for_parent_reports(parent, owner))
+        await asyncio.sleep(0)
+
+        assert stage_boundary_owner_for_run(announced[0]) == owner
+        assert not barrier.done(), "the next stage captured a late queued-stop report"
+
+        release_report.set()
+        assert await barrier is True
+
+    def test_stage_boundary_owner_survives_every_run_reconstruction_site(self):
+        """Every run copy keeps the boundary token that admitted its source."""
+        import inspect
+        from types import SimpleNamespace
+
+        from kiro_crew.dashboard.handlers.messaging import (
+            _stage_boundary_owner_for_parent,
+            _stage_boundary_slot_for_parent,
+            api_spawn_retry,
+        )
+        from kiro_crew.dashboard.state import StageBoundary
+        from kiro_crew.subagent_manager.admission.gate import _GateMixin
+        from kiro_crew.subagent_manager.cancellation import CancellationCoordinator
+        from kiro_crew.subagent_manager.continuation import ContinuationCoordinator
+
+        requirements = {
+            "spawn": (SubagentManager.spawn, "_stage_boundary_owner=_stage_boundary_owner"),
+            "spawn result": (
+                SubagentManager.spawn,
+                "result._stage_boundary_owner = _stage_boundary_owner",
+            ),
+            "queued spawn": (
+                _GateMixin.spawn_impl,
+                '"_stage_boundary_owner": _stage_boundary_owner',
+            ),
+            "retry": (
+                api_spawn_retry,
+                "_stage_boundary_owner_for_parent(state, old.parent_session_key)",
+            ),
+            "respawn": (
+                CancellationCoordinator._schedule_cancel_recovery_impl,
+                "self._manager._run(info)",
+            ),
+            "queued stop": (
+                CancellationCoordinator._report_queued_stop_impl,
+                '_stage_boundary_owner=str(params.get("_stage_boundary_owner") or "")',
+            ),
+            "automatic follow-up": (
+                ContinuationCoordinator._deliver_followups_impl,
+                "_stage_boundary_owner=stage_boundary_owner_for_run(info)",
+            ),
+            "synthetic failure": (
+                ContinuationCoordinator._announce_followup_failure_impl,
+                "synthetic._stage_boundary_owner = stage_boundary_owner_for_run(info)",
+            ),
+            "channel parent": (
+                _stage_boundary_slot_for_parent,
+                "effective_session_key(candidate) == parent",
+            ),
+        }
+        missing = [
+            site
+            for site, (function, needle) in requirements.items()
+            if needle not in inspect.getsource(function)
+        ]
+        continuation_source = inspect.getsource(ContinuationCoordinator._continue_prelude_impl)
+        if (
+            continuation_source.count("_stage_boundary_owner=_stage_boundary_owner")
+            != continuation_source.count("SubagentInfo(") + 1
+        ):
+            missing.append("continuation result")
+        assert missing == [], f"stage boundary owner dropped at: {missing}"
+
+        parent = "slack:123.456"
+        boundary = StageBoundary(stage=1, generation="stage-owner")
+        slot = SimpleNamespace(
+            key="slack_123.456",
+            linked_session_key=parent,
+            stage_boundary=boundary,
+        )
+        state = SimpleNamespace(_slots={slot.key: slot})
+        with patch(
+            "kiro_crew.dashboard.handlers.messaging.dashboard_slot_key",
+            return_value="",
+        ):
+            assert _stage_boundary_owner_for_parent(state, parent) == "stage-owner"
+
+    @pytest.mark.asyncio
     async def test_stop_parent_removes_its_queued_agents_before_start(self):
         mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
         mgr._queue = [
@@ -566,6 +692,52 @@ class TestBatchIdentity:
 
         assert (stopped, queued) == (1, 0)
         mgr.cancel.assert_awaited_once_with("run")
+
+    @pytest.mark.asyncio
+    async def test_stop_boundary_includes_approval_waiters_and_preserves_sibling(self):
+        parent = "dashboard:shared"
+        owner_a, owner_b = "owner-a", "owner-b"
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
+        running_a = SubagentInfo(
+            id="run-a",
+            task="run-a",
+            parent_session_key=parent,
+            _stage_boundary_owner=owner_a,
+        )
+        approval_a = SubagentInfo(
+            id="approval-a",
+            task="approval-a",
+            parent_session_key=parent,
+            _stage_boundary_owner=owner_a,
+        )
+        approval_a._awaiting_approval = True
+        approval_a._exec_started = None
+        running_b = SubagentInfo(
+            id="run-b",
+            task="run-b",
+            parent_session_key=parent,
+            _stage_boundary_owner=owner_b,
+        )
+        mgr._agents = {info.id: info for info in (running_a, approval_a, running_b)}
+        waits = {
+            info.id: asyncio.create_task(asyncio.Event().wait()) for info in mgr._agents.values()
+        }
+        mgr._tasks = dict(waits)
+        mgr._fire_event = AsyncMock()
+        mgr._write_tombstone = MagicMock()
+        mgr._record_cost = MagicMock()
+
+        try:
+            stopped, queued = await mgr.cancel_for_boundary(parent, owner_a)
+            await asyncio.gather(waits[running_a.id], waits[approval_a.id], return_exceptions=True)
+
+            assert (stopped, queued) == (2, 0)
+            assert waits[running_a.id].cancelled()
+            assert waits[approval_a.id].cancelled(), "spawn-approval waiter stayed parked"
+            assert not waits[running_b.id].done(), "sibling owner was cancelled"
+        finally:
+            waits[running_b.id].cancel()
+            await asyncio.gather(waits[running_b.id], return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_spawn_counts_submissions_once_per_member(self):
@@ -2347,6 +2519,39 @@ class TestRetryGating:
         assert mgr.spawn.call_args.args[0] == "original raw task"
         assert mgr.spawn.call_args.kwargs["parent_session_key"] == "dashboard:m"
 
+    @pytest.mark.asyncio
+    async def test_retry_inherits_original_active_stage_boundary_owner(self):
+        """Retry ownership stays with the failed work while its boundary is active."""
+        from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
+        from kiro_crew.dashboard.state import StageBoundary
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        parent = "dashboard:m"
+        failed = SubagentInfo(id="f1", task="failed", parent_session_key=parent)
+        failed.done = True
+        failed.error = "boom"
+        failed._stage_boundary_owner = "stage-owner"
+        failed.execution_context = ExecutionContext(
+            None, MemoryStoreRef("default"), "template", "kirocrew"
+        )
+        mgr = self._mgr_with(failed)
+        mgr.spawn = MagicMock(return_value=SubagentInfo(id="n1", task="failed"))
+        request = self._request(mgr, "f1")
+        request.app["state"]._slots = {
+            "m": MagicMock(
+                stage_boundary=StageBoundary(
+                    stage=1,
+                    generation="stage-owner",
+                    parent_session_keys={parent},
+                )
+            )
+        }
+
+        resp = await api_spawn_retry(request)
+
+        assert resp.status == 200
+        assert mgr.spawn.call_args.kwargs["_stage_boundary_owner"] == "stage-owner"
+
 
 # ── 6. Durable task queue at scale ───────────────────────────────────
 
@@ -2487,3 +2692,82 @@ class TestDurableQueueScale:
         assert store.count(state=model.DONE) == 199
         assert len(mgr_queue := second._queue) == 0, mgr_queue
         assert second._running_count == 0
+
+
+# ── 7. Run-id minting ────────────────────────────────────────────────
+
+
+class TestRunIdMinting:
+    """The width of a run id is what keeps it unique, and one draw site owns it.
+
+    At 8 hex characters an id was 32 bits, so 2000 spawns on one host collided
+    about once in 2,100 times, and the collision did not read as one: identity
+    is assigned before registration, so the caller was handed the id and the
+    accept then failed on the duplicate primary key, reaching the user as
+    ``task store write failed``. 16 characters is 64 bits, which puts the same
+    2000 draws at about 1 in 10**13 -- no registry to seed, nothing to read, and
+    no place for a spawn path to forget the check.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_minted_id_is_sixteen_hex_characters(self):
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=4)
+        await mgr.wait_taskq_ready()
+        assert _RUN_ID_HEX_CHARS == 16
+        for _ in range(50):
+            assert re.fullmatch(r"[0-9a-f]{16}", mgr._mint_agent_id())
+
+    @pytest.mark.asyncio
+    async def test_every_spawned_id_carries_the_full_width(self):
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=1)
+        await mgr.wait_taskq_ready()
+        mgr._spawn_stagger_secs = 0.0
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(SubagentManager, "_run", new=AsyncMock()),
+        ):
+            ids = [mgr.spawn(f"t{i}", parent_session_key="dashboard:s1").id for i in range(40)]
+        # Running and queued alike: the gate assigns one identity and every exit
+        # path carries it, so a queued row must not be narrower than a started one.
+        assert len(set(ids)) == 40
+        assert [i for i in ids if not re.fullmatch(r"[0-9a-f]{16}", i)] == []
+
+    def test_the_width_is_the_uniqueness_argument(self):
+        # 2000 draws, birthday bound n**2 / (2 * space). The 8-character id this
+        # replaces sat at ~1/2100, which CI hit as a red 2000-spawn shard.
+        space = 2 ** (4 * _RUN_ID_HEX_CHARS)
+        assert 2000**2 / (2 * space) < 1e-12
+        assert 2000**2 / (2 * 2**32) > 1e-4
+
+    @pytest.mark.asyncio
+    async def test_every_character_of_the_id_is_random(self):
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=4)
+        await mgr.wait_taskq_ready()
+        drawn = [mgr._mint_agent_id() for _ in range(200)]
+        # A v4 UUID spends its 13th hex character on the fixed version digit, so
+        # the first 16 characters of one carry 60 bits, not the 64 the width
+        # advertises. Every position has to vary or the bound above is wrong.
+        for pos in range(_RUN_ID_HEX_CHARS):
+            assert len({d[pos] for d in drawn}) > 1, pos
+
+    def test_one_draw_site_owns_the_width(self):
+        import kiro_crew.subagent_manager as manager_pkg
+
+        package = pathlib.Path(manager_pkg.__file__).parent
+        component_draws = [
+            f"{path.relative_to(package)}:{lineno}"
+            for path in sorted(package.rglob("*.py"))
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if "urandom" in line or "uuid4()" in line
+        ]
+        # The gate, the continuation coordinator and the wave digest all ask the
+        # manager for an id. A new spawn path that draws its own would reopen the
+        # collision at whatever width it picked, so none of them may draw.
+        assert component_draws == []
+
+        source = pathlib.Path(subagent_module.__file__).read_text(encoding="utf-8")
+        assert source.count("os.urandom(") == 1
+        assert "uuid4()" not in source
+        mint = source.split("def _mint_agent_id", 1)[1].split("\n    def ", 1)[0]
+        assert "os.urandom(_RUN_ID_HEX_CHARS // 2).hex()" in mint

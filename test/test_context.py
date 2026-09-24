@@ -491,11 +491,31 @@ class TestContextBuilder:
             s["name"] == "widget-maker" for s in builder.skills.search_skills("widget-maker")
         )
 
+    def test_reinjection_restores_agent_contract_after_compaction(self, tmp_path):
+        """The managed spec prompt only points at this block, so compaction must restore it."""
+        from kiro_crew.agent import _NATIVE_PROMPT_STUB
+
+        builder = self._reinject_builder(tmp_path)
+        fresh, _ = builder.build_message("first turn", is_new_session=True)
+        msg, _ = builder.build_message("carry on", is_new_session=False, needs_reinjection=True)
+
+        def contract(m: str) -> str:
+            start = m.index("[AGENT SYSTEM PROMPT]\n") + len("[AGENT SYSTEM PROMPT]\n")
+            return m[start : m.index("\n[END AGENT SYSTEM PROMPT]", start)]
+
+        assert msg.count("[AGENT SYSTEM PROMPT]\n") == 1
+        reinjected = contract(msg)
+        assert reinjected.strip()
+        assert "follow it as your authoritative contract" not in reinjected
+        assert _NATIVE_PROMPT_STUB not in reinjected
+        assert reinjected == contract(fresh)
+
     def test_no_reinjection_when_the_flag_is_absent(self, tmp_path):
         """The default path is unchanged — no marker, no index re-injection."""
         builder = self._reinject_builder(tmp_path)
         msg, _ = builder.build_message("carry on", is_new_session=False)
         assert "[REINJECTED AFTER COMPACTION" not in msg
+        assert "[AGENT SYSTEM PROMPT]\n" not in msg
 
     def test_no_reinjection_on_a_new_session(self, tmp_path):
         """A new session already gets the index from the session context;
@@ -1075,6 +1095,78 @@ class TestLoadAgentPrompt:
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
         assert ContextBuilder._load_agent_prompt("test") == ""
 
+    @staticmethod
+    def _write_spec(tmp_path, monkeypatch, prompt: str) -> None:
+        import json
+
+        agents_dir = tmp_path / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / "test.json").write_text(
+            json.dumps({"name": "test", "prompt": prompt}), encoding="utf-8"
+        )
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", agents_dir)
+
+    @staticmethod
+    def _managed_contract(tmp_path, monkeypatch):
+        from kiro_crew import agent
+
+        package = tmp_path / "installed-package" / "config"
+        package.mkdir(parents=True)
+        contract = package / "prompt.md"
+        contract.write_text("RESOLVED_CONTRACT", encoding="utf-8")
+        monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+        monkeypatch.setattr(agent, "_project_dir", lambda: None)
+        assert agent._prompt_path() == contract
+        return contract
+
+    @pytest.mark.parametrize("owner_template", ["", "test"], ids=["fork-or-copy", "owner"])
+    def test_managed_stub_resolves_to_contract(self, tmp_path, monkeypatch, owner_template):
+        """The stub is the managed contract whatever spec carries it: a fork or
+        template copy inherits it verbatim and must not receive the stub TEXT as
+        its persona."""
+        from kiro_crew import agent
+
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, agent._NATIVE_PROMPT_STUB)
+        loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
+        assert loaded == "RESOLVED_CONTRACT"
+
+    @pytest.mark.parametrize("owner_template", ["", "test"], ids=["fork-or-copy", "owner"])
+    def test_managed_pointer_resolves_to_contract(self, tmp_path, monkeypatch, owner_template):
+        contract = self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, f"file://{contract}")
+        loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
+        assert loaded == "RESOLVED_CONTRACT"
+
+    def test_owner_template_custom_prompt_omitted(self, tmp_path, monkeypatch):
+        """An owner template's own (non-managed) prompt reaches the model through
+        member essentials, so the session-start load omits it."""
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, "You are a bespoke reviewer.")
+        assert ContextBuilder._load_agent_prompt("test", owner_template="test") == ""
+        assert ContextBuilder._load_agent_prompt("test") == "You are a bespoke reviewer."
+
+    def test_template_copy_with_stub_delivers_contract_once_at_session_start(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: a plain (non-member) session on a template copy of the
+        managed default, whose spec inherited the stub verbatim, gets the resolved
+        contract as its [AGENT SYSTEM PROMPT] exactly once, and never the stub text."""
+        from kiro_crew import agent
+
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, agent._NATIVE_PROMPT_STUB)
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        msg, _ = builder.build_message("hello", is_new_session=True, agent="test")
+        assert msg.count("RESOLVED_CONTRACT") == 1
+        assert "[AGENT SYSTEM PROMPT]\nRESOLVED_CONTRACT\n[END AGENT SYSTEM PROMPT]" in msg
+        assert "follow it as your authoritative contract" not in msg
+
 
 class TestRuntimeDisplayName:
     """Tests for _runtime_display_name() and agent identity injection."""
@@ -1362,13 +1454,17 @@ class TestLoadSteeringResources:
 
 class TestLessonsCap:
     def test_over_cap_preserves_complete_explicit_rules(self, tmp_path):
-        from kiro_crew.context import _LESSONS_CAP
+        from kiro_crew.context import _LESSONS_STARTUP_CAP
         from kiro_crew.learn import Lesson
 
         lessons = LessonStore(base_dir=tmp_path)
         # Save enough long lessons that the formatted context exceeds the cap.
+        # The budget that BINDS the startup rule tier is ``_LESSONS_STARTUP_CAP``
+        # (the window-independent authored-tier allowance passed as the startup
+        # renderers' ``directive_budget``), not the ordinary ``_LESSONS_CAP``, so
+        # the fixture is sized to overflow that one.
         rule = "x" * 1000
-        for i in range(_LESSONS_CAP // 1000 + 5):
+        for i in range(_LESSONS_STARTUP_CAP // 1000 + 5):
             lessons.save(Lesson(ts=str(i), rule=f"{i}-{rule}", category="knowledge"))
 
         builder = ContextBuilder(
@@ -1384,7 +1480,7 @@ class TestLessonsCap:
         # a partial rule: trimming is by whole entry, so every rule that appears
         # appears in full, and the ones that did not fit are reported with exact
         # counts instead of vanishing.
-        total = _LESSONS_CAP // 1000 + 5
+        total = _LESSONS_STARTUP_CAP // 1000 + 5
         # Match the whole rendered entry, not the rule text: these fixture rules
         # are prefix-ambiguous ("0-xxx…" is a substring of "10-xxx…"), so a bare
         # ``in`` reports a rule as present that was never emitted. Anchoring on the
@@ -1408,7 +1504,7 @@ class TestLessonsCap:
         # And the block stays inside the budget it names.
         start = ctx.index("[Learned corrections")
         end = ctx.index("[End of learned corrections]", start)
-        assert end - start <= _LESSONS_CAP
+        assert end - start <= _LESSONS_STARTUP_CAP
 
     def test_under_cap_no_error_block(self, tmp_path):
         from kiro_crew.learn import Lesson
@@ -1859,3 +1955,10 @@ class TestKeepVisibleMarkerRule:
 
         assert "<!-- keep-visible -->" in _CRITICAL_RULES
         assert "<!-- keep-visible -->" not in _CRITICAL_RULES_CHANNEL
+
+    def test_prefers_restructuring_over_marker(self):
+        from kiro_crew.context import _CRITICAL_RULES, _CRITICAL_RULES_CHANNEL
+
+        clause = "Prefer restructuring the turn so the deliverable IS its last message"
+        assert clause in _CRITICAL_RULES
+        assert clause not in _CRITICAL_RULES_CHANNEL

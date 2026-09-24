@@ -56,7 +56,11 @@ import urllib.parse
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import split_trailing_protocol_suffix, strip_control_comments
+from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    split_trailing_protocol_suffix,
+    strip_control_comments,
+)
 from kiro_crew.discord.client import (
     DISCORD_MAX_FILE_BYTES,
     DISCORD_MAX_FILES_PER_MESSAGE,
@@ -77,7 +81,9 @@ from kiro_crew.messaging.renderer import (
     Renderer,
     apply_options_cap,
     chunk_text,
+    count_redaction_tags,
     new_approval_nonce,
+    redaction_notice,
     session_provenance_tag,
     split_options_trailer,
 )
@@ -398,6 +404,8 @@ class DiscordApprovalDecider:
 
     def __init__(self, *, session_key: str) -> None:
         self._session_key = session_key
+        #: Why the LAST call denied -- see ``messaging.driver.ApprovalDecider``.
+        self.last_deny_cause = ""
 
     @staticmethod
     def key(session_key: str, request_id: str | int) -> str:
@@ -411,12 +419,16 @@ class DiscordApprovalDecider:
         return nonce
 
     async def __call__(self, event: Any) -> bool:
+        self.last_deny_cause = ""
         k = self.key(self._session_key, getattr(event, "request_id", ""))
         fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
         DiscordApprovalDecider._REGISTRY[k] = fut
         try:
             return bool(await asyncio.wait_for(fut, _APPROVAL_TIMEOUT_S))
         except asyncio.TimeoutError:
+            # Recorded for the driver, which steers the cause into the turn
+            # before it rejects, so the model hears "expired" not "denied".
+            self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
             # Nobody pressed a button for the whole window, so a monitoring loop
             # bound to this session cannot act either -- record it so the loop
             # stops on its next wake instead of spending the rest of its cycle
@@ -522,6 +534,11 @@ class DiscordRenderer(Renderer):
         # and how many actually reached Discord.
         self._seals_attempted = 0
         self._seals_landed = 0
+        # Redaction placeholders in text that actually LANDED, tallied per
+        # delivered message's final state (streaming edits supersede each other,
+        # so only the sealed form counts). Feeds the post-answer notice.
+        self._redacted_creds = 0
+        self._redacted_urls = 0
         self._last_edit = 0.0
         # A valid table at the end of a stream may still receive rows. While it
         # is pending, keep it in the buffer instead of freezing a partial card
@@ -953,6 +970,32 @@ class DiscordRenderer(Renderer):
             return body
         return f"{body}\n\n{note}"
 
+    def _tally_redactions(self, text: str) -> None:
+        """Record the redaction placeholders in one LANDED message's final text."""
+        cred_count, url_count = count_redaction_tags(text)
+        self._redacted_creds += cred_count
+        self._redacted_urls += url_count
+
+    async def _maybe_send_redaction_notice(self) -> None:
+        """One best-effort notice for the whole turn, after its answer landed.
+
+        Best-effort by the shared contract: the answer is already out, so a
+        failed notice send is logged, never raised — losing the notice is a
+        degraded warning, failing the turn would discard a delivered reply.
+        """
+        if not (self._redacted_creds or self._redacted_urls):
+            return
+        try:
+            await self._client.send_message(
+                self._channel_id,
+                redaction_notice(self._redacted_creds, self._redacted_urls),
+            )
+        except Exception:
+            logger.warning(
+                "discord: could not deliver the redaction notice (answer already sent)",
+                exc_info=True,
+            )
+
     async def _land_sealed(
         self,
         text: str,
@@ -967,6 +1010,7 @@ class DiscordRenderer(Renderer):
                     self._channel_id, self._stream_mid, text, files, components=components
                 ):
                     self._seals_landed += 1
+                    self._tally_redactions(text)
                     return True
                 # A missing live message falls through to a fresh send.
                 self._stream_mid = None
@@ -978,6 +1022,7 @@ class DiscordRenderer(Renderer):
             )
             if landed:
                 self._seals_landed += 1
+                self._tally_redactions(text)
             return landed
         except Exception:
             logger.warning("discord: sealing the segment failed", exc_info=True)
@@ -1069,6 +1114,7 @@ class DiscordRenderer(Renderer):
                     components=components if index == len(recovery) - 1 else None,
                 ):
                     landed_any = True
+                    self._tally_redactions(chunk)
             if landed_any:
                 # This recovery IS a delivery, so it has to answer to
                 # `delivery_failed`. Only the LANDED count moves: the seal that
@@ -1114,6 +1160,7 @@ class DiscordRenderer(Renderer):
             body = body[:_THINKING_PREVIEW_CHARS].rstrip() + "…"
         try:
             await self._client.send_message(self._channel_id, _as_subtext(f"💭 {body}"))
+            self._tally_redactions(body)
         except Exception:
             logger.debug("discord: thinking note send failed", exc_info=True)
 
@@ -1242,6 +1289,7 @@ class DiscordRenderer(Renderer):
             # stay silent; otherwise show a placeholder. An extracted button
             # row (options-only body) must ALWAYS reach the user.
             if self._seal_count > 0 and components is None:
+                await self._maybe_send_redaction_notice()
                 return
             placeholder = "…" if ok else "⚠️ Error — please try again"
             placeholder = self._with_turn_footer(placeholder)
@@ -1263,6 +1311,7 @@ class DiscordRenderer(Renderer):
                 self._channel_id, placeholder, components=components
             ):
                 self._seals_landed += 1
+            await self._maybe_send_redaction_notice()
             return
         # The footer rides on the final segment rather than as its own message:
         # one turn, one bubble, and Discord charges rate budget per message.
@@ -1275,6 +1324,7 @@ class DiscordRenderer(Renderer):
         # history and the transcript read is untouched.
         self._delivery_text = self._with_turn_footer(self._segment_text())
         await self._seal_current(components=components)
+        await self._maybe_send_redaction_notice()
 
     def _context_pct(self) -> float | None:
         """This session's context-window usage, or ``None`` when unknown.

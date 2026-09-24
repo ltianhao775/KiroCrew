@@ -372,7 +372,8 @@ describe('Design Critique — annotations saved with a critique', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Ask' }))
     await tick()
 
-    expect(screen.getByText('the critic is gone')).toBeInTheDocument()
+    // The failure renders through ErrorNotice, not as red answer text.
+    expect(screen.getByRole('alert')).toHaveTextContent('the critic is gone')
     // The gate is released, so a second question is still possible.
     expect(screen.getByPlaceholderText('Ask a follow-up…')).not.toBeDisabled()
   })

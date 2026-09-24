@@ -647,10 +647,32 @@ These are code, or say in their own text where an implementation still diverges
 enforced nowhere:
 
 - An unclassified provider state is `unknown` and counts as **not passing**.
-- Superseded attempts collapse to the newest per check identity. A host leaves a
-  replaced round's completed rows in its rollup, and counting them reports a failure
-  that is not live. The structured provider collapses in
-  `_collapse_superseded_rows`, which runs before `_normalize_checks` groups rows; the
+- Superseded attempts are DECLASSIFIED, not deleted. A host leaves a replaced round's
+  completed rows in its rollup, and counting them reports a failure that is not live.
+  A row a newer run of its own identity replaced is marked with the terminal,
+  non-blocking `superseded` state: it is excluded from BOTH actionable and pending, so
+  it neither wakes the session nor holds it open, and it is still listed -- under the
+  canonical `superseded` bucket -- so the report names the row a suppressed wake was
+  suppressed for. Deleting it instead leaves nothing behind to explain the silence, and
+  because the fold re-runs identically on every poll that silence never self-corrects.
+  The bucket is written only when it holds something, so a subject with no displaced
+  rows keeps the exact canonical shape every provider shares. Its size is not a
+  completeness claim: exceeding the per-bucket bound does NOT set `checks_complete`
+  false, because a displaced row carries no verdict and every live row is still
+  measured. The bound is spent in exactly ONE place, the canonical projection, and the
+  cut announces itself there: the last entry becomes `superseded:incomplete`, the same
+  sentinel idiom the live buckets use. Cutting the bucket twice would spend the bound
+  before the projection could announce anything, leaving a saturated list -- and the
+  count derived from its length -- reading like the whole list. The compact inspection
+  carries the announcement through as a field, `superseded_incomplete`, and takes its
+  `superseded_count` off the sentinel: a compact reader gets the count and not the
+  list, so a bare length there would report one entry that is not a check and would
+  still read as an exact total at exactly the bound. The live buckets need no such
+  field, because they are listed and their own sentinel travels with them.
+  The structured provider marks in
+  `_mark_superseded_rows`, which runs before `_normalize_checks` groups rows and before
+  the row cap is spent -- capping first can cut a successor while keeping the row it
+  replaced, and that kept row then wins its own key and is reported live. The
   skill's status tool collapses in `collapse_superseded`, and the two **diverge on both
   halves of the rule**. On identity, that one keys CheckRuns on
   `("run", workflowName, name)`, so it groups two workflow files sharing a single
@@ -672,35 +694,35 @@ enforced nowhere:
   a pair shares this identity, and a tie leaves both rows live so the fold reports the
   replaced one. `pr-readiness.yml` reached the same conclusion for the required
   aggregate and records the reasoning there. Two rules about `cancelled` point in opposite directions and must not be
-  conflated. A row is dropped ONLY when its own RUN concluded `CANCELLED` AND that row
+  conflated. A row is marked ONLY when its own RUN concluded `CANCELLED` AND that row
   itself is `COMPLETED`+`CANCELLED` AND a newer run of its identity exists: the rollup
   carries no lineage edge, so recency alone does not
-  license removing a row, while a cancellation by the concurrency group does establish
+  license declassifying a row, while a cancellation by the concurrency group does establish
   displacement. Displacement is a property of the RUN and is read from the run, never
   inferred from the row: a row reaches `CANCELLED` inside runs that were never
   displaced -- `fail-fast` cancelling a matrix job's siblings, a job cancelled because
   something in its `needs` failed, an operator cancelling one job -- and in each the
   run concluded `FAILURE` and is live, so reading the row's own cancellation as
-  displacement drops a row out of a live run and reports it ready. The row's own
+  displacement declassifies a row out of a live run and reports it ready. The row's own
   cancellation is required in addition, because a cancelled run can still hold a row
   that reached a real verdict before the cancel landed. The run's conclusion is read
   from `CheckSuite.conclusion`, the run's own status container, because `WorkflowRun`
   exposes no `conclusion` and `CheckSuite.workflowRun` is the inverse of the edge the
   selection follows. Separately, the NEWEST run being
-  cancelled is never a reason to drop it, because that would revive the verdict of the
+  cancelled is never a reason to mark it, because that would revive the verdict of the
   run it superseded. Consequence, stated rather than hidden: a replaced round that
-  COMPLETED keeps its rows, so a phantom survives that case. Two rows of ONE run are **not** a retry
-  and both survive: a workflow can publish a check run through the Checks API under
+  COMPLETED is not marked, so a phantom survives that case. Two rows of ONE run are **not** a retry
+  and both stay live: a workflow can publish a check run through the Checks API under
   its own job's display name, so both are live at once and collapsing them by start
   time would let the later row erase the earlier row's failure.
   `CANCELLED` is one instance rather than the mechanism -- any completed row of a
   replaced round reads as live, and keying on the run instead of on the row's
   conclusion is
-  what covers all of them. A row is never collapsed on an id the response withheld:
+  what covers all of them. A row is never marked on an id the response withheld:
   both ids are nullable `Int` on the wire even though the objects carrying them are
   not, so either absence exempts the row, which also leaves it out of the
   comparison that picks the newest run. An absent run conclusion exempts the row from
-  removal too, but not from that comparison: such a row can still be the newest run,
+  the mark too, but not from that comparison: such a row can still be the newest run,
   and so still drop an older cancelled row. `CheckSuite.conclusion` is null while a
   run is still going, and evidence the host withheld is not evidence a row was
   replaced. Over-reporting costs a turn; hiding a
@@ -869,11 +891,12 @@ lifecycle stages, in different shapes:
 | `GET /api/session-tool-policy` | on request | the raw persisted rule | deliberately raw, so an operator can see a stale spelling and re-key it |
 | a hand-written block in an on-disk profile | the backend reads the file itself | unknown to this repo | **no** |
 
-The last row is what settles it. `acp/kas_agents.py` states the boundary: a
-hand-written block "is not ignored, just not Crew's to relay: it lives in the profile
-on disk, which the backend reads itself when Crew is not injecting an agent over the
-wire." No code here composes that file, so no migration can expand a retired name in
-it and nothing can warn the operator holding one.
+The last row is what settles it. `acp/kas_agents.py` projects an on-disk
+`permissions` block onto the wire through `kas_permissions.merge_user_permissions`,
+which relays the author's rules verbatim or not at all -- it intersects them with the
+governance ceiling and never rewrites one. No code here composes that file either, so
+no migration can expand a retired name in it and nothing can warn the operator holding
+one.
 
 So the best achievable end state for renaming a published tool is a known silent
 fail-open that cannot be closed -- not a step on the way to a complete job, but the
@@ -946,15 +969,30 @@ Both are properties of the engine rather than of the key, and both are what an
 operator is actually buying, so the key's help text names them.
 
 **Half of a review-ready objective is invisible to the typed provider.** A
-structured observation carries lifecycle, checks, mergeability, review decision
-and review-thread counts, and nothing else; `docs/architecture/mcp.md` states the
-same boundary from the tool's side ("requests that need comments or advisory
-findings route directly to the finite legacy tool whose agent turn can inspect
-them"). On this repository that is not a corner case: a pull request reaches
-`readiness: passed` only once every non-PASS whole-design verdict carries a
-disposition, and those verdicts live in comment bodies. A green typed board and an
-unanswered advisory finding are indistinguishable to a probe, which is why the
-prompt loop keeps `gate=false` for that evidence in both positions of this key.
+structured observation carries lifecycle, checks, mergeability, review decision,
+review-thread counts and a digest over the PR-level comment bodies, and nothing
+else; `docs/architecture/mcp.md` states the same boundary from the tool's side
+("requests that need comments or advisory findings route directly to the finite
+legacy tool whose agent turn can inspect them"). On this repository that is not a
+corner case: a pull request reaches `readiness: passed` only once every non-PASS
+whole-design verdict carries a disposition, and those verdicts live in comment
+bodies. The digest wakes the owner when such a body changes, but a green typed
+board with an unanswered advisory finding whose text never changed is still
+indistinguishable to a probe, which is why the prompt loop keeps `gate=false` for
+that evidence in both positions of this key.
+
+The PR-level comment-body digest is carried as one condition,
+`review_comment_bodies:<digest>`, with severity `WAKE` and `resets_on` `NEVER`:
+a comment belongs to the conversation, not to the commit under review, so a
+force-push must not replay it. The digest is inside the KEY rather than only the
+brief, because the engine dedupes per condition key and a stable key with a
+changing brief would be masked and never wake again -- a bot rewrites its verdict
+in place, so `created_at` does not move and only a digest over the bodies sees the
+change. An empty digest carries no condition, and the provider emits an empty
+digest on an incomplete comment read, so a page that keeps failing cannot wake the
+owner forever. Each comment body is reduced to a fixed-width fingerprint at the
+point of retention, so what the probe keeps does not scale with how much a
+reviewer wrote and no body text survives into the condition key.
 
 **An armed structured monitor is not freely swappable, though the key is.**
 Flipping the key back restores the previous wording on the next tool-list build

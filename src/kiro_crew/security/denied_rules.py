@@ -182,6 +182,31 @@ _ENV_DUMP_GREP_AWS_PATTERN = (
 # (``printenv | grep ...``) is ``_ENV_DUMP_GREP_AWS_PATTERN``'s job.
 _PRINTENV_AWS_SECRET_PATTERN = r"(?<![\w-])printenv(?!\w).*AWS_" + _AWS_SECRET_VAR_NAMES
 
+# netcat with a program to execute -- ``nc -e /bin/sh host port`` -- with ``nc``
+# required to BEGIN a token. ``rsync -e ssh`` ENDS in exactly the letters
+# ``nc -e``, so an unanchored substring refuses every rsync with a detached
+# remote-shell flag (the ordinary rsync-over-ssh transfer), and every read-only
+# command that merely quotes that phrase, as a reverse shell. The left boundary
+# is two fixed-width lookbehinds. The first excludes a word character, ``.``
+# or ``-`` directly before the verb (``rsync``, ``vnc``, ``dataset.nc``, a
+# ``-nc`` flag). The second excludes the ``\w=`` assignment shape -- a word
+# character then ``=`` -- directly before the verb (``X=nc``); a ``=`` alone at
+# the start of a word is not excluded (``=nc``), and neither is ``:`` (the
+# drive-relative ``C:nc``). ``/``
+# (``/usr/bin/nc``, ``./nc``), ``\`` (an alias-bypass ``\nc``), whitespace
+# (``sudo nc``, ``env X=1 nc``, ``busybox nc``), a separator (``;`` ``&&`` ``||``
+# ``|``) or an opener (``(``, ``$(``, a backtick, a quote) leaves the command token
+# whole, so every genuine invocation the bare substring refuses is refused here
+# too. ``\s+`` rather than one space is how the always-on exfil gate spells the
+# same command (``exfil._BASH_EXFIL_RES``); the whitespace-normalized pass-2 view
+# matches the padded form either way. Nothing constrains what follows the flag:
+# getopt accepts the program glued to it (``-e/bin/sh``, ``-esh``), so the row
+# fires on ``-e`` followed by anything. ``ncat`` is the sibling row's spelling and
+# deliberately not this one's -- each row governs exactly its own spelling so an
+# operator's toggle means what it says, and ``ncat`` has an ``a`` where this row's
+# whitespace is, so the two cannot both fire on one spelling.
+_NETCAT_EXEC_PATTERN = r"(?<![\w.-])(?<!\w=)nc\s+-e"
+
 # ``AWS_CONFIG_FILE`` / ``AWS_SHARED_CREDENTIALS_FILE`` hold a PATH, not a
 # secret, so neither is scrubbed from an agent child's environment -- the AWS CLI
 # and every SDK read them directly.
@@ -1261,11 +1286,14 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
     ),
     DeniedCommandRule(
         id="reverse-shell-nc",
-        pattern="nc -e.*",
+        pattern=_NETCAT_EXEC_PATTERN,
         category="reverse-shell",
         description=(
             "Blocks 'nc -e', which spawns a netcat reverse shell handing remote command "
-            "execution to an attacker."
+            "execution to an attacker. Anchored to the `nc` command token -- bare, "
+            "path-qualified (`/usr/bin/nc`), or after a wrapper or a shell separator -- so "
+            "an unrelated command that merely ends in the same letters, such as "
+            "`rsync -e ssh`, is not a reverse shell."
         ),
     ),
     DeniedCommandRule(
@@ -1744,7 +1772,7 @@ BUILTIN_DENY_PATTERNS: list[str] = [r.pattern for r in BUILTIN_DENIED_RULES]
 
 
 # ── Governance pins ("commands"-scope ceiling and profile pins) ──
-# Legacy spellings of rules whose patterns were later widened.  A governance
+# Prior spellings of rules whose patterns were later rewritten.  A governance
 # policy persists the pattern STRING it pinned, and the pin resolvers treat a
 # pattern as pinning a built-in rule only when it maps back to a rule id — so a
 # ceiling or profile written against an older catalog must keep resolving to
@@ -1756,15 +1784,21 @@ BUILTIN_DENY_PATTERNS: list[str] = [r.pattern for r in BUILTIN_DENIED_RULES]
 # enrichment, and they never enter ``BUILTIN_DENY_PATTERNS`` or the golden
 # manifest.
 #
-# Currently EMPTY, on purpose.  Entries here would alias the pre-widening
+# Only a row that still EXISTS may have an alias here.  The pre-widening
 # spellings of the ``restart`` / ``update`` / ``cloud`` / ``gateway restart``
-# rows, and those rows do not exist: their enforcement is the
-# ungated argv floor (``_SELF_PROTECTION_UNGATED_FLOOR_IDS``), which no opt-out
-# can reach, so there is nothing left for such a pin to force back on.  A
-# persisted pin in either spelling resolves to ``None`` and is reported by
-# ``_resolved_pin_ids`` as pinning nothing -- which is the truth, and preferable
-# to resolving it onto an id the catalog cannot display or toggle.
-_LEGACY_RULE_ID_BY_PATTERN: dict[str, str] = {}
+# rows are deliberately absent: those rows do not exist, their enforcement is
+# the ungated argv floor (``_SELF_PROTECTION_UNGATED_FLOOR_IDS``), which no
+# opt-out can reach, so there is nothing left for such a pin to force back on.
+# A persisted pin in either of those spellings resolves to ``None`` and is
+# reported by ``_resolved_pin_ids`` as pinning nothing -- which is the truth,
+# and preferable to resolving it onto an id the catalog cannot display or
+# toggle.
+_LEGACY_RULE_ID_BY_PATTERN: dict[str, str] = {
+    # The bare-substring spelling of ``reverse-shell-nc`` that a policy written
+    # against an older catalog pins; the row itself is anchored to the command
+    # token (``_NETCAT_EXEC_PATTERN``) and stays force-pinnable under that pin.
+    "nc -e.*": "reverse-shell-nc",
+}
 
 
 def _rule_id_for_pattern(pattern: str) -> "str | None":

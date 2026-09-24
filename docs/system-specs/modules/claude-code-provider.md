@@ -4,21 +4,21 @@
 
 `AgentConfig.provider` admits only the ACP provider, and
 `KiroCrewConfig.create_provider_factory()` constructs `AcpProvider`. Harness
-choice is a separate field, `agent.acp_backend`, and the public build now offers
-every harness it knows: `acp_backends.BASELINE_SELECTABLE_BACKENDS` contains
-`ACP_BACKEND_KIRO` (the empty string), `ACP_BACKEND_CLAUDE` and
-`ACP_BACKEND_KAS` — i.e. all of `ACP_BACKENDS_KNOWN`.
-`test_baseline_ships_every_known_backend` pins that equality.
+choice is a separate field, `agent.acp_backend`. The public baseline currently
+selects kiro-cli (`ACP_BACKEND_KIRO`, the empty string), Claude, KAS, Codex,
+OpenCode, Pi, goose and DeepSeek -- every id in `ACP_BACKENDS_KNOWN`. DeepSeek was
+the one exception until Crew's gate plugin routed its tool calls through the host
+permission gate (`Routing.VERIFIED_GATE_EXTENSION`, `agent_sdk/backends.py`);
+`test_baseline_ships_every_known_backend` pins the baseline as
+`ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE`, and that allowlist is empty again.
 
-`DefaultProviderRegistry` therefore registers no extra backend: there is nothing
-left in `ACP_BACKENDS_KNOWN` to add. `register_selectable_backend` stays because
-the `ProviderRegistry` protocol declares the hook and an edition overrides it, but
-it is **not** an extension point for a harness the core does not ship: it rejects
-any id outside `ACP_BACKENDS_KNOWN`, and every id inside that set is now already
-selectable. Adding a genuinely new harness therefore means widening
-`ACP_BACKENDS_KNOWN` — a core edit — not just calling the register. What the hook
-does buy an edition is reach once the id is known: it lands in the config gate, the
-dashboard PATCH allowlist and `GET /api/config/schema` together
+`DefaultProviderRegistry` registers no extra backend. The protocol hook remains
+for editions, but `register_selectable_backend` accepts only a core-known harness
+whose `ACP_BACKEND_ROUTING` verdict is not `UNVERIFIED`; it refuses both unknown
+ids and known-but-ungated harnesses. Adding a genuinely new harness therefore
+requires core definitions and an established routing contract, not just a call to
+the register. Once accepted, registration reaches the config gate, dashboard
+PATCH allowlist, and `GET /api/config/schema` together
 (`test_a_registered_backend_reaches_the_allowlist`,
 `test_a_registered_backend_reaches_the_schema_endpoint`).
 
@@ -104,9 +104,21 @@ for `bypassPermissions` and for `acceptEdits` on the operations it covers.
 rules do not have to come from the operator. The SDK reads `.claude/settings.json`
 from the **project directory** — the `project` setting source is enabled for default
 options — so a cloned repository can carry allow rules its author wrote. Crew's public
-core passes nothing that would change this: no permission mode
-(`AcpClient._permission_mode` is stored and never read), no `settingSources`
-restriction, no `PreToolUse` hook, and no settings seed.
+core passes no `settingSources` restriction and no `PreToolUse` hook, so it closes
+none of it. What Crew does write is a session-scoped
+`.claude/settings.local.json`, and only while it can prove the file still holds the
+bytes it wrote; that seed carries deny rules translated from the spec's
+`disabledTools` and never merges into a foreign project settings file.
+
+A session can now OPEN it further, and only on purpose. `KIROCREW_CC_PERMISSION_MODE=auto`
+resolves through `agent_sdk.backends.resolve_cc_permission_mode` and is seeded as
+`permissions.defaultMode`, which puts Claude's own classifier in charge of approving
+tool calls: an approved call asks nothing, so it reaches no `hooks.on_tool_call` and
+writes no SEL record, exactly as a project allow rule does. Only the literal value
+`auto` resolves, a backend that seeds no settings file resolves to nothing, and with
+no opt-in no `defaultMode` is written at all. An explicitly requested
+`bypassPermissions` mode pre-approves by design. The audit half of that trade is
+tracked in #12744.
 
 This is documented, intended Claude Code behaviour, not a defect introduced by making
 the harness selectable — the harness was already implemented and reachable by any
@@ -186,9 +198,17 @@ and effort selection, the full `session/request_permission` flow) works. So
   overlay is written per agent from the GLOBAL settings file as well as the
   agent's own spec, so it can carry exactly that stub), and a session whose
   permission surface Crew does not own gets no stubs along with no array. The
-  registry filter is the stated residual: the rewriter has no registry
-  awareness, so a stub is not held to it here -- tracked separately, and
-  pre-existing on codex, whose stub filter reads the same two rules. A stub
+  registry ceiling reaches the stubs through that same call: both
+  `pooled_session_servers` and `injection_server_names` withhold a stub under
+  registry mode, because a stub is by construction an UNMARKED entry -- the
+  rewriter refuses to wrap a `type: "registry"` one -- and nothing here can
+  resolve a name against the admin's catalog. Holding the line at that one
+  overlay read covers every mirror that mounts `stub_elements`, codex included,
+  and any future one; it is a no-op for the kiro-cli path, which drops an
+  unmarked injected entry under registry mode by itself. Crew's control plane is
+  exempt there on the same grounds it is exempt above, and the two functions must
+  agree, or a name in the set with no element behind it withholds the spec's only
+  copy of that server. A stub
   for a spec-narrowed server stays mounted, unlike codex: the narrowing rides
   `permissions.deny` in `settings.local.json`, which matches the stub because it
   registers under the same server name.
@@ -237,28 +257,30 @@ none.
 ### Session-scoped Claude settings
 
 `_write_claude_local_settings` writes `<work_dir>/.claude/settings.local.json`
-before the primary spawn (not only on the model-substitution retry) with four
-things: `permissions.defaultMode` when the session asked for one, the
-`permissions.deny` rules derived from the spec's `disabledTools`,
-`availableModels` from the registry, and `model` when the session pinned one. The
-allowlist is not cosmetic — without it the adapter can collapse a versioned `[1m]`
-id back to the 200K window.
+before the primary spawn (not only on the model-substitution retry) with
+`permissions.defaultMode` when requested and `permissions.deny` rules derived
+from the spec's `disabledTools`. Once the provider-advertised model cache is warm,
+it also writes `availableModels` and a pinned `model`; on a cold cache both model
+keys are omitted so a stale static allowlist cannot collapse a versioned `[1m]`
+id to the 200K window. The post-capture re-seed fills them after `session/new`
+records the backend's actual list.
 
-**Crew CREATES this file or it leaves the path entirely alone.** That single
-ownership rule is what the whole seam rests on. `work_dir` is routinely a
-checked-out project the user also drives with `claude` by hand, so a
-`settings.local.json` already sitting there belongs to someone else — either the
-user, or a live sibling session (`work_dir` is caller-supplied and every keyless
-client shares one default). Crew authored neither, so it reads neither, merges into
-neither, rewrites neither and deletes neither. `AcpClient._reset_state` removes only
-a file this session itself created, which is also what keeps a permission mode from
-outliving its session and an inherited `bypassPermissions` from surviving a crash.
+**Crew creates the file, or adopts only a byte-for-byte Crew-authored orphan;
+otherwise it leaves the path entirely alone.** `work_dir` is routinely a checked-out
+project the user also drives with `claude` by hand, so a foreign
+`settings.local.json` may belong to the user or a live sibling session. Crew reads
+neither for merging, rewrites neither, and deletes neither. A durable
+`seed_provenance` record stores the expected digest and arbitrates a live claim;
+that lets a later process recognize, claim, and re-seed a file Crew left behind
+after a crash without treating a user replacement as its own.
 
-The create is `O_EXCL` + `O_NOFOLLOW` at `0o600`, so the existence check is only a
-fast path: two sessions sharing a `work_dir` can both pass it, and the loser of the
-race declines rather than clobbering the winner. Nothing on the teardown path writes
-a file, so reset is a single `unlink` — the same operation the pre-change code
-performed at that point.
+A fresh create uses `O_EXCL` + `O_NOFOLLOW` at `0o600`, so two sessions sharing a
+`work_dir` cannot clobber each other. Re-seeding an owned file uses an inode-pinned
+move-aside plus atomic replacement; a concurrent user replacement is detected and
+left in place. Teardown runs ownership check, durable revocation, and deletion in
+one shielded worker-thread transaction. If revocation or deletion cannot complete,
+the old seed is restored or re-recorded so a later session can repair it rather
+than leaving an unowned permission mode on disk.
 
 What this deliberately does NOT do is preserve and restore a user's own file.
 Doing that means reading and rewriting a path a checked-out repository controls,
@@ -303,11 +325,13 @@ naming what is lost.
 
 `_spawn` also merges `extra_env` into the child environment, which is how a
 caller-supplied `CLAUDE_CONFIG_DIR` reaches the adapter
-(`test_spawn_forwards_claude_config_dir_from_extra_env`). The public core does not
-set that variable itself: an isolated CC config root (seeding a Crew-owned
-directory from the user's `~/.claude`, keeping credentials and models while
-stripping inherited `permissions` that would pre-approve past Crew's gate) is
-**not implemented here** — see the known gap below.
+(`test_spawn_forwards_claude_config_dir_from_extra_env`). The gateway contract is
+to forward inherited `ANTHROPIC_*` and `CLAUDE_CODE_*` variables to the harness
+child, so the spawn scrub list must not grow to cover either namespace. The public
+core does not set `CLAUDE_CONFIG_DIR` itself: an isolated CC config root (seeding a
+Crew-owned directory from the user's `~/.claude`, keeping credentials and models
+while stripping inherited `permissions` that would pre-approve past Crew's gate)
+is **not implemented here** — see the known gap below.
 
 ### Known gap: the user's global `~/.claude` is inherited
 

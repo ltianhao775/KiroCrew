@@ -1047,4 +1047,103 @@ describe('SessionAutomationPopover', () => {
     expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Watch a pull request instead' })).not.toBeInTheDocument()
   })
+
+  /* THE JUDGE LINE, mounted the way the dashboard mounts it.
+     The row below is `GET /api/autonudge` output in the wire's own spelling, and it
+     is parsed by the real normalizer rather than written as a record, because the
+     three hops between the endpoint and the line each name their fields: the
+     publisher's keys, this record's, and the adapter's. A test that hands the
+     popover a loop object directly agrees with the reader about every name and
+     still passes while a middle hop carries none of them -- and a dropped judge is
+     silent on screen, because "this loop has no judge" is the honest reading for
+     most loops and renders nothing. So the assertion has to start at the wire. */
+  const judgeLoopRow = (judge: Record<string, unknown>) => ({
+    id: 'legacy-judge', slot_key: 'chat-1', message: 'Keep checking.',
+    idle_secs: 300, max_cycles: 24, cycle_count: 2, active: true,
+    last_fire_ts: 1_800_000_000, next_due_ts: 1_900_000_000, stopped_reason: '',
+    ...judge,
+  })
+
+  it('renders the judge line from a GET row, criterion and verdict both', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 'a reviewer asks for changes', quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 2, at: 1_800_000_500 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('Judge: wake when a reviewer asks for changes')
+    expect(line).toHaveTextContent('quiet')
+    expect(line).toHaveTextContent('2 items')
+  })
+
+  it('renders the judge line with no verdict yet when the judge has not answered', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: '', quiet_when: 'the build is still running', targets: [] },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    // The LABEL as well as the criterion. A quiet-only brief under the wake label
+    // states the inverse of what the owner armed, and an assertion on the criterion
+    // alone passes either way, because the criterion travels either way.
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('Judge: stay quiet while the build is still running')
+    expect(line).not.toHaveTextContent('wake when')
+    expect(line).toHaveTextContent('no verdict yet')
+  })
+
+  it('renders a verdict with no timestamp without a dangling separator', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 'a reviewer asks for changes', quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 2, at: 0 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('2 items')
+    expect(line.textContent?.trimEnd().endsWith('·')).toBe(false)
+  })
+
+  it('carries a criterion at the arming bound in full, styled as its sibling rows', () => {
+    // The arming surface refuses anything past MAX_JUDGE_CRITERION_CHARS (500), so a
+    // criterion this long is the widest the render can ever be handed. It is shown
+    // whole rather than clipped: the owner reads back exactly the prose they armed,
+    // and the row carries its siblings' type contract so a long brief grows the
+    // popover the way every other wrapping row in it does.
+    const criterion = 'w'.repeat(500)
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: criterion, quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 1, at: 1_800_000_500 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line.textContent).toContain(criterion)
+    expect(line).toHaveTextContent('quiet')
+    expect(line.className).toContain('text-[11px]')
+    // This criterion is 500 characters with NO space in it, which is the input that
+    // makes the difference between wrapping and overflowing: without a break rule the
+    // row runs off the popover horizontally instead of growing it. A rendered capture
+    // of this exact case is attached to the pull request.
+    expect(line.className).toContain('break-words')
+  })
+
+  it('draws no judge line for a loop whose row carries a cleared brief', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({ judge: {} }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
+    expect(screen.queryByTestId('judge-line')).not.toBeInTheDocument()
+  })
+
+  it('keeps a malformed judge inert rather than throwing inside the render', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 42, quiet_when: null, targets: ['ok', 7] },
+      judge_last_verdict: { outcome: {}, evidence_items: -1, at: 'now' },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
+    expect(screen.queryByTestId('judge-line')).not.toBeInTheDocument()
+  })
 })

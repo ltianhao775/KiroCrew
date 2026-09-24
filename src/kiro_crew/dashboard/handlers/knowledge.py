@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew._sqlite_compat import fts5_segment_for_index, sqlite3
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config import live
@@ -1168,16 +1169,31 @@ _FOLDER_DIALOG_TIMEOUT = 180  # seconds
 def _folder_picker_available(request: web.Request) -> bool:
     """The native folder picker is offered only on macOS (via osascript) and
     only when the dashboard is local -- a dialog on a remote gateway would open
-    on the wrong screen."""
-    return sys.platform == "darwin" and bool(request.app.get("local_only", False))
+    on the wrong screen.
+
+    It also requires osascript to resolve out of the fixed system directories.
+    A host where it does not hides the button rather than offering one whose
+    only possible answer is a refusal."""
+    if sys.platform != "darwin" or not bool(request.app.get("local_only", False)):
+        return False
+    return platform_compat.trusted_system_bin("osascript") is not None
 
 
 def _run_folder_dialog() -> str | None:
     """Open the macOS native folder chooser (blocking) and return the selected
     absolute path, or None if the user cancelled or it failed to launch. Meant
-    to run off the event loop via an executor."""
+    to run off the event loop via an executor.
+
+    The binary is resolved from the fixed system directories rather than PATH: a
+    gateway's PATH can lead with an agent-writable directory, so a bare argv name
+    lets a planted shim run with the gateway's environment and outside the
+    sandbox. An unresolvable osascript reads as "failed to launch", which is what
+    it is -- the spawn does not happen at all."""
+    osascript = platform_compat.trusted_system_bin("osascript")
+    if osascript is None:
+        return None
     cmd = [
-        "osascript", "-e",
+        osascript, "-e",
         'POSIX path of (choose folder with prompt '
         '"Select a folder to add to your knowledge base")',
     ]

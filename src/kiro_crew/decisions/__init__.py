@@ -39,6 +39,7 @@ from kiro_crew.decisions.gate import (
     decide,
     history_budget_chars,
     is_enabled,
+    judge_evidence_scope_granted,
     timeout_secs,
 )
 from kiro_crew.decisions.types import Answer, Answers, Choice, Question
@@ -52,5 +53,6 @@ __all__ = [
     "decide",
     "history_budget_chars",
     "is_enabled",
+    "judge_evidence_scope_granted",
     "timeout_secs",
 ]

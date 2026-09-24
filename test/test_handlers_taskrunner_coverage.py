@@ -132,6 +132,10 @@ def _request(
     else:
         raw = b""
     headers = {"Content-Length": str(len(raw))} if (raw and with_content_length) else {}
+    # A body must DECLARE JSON or ``read_bounded_json`` refuses it 415 before the
+    # shape guard these tests are about ever runs. Every real client sets this.
+    if raw:
+        headers["Content-Type"] = "application/json"
     if session:
         headers["X-Session-Key"] = session
     req = make_mocked_request(

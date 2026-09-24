@@ -7,9 +7,12 @@ import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import ChatMessageList from '../app-sdk/ChatMessageList'
 import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
+import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
+import { filterCrewmateChat } from './chat/crewmateBubbles'
+import type { CrewmateIdentity } from '../pages/chat/CrewmateMessage'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
 import ChatDropOverlay, { useChatFileDrop } from './ChatDropOverlay'
@@ -43,18 +46,20 @@ import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
-import { JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
+import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, selectIsFeatureRequestSlot, hydrateSlotMessages, appendSlotMessage, requestStop, syncSlotRunningFromServer, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
+import { FEATURE_REQUEST_FORM_URL } from '../prompts/featureRequest'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
+import { scaleContentWidth } from '../pages/chat/contentWidth'
 import { tryQuickSend } from '../lib/quickSend'
-import { mergeRecoveredDraft } from '../utils/chatDrafts'
 import { takePaneDraft, writePaneDraft, mergePaneDraft, subscribePaneDraft } from '../utils/chatPaneDrafts'
+import { type PasteBlock, type CarriedPastes, carryPastes, expandAll as expandPasteTokens, mergeCarriedDraft, pruneBlocks, saveStoredPaste } from '../utils/pasteTokens'
 import { sendTurn, type SendReceiptStatus } from '../chat-core/transport/sendTurn'
 import { applySteerReceipt } from '../chat-core/transport/steerReceipt'
 import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
@@ -84,6 +89,10 @@ import { i18nT } from '../i18n/t'
  * s.dashboard.slots. Server reads/writes go through React Query + the api client.
  */
 
+/** Variables of the composer upload mutation: the files, the slot they were
+ *  picked in, and the AbortController that can end the request. */
+type UploadVars = { files: File[]; forSlot: string; controller: AbortController }
+
 export default function ChatPane({
   slotKey,
   focused,
@@ -99,6 +108,9 @@ export default function ChatPane({
   openSideChat,
   leading,
   busyMode = 'split',
+  crewmate,
+  onOpenCrewWorkLog,
+  threads,
 }: {
   slotKey: string
   focused?: boolean
@@ -154,6 +166,23 @@ export default function ChatPane({
    *  turn. Decided by the host, never inferred here, so no pane changes
    *  behaviour by accident. */
   busyMode?: ComposerBusyMode
+  /** This pane is a CREWMATE's chat (a member-mode slot on the Members page):
+   *  the transcript shows only what the crewmate says to the user — the
+   *  auto-nudge turns, cron and sub-agent envelopes, tool rows and say-nothing
+   *  rows stay in the slot's history for the Work log but are not drawn — and
+   *  the assistant rows draw as a run of bubbles under the crewmate's avatar
+   *  (components/chat/crewmateBubbles). Undefined = an ordinary transcript;
+   *  decided by the host, never inferred from the slot. */
+  crewmate?: CrewmateIdentity
+  /** Focus the crewmate's Work log tab (the side-panel tab that holds what
+   *  the filter hid). When given, the quiet hint's "where the work went" line
+   *  is a link that opens it, so the words that read as a destination are one;
+   *  without it the line is plain text. Only meaningful with `crewmate`. */
+  onOpenCrewWorkLog?: () => void
+  /** Reply threads on this pane's messages. Only a host presenting a
+   *  crewmate's chat (the Members page) passes it; absent, the rows draw no
+   *  thread footer and no "Reply in thread" action. */
+  threads?: ThreadHooks
 }) {
   // One instance covers both dropdown filter inputs (never open at once).
   const dispatch = useAppDispatch()
@@ -163,6 +192,12 @@ export default function ChatPane({
   const connectionsUiOn = useConnectionsUiEnabled()
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
+  // Collapsed paste blocks behind the `[ Paste #N · M lines ]` tokens in
+  // `input` — the sidecar ChatInput needs before it collapses a large paste
+  // into a chip at all (it stays raw text for a host that passes no
+  // `onPasteBlocksChange`). Pane-local like `input`, parked and restored WITH
+  // it (chatPaneDrafts), expanded at send, cleared with it.
+  const [pasteBlocks, setPasteBlocks] = useState<PasteBlock[]>([])
   // Upload failures shown as a banner, keyed by the slot they were shown for.
   // A banner belongs to the conversation it happened in: rebinding the pane to
   // another slot must not carry A's banner over B's thread, and coming back to
@@ -192,12 +227,32 @@ export default function ChatPane({
   const slotKeyRef = useRef(slotKey)
   const inputRef = useRef(input)
   const pendingFilesRef = useRef(pendingFiles)
+  const pasteBlocksRef = useRef(pasteBlocks)
   // False once the pane is gone: a recovery or upload result that lands after
   // unmount has no composer to write to (a setState on an unmounted component
   // is a silent no-op), so it goes to the store instead.
   const mountedRef = useRef(false)
   inputRef.current = input
   pendingFilesRef.current = pendingFiles
+  pasteBlocksRef.current = pasteBlocks
+  /** Bring recovered paste blocks into the live composer: the blocks behind
+   *  the tokens in `text` are re-numbered past the ones held now, and the text
+   *  with its rewritten tokens is returned for the caller's text merge.
+   *
+   *  The ref is advanced HERE, synchronously, not left to the next render:
+   *  two recoveries can land in one React batch (two sends refused together),
+   *  and both would otherwise read the same stale block list, so the second
+   *  `setPasteBlocks` would drop the first recovery's blocks while both tokens
+   *  still land in the text — a chip with nothing behind it, and a retry that
+   *  sends one paste twice and the other not at all. With the ref advanced
+   *  per call, the second recovery carries on top of the first. */
+  const carryIntoComposer = useCallback((text: string, pastes: PasteBlock[]): CarriedPastes => {
+    const carried = carryPastes(text, pastes, pasteBlocksRef.current)
+    if (!pastes.length) return carried
+    pasteBlocksRef.current = carried.pastes
+    setPasteBlocks(carried.pastes)
+    return carried
+  }, [])
   // A LAYOUT effect, not a passive one: `slotKeyRef` and the park/take below
   // must move in the same commit as the `slotKey` prop. With a passive effect
   // there is a gap between the commit and the effect in which the ref still
@@ -213,16 +268,26 @@ export default function ChatPane({
     // the one copy — the store entry is cleared so a later park cannot
     // overwrite an arrival that came in between.
     if (prev !== slotKey) {
-      writePaneDraft(prev, { text: inputRef.current, files: pendingFilesRef.current })
+      writePaneDraft(prev, { text: inputRef.current, files: pendingFilesRef.current, pastes: pasteBlocksRef.current })
       slotKeyRef.current = slotKey
       const incoming = takePaneDraft(slotKey)
       setInput(incoming.text)
       setPendingFiles(incoming.files)
+      // Ref advanced with the state (see carryIntoComposer): a recovery for the
+      // incoming slot that lands in this same commit carries on top of ITS
+      // parked blocks, not the outgoing slot's.
+      pasteBlocksRef.current = incoming.pastes
+      setPasteBlocks(incoming.pastes)
     } else {
       // First mount: pick up whatever this slot parked before (a page the user
-      // left mid-draft, a recovery that landed while the pane was gone).
+      // left mid-draft, a recovery that landed while the pane was gone). The
+      // parked blocks come in with their text, re-numbered past any the
+      // composer already holds so no two tokens share a number.
       const parked = takePaneDraft(slotKey)
-      if (parked.text) setInput(cur => mergeRecoveredDraft(cur, parked.text))
+      if (parked.text) {
+        const carried = carryIntoComposer(parked.text, parked.pastes)
+        setInput(cur => mergeCarriedDraft(cur, carried))
+      }
       if (parked.files.length) setPendingFiles(cur => [...cur, ...parked.files.filter(f => !cur.includes(f))])
     }
     // While this slot is on screen, a late arrival for it (a recovery or upload
@@ -231,7 +296,10 @@ export default function ChatPane({
     // sit in the store until this pane's own park overwrote it.
     const unsubscribe = subscribePaneDraft(slotKey, () => {
       const arrived = takePaneDraft(slotKey)
-      if (arrived.text) setInput(cur => mergeRecoveredDraft(cur, arrived.text))
+      if (arrived.text) {
+        const carried = carryIntoComposer(arrived.text, arrived.pastes)
+        setInput(cur => mergeCarriedDraft(cur, carried))
+      }
       if (arrived.files.length) setPendingFiles(cur => [...cur, ...arrived.files.filter(f => !cur.includes(f))])
     })
     // Unmount (or the next rebind, which runs this cleanup first): park the
@@ -239,9 +307,9 @@ export default function ChatPane({
     return () => {
       unsubscribe()
       mountedRef.current = false
-      writePaneDraft(slotKeyRef.current, { text: inputRef.current, files: pendingFilesRef.current })
+      writePaneDraft(slotKeyRef.current, { text: inputRef.current, files: pendingFilesRef.current, pastes: pasteBlocksRef.current })
     }
-  }, [slotKey])
+  }, [slotKey, carryIntoComposer])
   /** Stage uploaded attachment paths for the slot they were picked in. A slow
    *  upload can resolve after the pane was rebound to another member; the
    *  paths then belong to the ORIGINATING slot's parked draft, not to whoever
@@ -307,6 +375,10 @@ export default function ChatPane({
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
   const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
+  // Same rule as ChatPage: only the slot the header's "Request a Feature"
+  // action created hands its usage-limit row the issue-form route, so the
+  // pane offers the non-inference exit where the main surface would.
+  const isFeatureRequestSlot = useAppSelector((s) => selectIsFeatureRequestSlot(s, slotKey))
   // The composer is a `Composer` root around the ChatInput preset (chat-core
   // P3-b). Its Voice atom is what gives the pane a microphone: the pane wires no
   // voice props, only the two things the atom cannot know — the endpointer's
@@ -345,10 +417,24 @@ export default function ChatPane({
   // hand `messages` a fresh array identity per character, defeating the memo()
   // on ChatMessageList and re-running its O(N) turn grouping while the user
   // types.
-  const { messages, queuedMessages, systemDeliveryCount } = useMemo(
+  const { messages: paneMessages, queuedMessages, systemDeliveryCount } = useMemo(
     () => splitPaneMessages(allMessages),
     [allMessages],
   )
+  // A crewmate's chat draws only what the crewmate says (see the `crewmate`
+  // prop). Filtered HERE, above the list, so the run positions the assistant
+  // rows compute from their neighbours see the drawn list, and so the pinned
+  // prompt, the earlier-messages anchor and the empty hint all agree with what
+  // is on screen. Same array identity back when nothing is dropped.
+  const messages = useMemo(
+    () => (crewmate ? filterCrewmateChat(paneMessages) : paneMessages),
+    [crewmate, paneMessages],
+  )
+  // The unfiltered rows, handed to the row set for the one read that must see
+  // what the filter dropped (the steer-chip decision reads the policy-block
+  // inject row). `undefined` for an ordinary chat, so its renderer set does not
+  // rebuild on every appended message.
+  const crewmateTranscript = crewmate ? paneMessages : undefined
   // EVERY queued row, cards and hidden system deliveries alike. A reorder
   // submits the full sequence — see useQueuedMessageActions — so the
   // non-interactive rows `splitPaneMessages` strips out are still needed here.
@@ -553,6 +639,17 @@ export default function ChatPane({
     limitRef.current = undefined
     limitLatched.current = true
   }
+  // A crewmate's chat that filters a BOUNDED window down to no speech has
+  // proved nothing: the last thing it said may sit just behind the window,
+  // under fifty newer patrol rows. The never-spoken hint is a claim about the
+  // whole history, so that read is upgraded to the whole transcript first
+  // (same latch as the streaming upgrade) and the hint waits for it. An
+  // unbounded read that is still empty is the real never-spoken case.
+  const crewmateQuietUnproven = !!crewmate && warmHasMore === true && paneMessages.length > 0 && messages.length === 0
+  if (!limitLatched.current && crewmateQuietUnproven) {
+    limitRef.current = undefined
+    limitLatched.current = true
+  }
   const hydrateLimit = limitRef.current
   const { data: slotDetail, isError: slotDetailFailed, refetch: refetchSlotDetail } = useQuery({
     queryKey: slotMessagesQueryKey(slotKey, hydrateLimit),
@@ -646,8 +743,15 @@ export default function ChatPane({
   // must follow the files' slot, not the screen: paths stage into that slot's
   // live or parked composer, failures into that slot's banner (or, after
   // unmount, its transcript) — see stagePendingFiles / reportUploadFailure.
+  //
+  // The variables also carry the request's own AbortController, so the
+  // composer's cancel control can abort it. The set holds EVERY live one: the
+  // disabled attach button is not the only entry point, since paste, a drop
+  // and a Sketch insert all reach `uploadFiles` ungated, so two requests can be
+  // in flight at once.
+  const uploadAbortsRef = useRef(new Set<AbortController>())
   const uploadMutation = useMutation({
-    mutationFn: ({ files }: { files: File[]; forSlot: string }) => api.uploadFiles(files),
+    mutationFn: ({ files, controller }: UploadVars) => api.uploadFiles(files, controller.signal),
     // api.uploadFiles does NOT throw on a server refusal (unsupported type,
     // signature mismatch, over-cap): it resolves with { paths: [], error }.
     // So a refusal lands here in onSuccess, not onError — surface res.error
@@ -662,13 +766,22 @@ export default function ChatPane({
     // reading "Failed to fetch", which is not user-facing copy, so that case
     // gets the pane's shared connectivity string instead.
     onError: (err: unknown, { forSlot }) => {
+      // A cancel the user asked for is not a failure: it raises no banner.
+      if ((err as Error | undefined)?.name === 'AbortError') return
       const message = (err as Error)?.message
       const reason = (!message || err instanceof TypeError)
         ? i18nT('pages.chatPage.connection_error')
         : message
       reportUploadFailure(i18nT('pages.chatPage.upload_failed_error', { error: reason }), forSlot)
     },
+    onSettled: (_data, _err, { controller }: UploadVars) => {
+      uploadAbortsRef.current.delete(controller)
+    },
   })
+  /** Abort every composer upload in flight. */
+  const cancelUpload = useCallback(() => {
+    uploadAbortsRef.current.forEach(controller => controller.abort())
+  }, [])
   const uploadFiles = useCallback((files: File[]) => {
     if (!files.length) return
     // Clear FIRST, so a refusal from the previous attempt cannot stay on
@@ -683,7 +796,9 @@ export default function ChatPane({
     // already takes, and the one this change just wired to the banner.
     const big = files.find((f) => !VIDEO_EXT.test(f.name) && f.size > 50 * 1024 * 1024)
     if (big) { setUploadError(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
-    uploadMutation.mutate({ files, forSlot: slotKeyRef.current })
+    const controller = new AbortController()
+    uploadAbortsRef.current.add(controller)
+    uploadMutation.mutate({ files, forSlot: slotKeyRef.current, controller })
   }, [uploadMutation, setUploadError])
 
   // Classify BEFORE acting (issue #743): a dropped folder inserts its path
@@ -718,11 +833,15 @@ export default function ChatPane({
    *  into THAT slot's parked draft (shown again when the user returns to it)
    *  instead of into the composer the user is now looking at, which belongs to
    *  someone else's conversation, or into a component that no longer exists. */
-  const restoreIntoComposer = useCallback((text: string, files: string[] = [], forSlot: string = slotKeyRef.current) => {
-    if (!mountedRef.current || forSlot !== slotKeyRef.current) { mergePaneDraft(forSlot, text, files); return }
-    setInput(prev => mergeRecoveredDraft(prev, text))
+  const restoreIntoComposer = useCallback((text: string, files: string[] = [], pastes: PasteBlock[] = [], forSlot: string = slotKeyRef.current) => {
+    if (!mountedRef.current || forSlot !== slotKeyRef.current) { mergePaneDraft(forSlot, text, files, pastes); return }
+    // The paste blocks behind the payload's tokens come back with it, numbered
+    // past whatever the composer holds now, or the restored token would be a
+    // chip with nothing behind it.
+    const carried = carryIntoComposer(text, pastes)
+    setInput(prev => mergeCarriedDraft(prev, carried))
     if (files.length) setPendingFiles(prev => [...prev, ...files.filter(f => !prev.includes(f))])
-  }, [])
+  }, [carryIntoComposer])
 
   /** Say, in the transcript that owns the message, that it never went out.
    *
@@ -792,9 +911,11 @@ export default function ChatPane({
     // loss). Consuming the draft or attachments here would wipe text the user
     // never sent and attach files to a message they never composed.
     const files = optionText ? [] : pendingFiles
+    const blocks = optionText ? [] : pasteBlocks
     if (!optionText) {
       setInput('')
       setPendingFiles([])
+      setPasteBlocks([])
     }
     // Attachments take the SAME wire/bubble serialization as ChatPage
     // (prepareSendPayload, the single owner of attachment-marker knowledge):
@@ -815,7 +936,17 @@ export default function ChatPane({
     // marker N to dirPaths[N-1] for lossless history replay. The pane has no
     // project context, so tokens are absolute and serialize as-is. Runs AFTER
     // the file pass: file tokens never end in `/`, so the rewrites are disjoint.
-    const { llm, dirPaths } = serializeDirTokens(txt, '')
+    const { llm: dirLlm, dirPaths } = serializeDirTokens(txt, '')
+    // Collapsed pastes expand for the model only, AFTER the file and folder
+    // passes (a path inside pasted content is content, not an attachment —
+    // the same order ChatPage sends in). The bubble keeps the tokens plus the
+    // blocks on `meta.pastes` so it renders the paste as a clickable chip, and
+    // the side table (saveStoredPaste) re-collapses the server's expanded echo
+    // to that chip on history load. Blocks whose token the user deleted as
+    // text are pruned first so neither carries a block nothing points at.
+    const bubblePastes = pruneBlocks(displayTxt, blocks)
+    const llm = bubblePastes.length ? expandPasteTokens(dirLlm, bubblePastes) : dirLlm
+    if (bubblePastes.length) saveStoredPaste(llm, displayTxt, bubblePastes, filePaths)
     // sendId correlation (same contract as ChatPage): the wire text differs
     // from the bubble text whenever a folder token serialized, so the store's
     // content-equality fallback can never reconcile the server echo against
@@ -829,6 +960,7 @@ export default function ChatPane({
     const meta = {
       ...(filePaths.length ? { files: filePaths } : {}),
       ...(dirPaths.length ? { dirs: dirPaths } : {}),
+      ...(bubblePastes.length ? { pastes: bubblePastes } : {}),
       sendId,
     }
     const bubbleMinted = !busy && (text || files.length)
@@ -880,7 +1012,7 @@ export default function ChatPane({
         restore: (status) => {
           if (optionText) return
           if (status === 'response-late' && bubbleMinted) return
-          restoreIntoComposer(text, files, slotKey)
+          restoreIntoComposer(text, files, bubblePastes, slotKey)
         },
         // Report ONLY -- the error row. The restore is `restore`'s job above;
         // handing the payload back here too would restore a `refused` twice.
@@ -911,7 +1043,12 @@ export default function ChatPane({
         // and re-stages the files (#560). `!optionText` mirrors the
         // composer-consumption gate above -- an option send never consumed the
         // draft, so there is no pre-send state to bind.
-        stashDemoted: (queueId) => { if (!optionText) queuedSendStash.set(queueId, { raw: text, files, sent: llm }) },
+        // `raw` is what a cancel of that card puts back in the composer. A
+        // paste goes back EXPANDED: the stash carries no blocks (the same
+        // conservative shape ChatPage's cancel restores through), so the token
+        // string alone would be a dead chip that sends literally on retry —
+        // the pasted text itself is the lossless form of what the user put in.
+        stashDemoted: (queueId) => { if (!optionText) queuedSendStash.set(queueId, { raw: bubblePastes.length ? expandPasteTokens(text, bubblePastes) : text, files, sent: llm }) },
       })
       // -- doSend's send-machinery tail (not steer-receipt policy) --
       // Stateless card + blocking ask resolution, owned by doSend and run on
@@ -923,7 +1060,7 @@ export default function ChatPane({
       if (receipt.status === 'dispatched' && cardAtSend) dispatch(retireStatelessQuestion({ slot: slotKey, expected: cardAtSend }))
       void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
     })
-  }, [input, pendingFiles, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure])
+  }, [input, pendingFiles, pasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure])
   // The endpointer auto-submit (handed to the Voice atom above) reads the
   // latest send through this ref.
   doSendRef.current = doSend
@@ -961,7 +1098,11 @@ export default function ChatPane({
     // AFTER the empty-payload check, like doSend: an Enter on an empty composer
     // before the first partial lands sends nothing and must not end the capture.
     composerRef.current?.voice()?.disarmForSend()
-    const { txt, filePaths } = prepareSendPayload(raw, files)
+    const { txt: inlined, filePaths } = prepareSendPayload(raw, files)
+    // Same expansion as doSend; the steer channel is text-only and ChatPage's
+    // steer shows the expanded text in its bubble too, so this one does.
+    const steerPastes = pruneBlocks(inlined, pasteBlocks)
+    const txt = steerPastes.length ? expandPasteTokens(inlined, steerPastes) : inlined
     const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     // `meta.files` is the ORDERED non-image list the `[attached_file N]`
     // tokens index into: the transcript chip resolves marker N to
@@ -978,9 +1119,11 @@ export default function ChatPane({
       slot: slotKey,
       message: { role: 'user', content: txt, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, ...steerMeta } },
     }))
-    // Cleared HERE (not in ChatInput) so text and attachments clear atomically.
+    // Cleared HERE (not in ChatInput) so text, attachments and paste blocks
+    // clear atomically.
     setInput('')
     setPendingFiles([])
+    setPasteBlocks([])
     // `auto` hands the steer-or-queue choice to the gateway for this message
     // (`decisions/points/message_steer.py`); the receipt policy below is unchanged,
     // because a decided send still comes back as a steer's `dispatched` or a
@@ -996,7 +1139,7 @@ export default function ChatPane({
         echoReconciled: () => selectSendConfirmed(store.getState(), slotKey, sendId),
         // refused / response-late hand the payload back into this pane's
         // composer (raw text + files), addressed to the slot it was typed into.
-        restore: () => restoreIntoComposer(raw, files, slotKey),
+        restore: () => restoreIntoComposer(raw, files, steerPastes, slotKey),
         reportFailure: (reason, status) => reportSendFailure(reason, status),
         // \u26A0 is NoticeCard's warn-tone selector (parseNotice).
         warnUnconfirmed: () => dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })),
@@ -1009,10 +1152,12 @@ export default function ChatPane({
         // inlined file markers, so cancelling it must restore the typed text
         // and re-stage the files, not hand back `[attached_file N]` with the
         // chip gone (#560).
-        stashDemoted: (queueId) => queuedSendStash.set(queueId, { raw, files, sent: txt }),
+        // Expanded for the same reason as doSend's stash: no blocks travel
+        // with the card, so the token alone would restore as a dead chip.
+        stashDemoted: (queueId) => queuedSendStash.set(queueId, { raw: steerPastes.length ? expandPasteTokens(raw, steerPastes) : raw, files, sent: txt }),
       })
     })
-  }, [running, doSend, input, pendingFiles, slotKey, dispatch, reportSendFailure, restoreIntoComposer])
+  }, [running, doSend, input, pendingFiles, pasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer])
 
   // Stop mirrors ChatPage's press protocol (ChatPage.onStop): the first press
   // is the cooperative cancel, a second press while the slot reports
@@ -1191,8 +1336,11 @@ export default function ChatPane({
       // A steer-only surface has no steer/queue concept to explain, so a
       // confirmed steer draws as an ordinary message: no badge, no tint.
       hideSteerBadge: busyMode === 'steer-only',
+      featureRequestFormUrl: isFeatureRequestSlot ? FEATURE_REQUEST_FORM_URL : undefined,
+      crewmate,
+      crewmateTranscript,
     }),
-    [slotKey, toolDisclosure, setToolDisclosureFor, busyMode],
+    [slotKey, toolDisclosure, setToolDisclosureFor, busyMode, isFeatureRequestSlot, crewmate, crewmateTranscript],
   )
 
   // Quote / Ask on selected assistant text — the same chat-core seam the main
@@ -1232,10 +1380,13 @@ export default function ChatPane({
             : `rounded-lg border transition-colors ${focused ? 'border-accent' : 'border-border'}`
         }`}
         style={{
-          '--mc-content-width': followContentWidth ? CONTENT_WIDTH[chatConfig.contentWidth].messages : '100%',
+          '--mc-content-width': followContentWidth ? scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).messages : '100%',
           // Split-view panes leave --mc-input-width UNSET so ChatInput keeps
           // its own fallback — byte-for-byte the pre-prop behavior.
-          ...(followContentWidth ? { '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input } : {}),
+          ...(followContentWidth ? { '--mc-input-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).input } : {}),
+          // Unlike content width, message font size is not a follow/independent
+          // choice per pane — it is one reading preference, so every pane gets it.
+          '--mc-message-font-size': `${chatConfig.messageFontSize}px`,
         } as React.CSSProperties}
       >
         {!frameless && (
@@ -1322,6 +1473,7 @@ export default function ChatPane({
                 images={pinnedState.images}
                 bodyBeyondPreview={pinnedState.bodyBeyondPreview}
                 pushUp={pinnedState.push}
+                liveH={pinnedState.liveH}
                 bannerH={pinnedState.bannerH}
                 expanded={pin.pinExpanded}
                 onToggleExpanded={() => setPinExpanded(p => !p)}
@@ -1331,6 +1483,7 @@ export default function ChatPane({
                 })}
                 cardRef={pin.pinCardRef}
                 onCollapsedHeight={pin.onPinCollapsedHeight}
+                scrollTranscriptBy={pin.scrollTranscriptBy}
               />
             </div>
           )}
@@ -1351,6 +1504,7 @@ export default function ChatPane({
           hiddenRow={pinHiddenRow}
           onQuote={onQuote}
           onAsk={onAsk}
+          threads={threads}
           transcript={{
             sessionId: `pane:${slotKey}`,
             scrollerRef,
@@ -1371,8 +1525,39 @@ export default function ChatPane({
                     <Btn onClick={() => { void refetchSlotDetail() }}>{i18nT('components.chatPane.retry')}</Btn>
                   </div>
                 )}
-                {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && (
-                  <div className="text-center text-muted text-[13px] px-4 py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
+                {/* A crewmate whose whole history is machinery (a patroller that
+                    has not spoken yet) filters to an empty chat. That is not a
+                    fresh thread, so it must not read as one: say who has not
+                    spoken and where the work went, instead of "type a message
+                    to start" beside a summary that counts its wakes. Said only
+                    once the read is the WHOLE history (`crewmateQuietUnproven`
+                    above): a bounded window with no speech in it is not proof. */}
+                {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && !crewmateQuietUnproven && (
+                  <div className="text-center text-muted text-[13px] px-4 py-8" data-testid={crewmate && paneMessages.length > 0 ? 'crewmate-quiet-hint' : undefined}>
+                    {crewmate && paneMessages.length > 0 ? (
+                      <>
+                        <div>{i18nT('components.chatPane.crewmate_quiet', { name: crewmate.name })}</div>
+                        {/* Where the work went: named after the panel tab
+                            (pages.membersPage.work_log_tab). A link when the
+                            host can focus that tab — the words read as a
+                            destination, so they must be one. */}
+                        {onOpenCrewWorkLog ? (
+                          <button
+                            type="button"
+                            onClick={onOpenCrewWorkLog}
+                            data-testid="crewmate-quiet-where"
+                            className="mt-1 text-accent underline bg-transparent border-none cursor-pointer hover:text-accent-hover transition-colors"
+                          >
+                            {i18nT('components.chatPane.crewmate_quiet_where')}
+                          </button>
+                        ) : (
+                          <div className="mt-1" data-testid="crewmate-quiet-where">{i18nT('components.chatPane.crewmate_quiet_where')}</div>
+                        )}
+                      </>
+                    ) : (
+                      i18nT('components.chatPane.session_ready_type_a_message_to_start')
+                    )}
+                  </div>
                 )}
                 {/* Suppressed on the active slot: that pane renders the store's full
                     history, so the bound does not apply and the row would be false. */}
@@ -1448,7 +1633,7 @@ export default function ChatPane({
              landed, and handing it back would invite a second answer to a
              question already gone. */
           onFallbackSend={(text) => {
-            const fail = (reason?: string, status?: SendReceiptStatus) => { reportSendFailure(reason, status); restoreIntoComposer(text, [], slotKey) }
+            const fail = (reason?: string, status?: SendReceiptStatus) => { reportSendFailure(reason, status); restoreIntoComposer(text, [], [], slotKey) }
             void sendTurn({ message: text, slot: slotKey }).then((receipt) => {
               if (receipt.status === 'refused' || receipt.status === 'transport-error' || receipt.status === 'response-late') {
                 fail(receipt.reason, receipt.status)
@@ -1529,7 +1714,7 @@ export default function ChatPane({
                 // hand it back on every non-delivered ruling. The bubble is
                 // dropped by `resolveBubble` below, so this never leaves an
                 // orphan row beside the restored text.
-                restore: () => restoreIntoComposer(text, [], slotKey),
+                restore: () => restoreIntoComposer(text, [], [], slotKey),
                 reportFailure: (reason, status) => reportSendFailure(reason, status),
                 // The leading char is NoticeCard's WARN tone selector (parseNotice
                 // strips it and renders a lucide TriangleAlert -- it is never shown
@@ -1601,6 +1786,8 @@ export default function ChatPane({
         <ChatInput
           value={input}
           onChange={setInput}
+          pasteBlocks={pasteBlocks}
+          onPasteBlocksChange={setPasteBlocks}
           onSend={doSend}
           isRunning={busy}
           onStop={onStop}
@@ -1628,6 +1815,9 @@ export default function ChatPane({
           agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
           modelName={shownModel}
           modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
+          // See ChatPage: the slot's RAW model, because `shownModel` substitutes
+          // the served id and would hide every routed turn.
+          modelIsJevRouted={jevRouteOn && isUnpinnedModel(paneSlot?.model)}
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
@@ -1639,6 +1829,9 @@ export default function ChatPane({
           followUpLayout={chatConfig.followUpLayout}
           quickSend={dashCfg?.quick_send}
           followUpSourceKey={followUpSourceKey}
+          followUpPendingOptions={planActionMutation.latchedActions}
+          followUpRefusedOptions={new Set(followUpOptions.filter(planActionMutation.isRefused))}
+          followUpError={planActionMutation.failure}
           onFollowUpSelect={(o: string, e: React.MouseEvent, sourceKeyAtClick?: string | null) => {
             // Mirrors ChatPage's wiring, plan branch included (#5893). Plan
             // options (Go / Go All / Cancel — the only labels the plan
@@ -1693,7 +1886,11 @@ export default function ChatPane({
             doSend(text)
           }}
           project={paneSlot?.project ?? ''}
+          // A crewmate's chat is a DM with one named crewmate, so the composer
+          // addresses it by name rather than the product ("Message Kiro Crew…").
+          placeholder={crewmate ? i18nT('components.chatInput.message_placeholder', { bot: crewmate.name }) : undefined}
           onUploadFiles={uploadFiles}
+          onCancelUpload={cancelUpload}
           pendingFiles={pendingFiles}
           onRemoveFile={(p) => setPendingFiles((prev) => prev.filter((x) => x !== p))}
           uploading={uploadMutation.isPending}

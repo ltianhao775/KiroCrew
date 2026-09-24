@@ -19,6 +19,7 @@ wrapper; the thread the read actually runs on cannot be faked.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -26,8 +27,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import agent_discovery
+from kiro_crew import hooks as hooks_mod
+from kiro_crew import security
 from kiro_crew.dashboard.handlers import sessions as sessions_mod
+from kiro_crew.security.paths import PathResolutionStalled
 
 AGENT = "reviewer"
 
@@ -413,3 +418,352 @@ async def test_a_missing_session_key_is_refused(monkeypatch: pytest.MonkeyPatch)
     request.headers = {}
     response = await sessions_mod.api_session_tool_policy(request)
     assert response.status == 400
+
+
+@pytest.mark.asyncio
+async def test_a_plain_markdown_file_does_not_deny_every_other_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-spec ``.md`` in the agents dir must not read as an unreadable spec.
+
+    A markdown file with no frontmatter fence and no ``<stem>.json`` twin -- a
+    README, a shared prompt fragment -- is not a spec by this repo's own rule
+    (``split_markdown_spec``'s docstring, and the skip both
+    ``connections/ownership.py`` and ``agent_discovery.agent_spec_stems``
+    already apply). It declares nothing and hides nothing, so it cannot be the
+    file that holds this agent's policy. Before the fix, the unreadable-spec
+    guard parsed it as a spec, failed, and answered 409 ``policy_unreadable``
+    for EVERY agent without a spec of its own -- turning one stray file into a
+    permanent denial of every managed tool call on the gateway.
+    """
+    (tmp_path / "notes.md").write_text(
+        "# Shared prompt fragment\n\nJust prose, no frontmatter.\n", encoding="utf-8"
+    )
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 200
+    assert _body(response) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        # Opens with a fence, frontmatter is not valid YAML.
+        "---\nname: [unclosed\n---\n\nbody\n",
+        # Opens with a fence that never closes: the boundary case
+        # split_markdown_spec folds into "not a spec", which this guard must
+        # NOT skip -- a truncated real spec looks exactly like this.
+        "---\nname: reviewer\n",
+    ],
+    ids=["bad-yaml", "unclosed-fence"],
+)
+async def test_a_fenced_markdown_file_that_fails_to_parse_still_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    """Only a document with NO opening fence is "not a spec".
+
+    A document that opens with ``---`` announced itself as a spec: its declared
+    name cannot be recovered without a successful parse, so the operator's
+    exclusion list may be inside it and the honest answer stays "unknown"
+    (409), exactly as before the skip was added. Widening the skip to any
+    ``.md`` that fails to read would silently convert a genuinely broken spec
+    into a missing one.
+    """
+    (tmp_path / "broken.md").write_text(content, encoding="utf-8")
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 409
+    assert _body(response)["code"] == "policy_unreadable"
+
+
+@pytest.mark.asyncio
+async def test_the_fence_probe_is_bounded_and_an_oversized_plain_file_still_skips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe must not re-read to EOF a file the strict reader refused at cap.
+
+    ``read_agent_spec_strict`` refuses an over-cap file after reading at most
+    ``cap + 1`` bytes -- deliberately never the whole file. The fence probe
+    runs exactly when that refusal fired, on every policy request, so an
+    unbounded re-read there hands the gateway an attacker-sized allocation
+    (and a ``MemoryError`` escapes the probe's fail-closed arm as a 500).
+    Pin both halves: the oversized plain file is still skipped (200, not
+    409), and the probe declared an explicit small byte bound at the one seam
+    that reads the descriptor (``_read_head``, ``os.read`` straight off the
+    fd -- no buffered reader pulling its own block behind the bound).
+    """
+    monkeypatch.setattr(hooks_mod, "MAX_FILE_BYTES", 128)
+    (tmp_path / "big.md").write_text("# prose\n" + "x" * 4096, encoding="utf-8")
+
+    probe_limits: list[int] = []
+    real_read_head = sessions_mod._read_head
+
+    def recording_read_head(fd: int, limit: int) -> tuple[bytes, bool]:
+        probe_limits.append(limit)
+        head, truncated = real_read_head(fd, limit)
+        assert len(head) <= limit
+        return head, truncated
+
+    monkeypatch.setattr(sessions_mod, "_read_head", recording_read_head)
+
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 200
+    assert _body(response) == {}
+    assert probe_limits, "the fence probe never ran"
+    assert all(limit <= 64 for limit in probe_limits), (
+        "the fence probe read without a small explicit byte bound: an "
+        "over-cap file would be slurped into memory on every policy request"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_fenced_markdown_file_still_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An over-cap document that OPENS with a fence announced itself as a spec.
+
+    Its declared name is unrecoverable (the strict reader refuses at the cap
+    before parsing), so the policy stays unknown: 409, the same answer as any
+    other fenced document that cannot be parsed. The bounded probe reads the
+    first bytes, sees the fence, and keeps the refusal.
+    """
+    monkeypatch.setattr(hooks_mod, "MAX_FILE_BYTES", 128)
+    (tmp_path / "big-spec.md").write_text("---\nname: reviewer\n" + "#" * 4096, encoding="utf-8")
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 409
+    assert _body(response)["code"] == "policy_unreadable"
+
+
+@pytest.mark.asyncio
+async def test_a_plain_markdown_file_at_the_agents_own_filename_is_not_its_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The not-a-spec rule also holds for ``<agent>.md`` in the direct-filename slot.
+
+    The declared-name scan finds nothing, so the read falls back to the direct
+    filename candidates and finds ``<agent>.md`` with no JSON twin. That file
+    has no opening fence: it is a prose document that happens to share the
+    agent's name, and it can no more hold this agent's policy than a
+    ``notes.md`` can. Before the fix this arm still parsed it as a spec, failed,
+    and answered 409 for exactly this agent -- the same one-file-denies-a-tool
+    defect the enumeration skip closed, one slot over. It is now the same
+    answer as no file at all: the directory-wide unreadable-spec check, then an
+    empty policy.
+    """
+    (tmp_path / f"{AGENT}.md").write_text(
+        "# Reviewer notes\n\nJust prose, no frontmatter.\n", encoding="utf-8"
+    )
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 200
+    assert _body(response) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        "---\nname: [unclosed\n---\n\nbody\n",
+        "---\nname: reviewer\n",
+    ],
+    ids=["bad-yaml", "unclosed-fence"],
+)
+async def test_a_fenced_markdown_file_at_the_agents_own_filename_still_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    """The boundary in the direct-filename slot is the same as in the scan.
+
+    ``<agent>.md`` that OPENS with a fence announced itself as this agent's
+    spec; when it does not parse, whatever exclusions it declares are unknown
+    and the answer stays 409 -- before and after the plain-document exception
+    was extended to this arm. Only the fence-less document is skipped. The
+    refusal is the direct arm's own, attributed to THIS agent's spec: the
+    directory-wide guard would also refuse, but it can only say that some spec
+    in the directory is unreadable, and the operator reading the denial needs
+    the file named.
+    """
+    (tmp_path / f"{AGENT}.md").write_text(content, encoding="utf-8")
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 409
+    assert _body(response)["code"] == "policy_unreadable"
+    assert f"agent spec for {AGENT!r} could not be read" in _body(response)["reason"]
+
+
+# A spec with a REAL exclusion list. Saved as UTF-8 it resolves by declared
+# name and answers ``{"exclude": ["shell"]}``; saved in another encoding the
+# strict parser cannot decode it, and the honest answer is 409, never ``{}``.
+_FENCED_SPEC_WITH_EXCLUSION = (
+    f"---\nname: {AGENT}\nmanagedToolPolicy:\n  exclude: [shell]\n---\n\nbody\n"
+)
+
+
+def _encode_foreign(text: str, encoding: str, *, with_bom: bool) -> bytes:
+    """*text* in *encoding*, optionally opened by its byte-order mark."""
+    prefix = "\ufeff" if with_bom else ""
+    return (prefix + text).encode(encoding)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"])
+@pytest.mark.parametrize("with_bom", [True, False], ids=["bom", "bomless"])
+@pytest.mark.parametrize("filename", ["ops.md", f"{AGENT}.md"], ids=["stray", "direct"])
+async def test_a_fenced_spec_in_a_foreign_encoding_still_denies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    encoding: str,
+    with_bom: bool,
+    filename: str,
+) -> None:
+    """A UTF-16/UTF-32 spec whose decoded text opens with a fence is not prose.
+
+    The strict parser reads every spec as UTF-8, so a spec an editor saved as
+    UTF-16 fails to decode when it has a byte-order mark. Without a mark, its
+    NUL-interleaved head is valid UTF-8 but is still not UTF-8 prose. A probe
+    that treats either byte shape as fence-less silently ignores the
+    operator's real exclusion list, returning ``200 {}`` where the file says
+    ``exclude: [shell]``. Only a UTF-8, NUL-free head showing no fence is
+    proven prose; every foreign-encoded head keeps the refusal, in the scan
+    (a stray file) and in the direct-filename slot alike.
+    """
+    (tmp_path / filename).write_bytes(
+        _encode_foreign(_FENCED_SPEC_WITH_EXCLUSION, encoding, with_bom=with_bom)
+    )
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 409
+    assert _body(response)["code"] == "policy_unreadable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Latin-1 prose: no fence, but 0xE9 is not UTF-8, so the parser never
+        # reached its fence test and the probe cannot say what it would have seen.
+        "# R\u00e9sum\u00e9\n\nJust prose.\n".encode("latin-1"),
+        # A file that ENDS inside a multibyte sequence, shorter than the probe
+        # bound: the parser's own decode failure, not a cut the probe made.
+        b"# prose \xe2\x82",
+    ],
+    ids=["latin-1-head", "file-ends-mid-sequence"],
+)
+async def test_a_fence_less_head_that_is_not_utf8_is_not_proven_prose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: bytes
+) -> None:
+    """Fence-less bytes the parser cannot decode are unknown, not ignorable.
+
+    The skip is for a document PROVEN not to be a spec. Proof is the parser's
+    own test on the parser's own decoding -- UTF-8 -- and a head that is not
+    UTF-8 has no such decoding, so the guard keeps raising (409) rather than
+    guess from bytes what text an operator meant.
+    """
+    (tmp_path / "notes.md").write_bytes(raw)
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 409
+    assert _body(response)["code"] == "policy_unreadable"
+
+
+@pytest.mark.asyncio
+async def test_a_multibyte_character_cut_at_the_probe_bound_is_not_misread_as_foreign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 64-byte cut may land inside a UTF-8 character; that is not a decode failure.
+
+    ``#`` and a space, sixty ``x``, then ``EUR SIGN`` (``E2 82 AC``): bytes 62
+    and 63 of the head are the first two bytes of that character and byte 64
+    is past the bound. A strict decode of the head alone would raise
+    ``unexpected end of data`` and turn a perfectly ordinary prose file into
+    a 409. The file is valid UTF-8 and fence-less: skipped.
+    """
+    text = "# " + "x" * 60 + "\u20ac and more prose\n"
+    assert text.encode("utf-8")[62:65] == b"\xe2\x82\xac"
+    (tmp_path / "notes.md").write_text(text, encoding="utf-8")
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 200
+    assert _body(response) == {}
+
+
+@pytest.mark.asyncio
+async def test_the_fence_probe_survives_a_saturated_resolver_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe must not hand the path back to the bounded ``mc-pathres`` gate.
+
+    ``read_agent_spec_strict`` was moved off that pool on purpose: it
+    canonicalises with ``Path.resolve`` and asks
+    ``is_sensitive_canonical_path``, which submits nothing off the event loop,
+    so a saturated pool cannot drop a healthy spec. A probe that read through
+    ``hooks.validate_file_path`` re-submits the same path to that pool and, when
+    it misses its budget, fails closed -- and a fail-closed probe is "not
+    proven prose", which is 409: the stray ``.md`` denies every agent again
+    exactly while the gateway is busy. Every submission refused here, the
+    hooks gate and the bounded gate both forbidden; the plain file is still
+    skipped.
+    """
+
+    def stalled(expanded: str, worker: Any, **kwargs: Any) -> Any:
+        raise PathResolutionStalled(expanded, os.sep)
+
+    monkeypatch.setattr(security.paths, "_run_resolution_bounded", stalled)
+    # Cold anchor cache: the targets must be rebuilt inline, not via the pool.
+    monkeypatch.setattr(security.paths, "_home_targets_cache", {})
+    monkeypatch.setattr(
+        hooks_mod,
+        "validate_file_path",
+        lambda *a, **k: pytest.fail("the fence probe read through hooks.validate_file_path"),
+    )
+    monkeypatch.setattr(
+        security.paths,
+        "is_sensitive_path",
+        lambda *a, **k: pytest.fail("the fence probe asked the bounded gate off the loop"),
+    )
+    (tmp_path / "notes.md").write_text("# prose\n\nno fence\n", encoding="utf-8")
+    response = await _call(monkeypatch, tmp_path)
+    assert response.status == 200
+    assert _body(response) == {}
+
+
+@requires_symlinks
+@pytest.mark.asyncio
+async def test_the_fence_probe_judges_the_canonical_target_with_the_spec_readers_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link in the agents dir is followed and its TARGET is what the fence judges.
+
+    Same contract as the strict reader (``test_agent_discovery_pathres``): the
+    gate receives the ``Path.resolve(strict=True)`` result, never the link's
+    spelling. First half: a link to a benign fence-less document is probed by
+    its canonical path and skipped. Second half: when that canonical target is
+    fenced, the probe fails closed -- 409, the same answer the strict reader
+    gave for the file -- instead of reading through the link to classify it.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    target = elsewhere / "prose.md"
+    target.write_text("# prose\n\nno fence\n", encoding="utf-8")
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    link = agents / "notes.md"
+    link.symlink_to(target)
+    canonical = str(target.resolve(strict=True))
+
+    seen: list[str] = []
+    real_gate = sessions_mod.is_sensitive_canonical_path
+
+    def recording(resolved: str) -> bool:
+        seen.append(resolved)
+        return real_gate(resolved)
+
+    monkeypatch.setattr(sessions_mod, "is_sensitive_canonical_path", recording)
+    response = await _call(monkeypatch, agents)
+    assert response.status == 200
+    assert _body(response) == {}
+    assert canonical in seen, "the probe never asked the fence about the resolved target"
+    assert str(link) not in seen, "the probe handed the fence the link's spelling"
+
+    def fenced(resolved: str) -> bool:
+        return str(resolved) == canonical
+
+    monkeypatch.setattr(agent_discovery, "is_sensitive_canonical_path", fenced)
+    monkeypatch.setattr(agent_discovery, "_sel", lambda: MagicMock())
+    monkeypatch.setattr(sessions_mod, "is_sensitive_canonical_path", fenced)
+    response = await _call(monkeypatch, agents)
+    assert response.status == 409
+    assert _body(response)["code"] == "policy_unreadable"

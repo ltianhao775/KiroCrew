@@ -31,11 +31,13 @@ other track's work.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import signal
 import sys
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -70,12 +72,39 @@ def _start_front(settings: Settings) -> ProcessGroup:
     return spawn_process_group("front", [sys.executable, "-m", "container.front"])
 
 
-def _wait_for_shutdown(children: Sequence[ProcessGroup]) -> str:
-    """Block until a stop signal arrives or any child exits. Return the reason.
+#: The shutdown reason a spent lifetime produces.
+_LIFETIME_REASON: str = "lifetime"
 
-    Returns ``"signal"`` on SIGTERM/SIGINT, or ``"<name> exited"`` if a child
-    dies first (the backend dying is fatal; so is either other child, since the
-    task cannot do its job).
+#: Shutdown reasons that mean the task did what was asked of it, so the process
+#: exits zero. Both members are produced by ``_wait_for_shutdown`` a few lines
+#: below, and a reason added there without being decided here reports a clean stop
+#: as a failure -- which is why the two live next to each other. Everything else,
+#: including a reason this code cannot account for, is a failure: see ``run``.
+_ORDERLY_REASONS: frozenset[str] = frozenset({"signal", _LIFETIME_REASON})
+
+
+def _wait_for_shutdown(children: Sequence[ProcessGroup], *, ttl_seconds: int = 0) -> str:
+    """Block until a stop signal arrives, a child exits, or the lifetime is spent.
+
+    Returns ``"signal"`` on SIGTERM/SIGINT, ``"lifetime"`` when *ttl_seconds* has
+    passed, or ``"<name> exited"`` if a child dies first (the backend dying is
+    fatal; so is either other child, since the task cannot do its job).
+
+    ``ttl_seconds`` of zero is UNBOUNDED, which is what a launch path saying
+    nothing about lifetime gets: the wait then ends only on a signal or a child.
+
+    The deadline is measured from here on the monotonic clock, so a wall-clock
+    correction inside the task cannot cut the lifetime short or extend it. Here
+    rather than at process start because this is the point from which the task is
+    doing its job; the launch-time sweep measures the same bound from the task's
+    own ``startedAt``, which is EARLIER, so where both enforcement points exist
+    the sweep is the one that fires. That ordering is the intended one: this
+    deadline is the backstop for a cluster no further launch ever sweeps.
+
+    Elapsed time is compared against *ttl_seconds*, which is never added to the
+    clock: an integer bound larger than any representable float would raise on
+    that addition, and a bound nobody can reach must read as a long lifetime
+    rather than as a crash. The sweep compares the same way.
     """
     stop = threading.Event()
     reason = {"why": ""}
@@ -87,11 +116,15 @@ def _wait_for_shutdown(children: Sequence[ProcessGroup]) -> str:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
+    started = time.monotonic()
+    bounded = ttl_seconds > 0
     while not stop.wait(0.5):
         for child in children:
             if child.poll() is not None:
                 reason["why"] = f"{child.name} exited (code {child.returncode()})"
                 return reason["why"]
+        if bounded and time.monotonic() - started >= ttl_seconds:
+            return _LIFETIME_REASON
     return reason["why"]
 
 
@@ -408,12 +441,19 @@ def verify_sandbox(settings: Settings, *, probe=_user_namespaces_available) -> N
     )
 
 
-def run(settings: Settings, *, wait_for_shutdown=_wait_for_shutdown) -> int:
+def run(settings: Settings, *, wait_for_shutdown=None) -> int:
     """Order, supervise and drain the task. Return a process exit code.
 
     ``wait_for_shutdown`` is injected so tests can drive the supervise phase
-    without signals or real processes.
+    without signals or real processes. It takes the watched children and returns a
+    reason; the task's lifetime is bound onto the default here, where the settings
+    are, so an injected stub keeps the one-argument shape and a test that is not
+    about the lifetime does not have to say anything about it.
     """
+    if wait_for_shutdown is None:
+        wait_for_shutdown = functools.partial(
+            _wait_for_shutdown, ttl_seconds=settings.task_ttl_seconds
+        )
     # 0. Fail loudly, before anything starts, if the environment cannot run a
     #    turn: bad path layout, no model credential, an unspawnable sandbox, or a
     #    bundle that is absent or names a different crew.
@@ -467,10 +507,15 @@ def run(settings: Settings, *, wait_for_shutdown=_wait_for_shutdown) -> int:
     # both told ECS a crash loop was a clean shutdown, so the console showed a task
     # exiting normally over and over with nothing marked failed.
     #
-    # `signal` is the ONLY success case. Anything else, including an empty reason,
-    # is reported as a failure: a reason this code cannot account for is not
-    # evidence that things went well.
-    if why == "signal":
+    # A spent lifetime joins "signal" as a success: the task ran for as long as it
+    # was allowed and then stood down, which is the bound working rather than
+    # anything going wrong. Reporting it as a failure would leave an operator
+    # reading every expiry as an incident.
+    #
+    # Anything outside `_ORDERLY_REASONS`, including an empty reason, is reported as
+    # a failure: a reason this code cannot account for is not evidence that things
+    # went well.
+    if why in _ORDERLY_REASONS:
         return 0
     log.error("exiting non-zero: %s", why or "shutdown reason unknown")
     return 1

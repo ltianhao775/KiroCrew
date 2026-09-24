@@ -34,6 +34,17 @@ per-invocation grant would report "delivered", render a card, and then refuse th
 download -- worse than today's clean refusal. A durable record is readable at
 every gate, which is why the grant is configuration-time and lives on disk.
 
+Both content kinds reach that rule, and each gate runs two passes rather than one.
+UTF-8 text goes through ``security.redact``; bytes that fail to decode go through
+``platform.binary_content_is_flagged``, the one binary scan all four gates share,
+because a credential can sit inside an allow-listed media type just as easily as
+in a text file. ``platform.wide_content_is_flagged`` runs on both branches at all
+four gates, because a credential written at UTF-16 or UTF-32 spacing is
+NUL-interleaved ASCII: that is valid UTF-8, so it decodes into the text branch,
+and the detectors match contiguous ASCII so they match none of it. What differs
+between the gates is only what a positive result DOES: the three owner-facing ones
+consult the grant recorded here, the upload legs refuse regardless.
+
 Which destinations a grant can EVER cover
 -----------------------------------------
 ``GRANTABLE_CLASSES`` has exactly one member, and that is a security property
@@ -186,19 +197,18 @@ CLASS_LABELS: dict[str, str] = {
 #: central promise, so the artifact is removed rather than defended: an agent cannot
 #: hold a lock that does not exist.
 #:
-#: One writer makes this sufficient. ``aws_consent`` needs a cross-process file lock
-#: because it has TWO writers -- its dashboard handler and the ``kirocrew
-#: aws-consent`` CLI. This grant still has exactly one writer of the STORE, the
-#: owner-gated dashboard handler, running in the gateway process. The
-#: ``kirocrew file-delivery approve`` verb does NOT write the store: it consumes
-#: an owner-armed nonce and drives the same in-process handler over loopback, so
-#: it is a step-up that authorizes a write rather than a second writer of it. One
-#: store writer in one process is served by a process-local lock.
+#: One writing PROCESS makes this sufficient. This grant has exactly one writer of
+#: the STORE, the owner-gated dashboard handler, running in the gateway process.
+#: The ``kirocrew file-delivery approve`` verb does NOT write the store: it
+#: consumes an owner-armed nonce and drives the same in-process handler over
+#: loopback, so it is a step-up that authorizes a write rather than a second
+#: writer of it. One store writer in one process is served by a process-local
+#: lock. ``aws_consent._STORE_LOCK`` reaches the same conclusion on the same
+#: grounds, and carries the shared reasoning in full.
 #:
 #: WHAT IS NOT SERIALISED, stated because it is a narrowing: two gateway
 #: processes sharing one data home do not serialise their writes against each
-#: other. That configuration is not served by a cross-process file lock either --
-#: the precedent's cross-process lock exists for the CLI, not for multi-gateway --
+#: other. That configuration is not served by a cross-process file lock either,
 #: and a torn write still cannot widen a grant, because ``read_grant`` refuses any
 #: row whose ``destination_class`` disagrees with its key and ``_read_all`` fails
 #: soft to "no consent" on anything unparseable.

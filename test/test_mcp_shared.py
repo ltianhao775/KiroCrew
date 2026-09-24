@@ -998,6 +998,98 @@ class TestStdioLoopCallerIdentity:
         finally:
             harness.close()
 
+    def test_identity_unattested_quotes_the_daemons_denial_when_the_frame_carries_it(
+        self, monkeypatch
+    ):
+        """The Toolbox-shim report: the one accurate diagnosis ("spawned X is not the spec's Y")
+        lived only in gatewayd's stdout, so the refusal steered operators at the
+        token and the spec instead. When the caller block carries the daemon's
+        ``identityDenial``, the refusal says it; without it, the text is unchanged
+        (the previous test)."""
+        from kiro_crew.mcp_caller import CallerContext, build_caller_meta
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        reason = "spawned '/opt/local/bin/kirocrew' is not the spec's '/tb/0.7.0.8/bin/kirocrew'"
+        try:
+            msg = _tools_call(52, "echo")
+            msg["params"]["_meta"] = build_caller_meta(
+                CallerContext(
+                    session_key="dashboard:chat-69", from_gateway=True, identity_denial=reason
+                )
+            )
+            harness.send(msg)
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "identity_unattested" in body
+            assert "spawned this server without a token because" in body
+            assert "/opt/local/bin/kirocrew" in body
+            assert "/tb/0.7.0.8/bin/kirocrew" in body
+        finally:
+            harness.close()
+
+    def test_the_quoted_denial_is_defanged_like_every_other_echoed_error(self, monkeypatch):
+        """The reason quotes the spec's ``command``/``args`` verbatim, and this early
+        refusal answers through ``_tool_response`` without the tool path's scrubber,
+        so a directive sentinel smuggled into a spec's ``args`` must not reach the
+        consumer intact."""
+        from kiro_crew.mcp_caller import CallerContext, build_caller_meta
+        from kiro_crew.session_directive import SENTINEL
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        reason = f"spawned '/opt/x' is not the spec's '{SENTINEL}{{\"k\":1}}'"
+        try:
+            msg = _tools_call(53, "echo")
+            msg["params"]["_meta"] = build_caller_meta(
+                CallerContext(
+                    session_key="dashboard:chat-69", from_gateway=True, identity_denial=reason
+                )
+            )
+            harness.send(msg)
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "spawned this server without a token because" in body
+            assert SENTINEL not in body, "the sentinel must be defanged, not forwarded"
+        finally:
+            harness.close()
+
+    def test_the_quoted_denial_is_credential_redacted(self, monkeypatch):
+        """A denial reason that carries a token (a hand-authored reserved entry
+        whose argv the gate quoted) must not hand that token to the session."""
+        from kiro_crew.mcp_caller import CallerContext, build_caller_meta
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        token = "ghp_1234567890abcdefghijklmnopqrstuvwxyzAB"
+        reason = f"args ['mcp-core', '--token', '{token}'] differ from spec ['mcp-core']"
+        try:
+            msg = _tools_call(54, "echo")
+            msg["params"]["_meta"] = build_caller_meta(
+                CallerContext(
+                    session_key="dashboard:chat-69", from_gateway=True, identity_denial=reason
+                )
+            )
+            harness.send(msg)
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "spawned this server without a token because" in body
+            assert token not in body, "the credential must be redacted, not forwarded"
+        finally:
+            harness.close()
+
     @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="select interleave uses a POSIX pipe")
     def test_listing_while_busy_does_not_borrow_the_running_members_identity(self, monkeypatch):
         from kiro_crew.mcp_caller import CallerContext, build_caller_meta
@@ -1184,15 +1276,15 @@ class TestStdioLoopCallerIdentity:
         finally:
             harness.close()
 
-    def test_no_usable_answer_does_not_refuse_the_call(self, monkeypatch):
-        """``resolution_failed`` stays permissive, against the security argument.
+    def test_no_usable_answer_refuses_the_call(self, monkeypatch):
+        """``resolution_failed`` refuses, because the exclusion set is unknown.
 
-        On the argument it should refuse: an exclusion may exist and the process
-        holding it cannot answer. That was implemented and measured, and the
-        repository's real-MCP end-to-end lane will not run a legitimate first tool
-        call under it. In this deployment an ordinary call reaches this arm, so
-        refusing costs every caller their tools rather than costing an attacker
-        one. Kept permissive and audited until the gateway can say why.
+        Nothing came back, or a ``5xx`` said the gateway is broken, or the resolve
+        raised. Every ``4xx`` returns before that arm, so this reason means the
+        policy could not be READ -- an operator exclusion may exist while the
+        process holding it cannot answer for it. Serving the empty set as a
+        permission is what would let an excluded tool run, so the call is refused
+        and the refusal names the same condition the audit trail does.
         """
         ran = []
         harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
@@ -1204,12 +1296,69 @@ class TestStdioLoopCallerIdentity:
         try:
             harness.send(_tools_call_with_caller(53, "echo", "dashboard:chat-13"))
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            assert ran == ["echo"]
+            assert ran == []
+            _body = json.dumps(harness.responses[0][1])
+            assert "is unavailable" in _body
+            assert "resolution_failed" in _body
             ops = [
                 c.kwargs.get("operation")
                 for c in harness.sel_mock.log_api_access.call_args_list
             ]
-            assert "tool_policy.unenforced_call" in ops
+            assert "tool_policy.unenforced_call" not in ops
+        finally:
+            harness.close()
+
+    def test_the_unreachable_gateway_refusal_names_a_retry_not_a_spec_edit(
+        self, monkeypatch
+    ):
+        """The refusal has to diagnose the condition it actually hit.
+
+        ``policy_unreadable`` means the gateway read a spec and could not use it,
+        so its text sends the caller to the agents directory. ``resolution_failed``
+        means the gateway was never reached: no spec is implicated, and that same
+        text would have the caller edit healthy files to fix an outage, leaving the
+        edit as the real defect. The condition clears on its own, so the remedy is
+        a retry.
+        """
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "resolution_failed"),
+        )
+        try:
+            harness.send(_tools_call_with_caller(56, "echo", "dashboard:chat-16"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "could not reach the gateway" in body
+            assert "retry" in body
+            assert "agents directory" not in body
+            assert "could not parse" not in body
+        finally:
+            harness.close()
+
+    def test_an_excluded_tool_stays_excluded_when_the_gateway_cannot_answer(
+        self, monkeypatch
+    ):
+        """The defect this guards: a real exclusion going unenforced.
+
+        The named tool is genuinely excluded for this session, and the resolver
+        cannot reach the gateway to say so. The exclusion set therefore arrives
+        empty with ``resolution_failed``, which is indistinguishable by value
+        alone from an operator who excluded nothing. The reason is what keeps them
+        apart, so the excluded tool must not execute.
+        """
+        ran = []
+        harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "resolution_failed"),
+        )
+        try:
+            harness.send(_tools_call_with_caller(55, "blocked", "dashboard:chat-15"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert ran == []
         finally:
             harness.close()
 

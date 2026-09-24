@@ -48,8 +48,7 @@ isolation admission. See [the memory contract](memory-skills-hooks.md).
             │ acp.py      │
             └──────┬──────┘
                    │  backend id from agent_sdk/backends.py
-        ┌──────────┼──────────┬──────────┐
-     kiro-cli   claude-acp   KAS      codex-acp
+                   └─ harness selected from the live backend registry
 ```
 
 `agent_sdk/backends.py` is the selection authority: it defines the ids, the membership
@@ -166,6 +165,76 @@ global steering directories also belong to that launch contract, even when no
 resource glob declares them. SOUL is native-owned only when explicitly declared.
 The mirrored steering reference records engine/version differences for conditional
 modes, so Kiro uses the fallback selector instead of claiming full native support.
+
+Folder steering is deliberately NOT part of that launch contract. A chat filed
+into a folder that declares `steering_dirs` (see [config](config.md)) has those
+directories read by `kiro_crew.folder_steering.collect_folder_steering` and the
+resulting documents placed into session-start context by the context builder, for
+EVERY provider — kiro-cli, Claude Code, Codex, KAS, and any config-authored
+harness — with no provider branch on that path. `SpawnContext`, `AcpRuntime` and
+the harnesses carry no folder-steering field, so every harness produces an
+identical `SpawnPlan` for a folder chat and a non-folder chat; delivery cannot be
+lost by adding a provider. A file whose realpath lies under the chat project's
+`.kiro/steering` or under `~/.kiro/steering` is skipped ONLY where the active provider
+already delivers those trees -- kiro-cli loads them natively, the Claude Code seam
+receives the explicit steering load, KAS reports `native_steering` -- so they are
+not sent twice; on a harness with no such path (Codex, OpenCode, Pi, Goose,
+DeepSeek) the folder delivers them like any other document rather than skipping
+rules nothing else would carry. Documents honor the steering
+`inclusion` frontmatter (`always`, or absent, is included; `manual`, `auto` and
+`fileMatch` are skipped and left to their native trigger), and each file is
+admitted against its own declared directory as the trust base, so a symlink can
+never read outside the root the operator pointed at. A root that is, contains,
+or lies inside a memory store (every configured V1 workspace -- the default
+`workspace/` under the crew data home and each `workspaces` entry, wherever its
+directory points -- or the `memory_stores/` tree) is refused by the folder API
+and skipped by the collector (compared casefolded, so an alternate-case spelling on a case-insensitive filesystem is the same silo): a named memory store is a silo, and folder
+steering must not carry one store's Markdown into another store's prompt. The
+fence is built from the configuration's `workspaces` table, and while that table
+cannot be read (an unparseable `config.json` or a non-object `workspaces` value,
+which the loader records as a degraded section rather than repairing to `{}`) the
+fence is INCOMPLETE and fails closed: the folder API refuses to admit any steering
+directory (clearing to `[]` still works), and the collector reads nothing and
+emits a `[FOLDER STEERING OMISSION: ...]` line saying so, until `config.json` is
+repaired -- the default directories alone are not the fence when an operator's
+external workspace may be missing from it. The
+stored value is bounded as STORED (the canonical spelling, after `~` and link
+expansion), and re-validated per entry on every resolve: a directory that has
+since vanished or become refused is skipped with a warning while the rest of the
+chain still steers; only a malformed stored shape fails the resolution.
+The section's own frame,
+`[FOLDER STEERING — …]` / `[END FOLDER STEERING]`, is a prompt-boundary marker in
+the same set as `[CURRENT USER REQUEST —]`: a copy planted in a channel message,
+a memory line or a steering body is neutralized by the session-context scrub and
+by the renderer's body scrub, and the genuine frame is minted AFTER that scrub
+(outside the `[SESSION CONTEXT …]` block on a fresh session, and around the
+already-scrubbed bodies on compaction reinjection), so only the operator-selected
+section ever carries it. The non-member section is
+capped like the existing steering section; a member (private-memory) chat carries
+the documents inside its essentials envelope instead, which applies its own
+document-count and per-source byte bounds; a private-member chat in Temporary
+memory mode receives no folder steering, exactly as that mode withholds the
+member's project documents (the envelope is built with reads blocked), whereas a
+non-member Temporary chat still receives it. Collection itself is bounded twice --
+a 64-document ceiling on what is read and a 4096-entry ceiling per root on what
+is enumerated -- and a ceiling that fires is never silent: the section ends with
+one `[FOLDER STEERING OMISSION: …]` line per fired ceiling stating what the model
+is not seeing in the terms the walk saw it -- unexamined Markdown candidates past
+the document ceiling; and, past the entry ceiling, the Markdown files the listing
+had already produced but will never read (counted as files) separately from the
+directories never listed or entered (counted as directories, a floor) -- and a member
+envelope that had to drop a tail carries the same counts as one extra
+`folder-steering://omitted` essentials document, so a capped tree never reads
+like a complete one. After provider compaction the section is re-injected under
+a `[REINJECTED AFTER COMPACTION — folder steering]` line. The tree is read only
+through descriptor-pinned directory handles (parent chain pinned, each child
+opened relative to its parent with `O_NOFOLLOW`, one descriptor per level of the
+active ancestry); on a platform that cannot open a directory relative to a
+descriptor (native Windows) the folder API refuses a non-empty `steering_dirs`
+before any filesystem call and the collector skips a stored value with a
+warning, because a by-name `isdir`/`realpath` on a swapped junction is itself
+the outbound SMB probe.
+
 KAS inline prompts and file resources come from the actual `customAgents`
 definition sent by `session/new`. File expansion uses that definition, not a
 reread of a possibly different project template. Successful activation publishes
@@ -176,7 +245,14 @@ Exact template and body matches omit initial manual copies. The complete-envelop
 budget is checked BEFORE omission: 64,000 characters including wrappers; reads
 refuse above 256,000 bytes per source, and resource expansion is bounded to 64
 unique documents. KAS's existing registration ceiling is 50 custom agents, not a
-file-body budget. This repository does not establish a universal native model or
+file-body budget. An id in `agent_files.KAS_RESERVED_AGENT_IDS` (`default` and
+the built-in mode ids `vibe`, `spec`, `quick-spec`, `bug-fix`, `plan`,
+`autonomous`; exact, case-sensitive) is refused by the projection before
+`session/new` -- the engine accepts such an entry and either drops it or keeps
+its own built-in under the id, so it would surface only as an unadvertised mode
+or as the built-in running under the crewmate's name -- and the refusal names
+the crewmate-side remedy (`crew-mode.md`, "Template names the harness cannot
+activate"). This repository does not establish a universal native model or
 resource truncation limit; real harness versions still need that integration check.
 Resume and replacement snapshots retain complete text. Frameworks without native steering receive a
 conditional discovery index: the agent reads a guide only after its explicit
@@ -327,12 +403,12 @@ tool-less session. The session-scoped barrier and its budget are specified in
 The one concrete provider. It spawns a long-lived harness subprocess — by default
 `kiro-cli acp --agent <name>` — and speaks JSON-RPC 2.0 over stdio.
 
-**The backend seam:** `AcpProvider`/`AcpClient` take an `acp_backend` id
-(`""` → kiro-cli, `"claude"` → `claude-agent-acp`, `"kas"` → KAS,
-`"codex"` → `codex-acp`). Construction rejects an id outside
-`ACP_BACKENDS_KNOWN`, so a value that falls through every identity check cannot
-spawn kiro-cli under a foreign label. Which of those ids an operator can select
-is `BASELINE_SELECTABLE_BACKENDS`, not this file. Binary resolution and
+**The backend seam:** `AcpProvider`/`AcpClient` take an `acp_backend` id from
+`ACP_BACKENDS_KNOWN`; the empty id denotes kiro-cli. Construction rejects an id
+outside that registry, so a value that falls through every identity check cannot
+spawn kiro-cli under a foreign label. Which registered ids an operator can select
+is the separate, live `BASELINE_SELECTABLE_BACKENDS` set in
+`agent_sdk/backends.py`, not a duplicated list in this file. Binary resolution and
 config isolation per backend live in [`acp-client.md`](acp-client.md); do not add
 a second provider or a provider-level selector (see the repo-root `CLAUDE.md`).
 
@@ -358,7 +434,7 @@ in [agent-host-contract.md](agent-host-contract.md).
 **MCP Tool Search** (kiro-family backends — see https://kiro.dev/docs/cli/mcp/tool-search/): loads MCP tool specs on demand ("search-and-call") instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. Gated by the `agent.tool_search` config toggle (default **on**; auto-surfaces as a Settings toggle since the schema is generated from the dataclass).
 - **kiro-cli (Rust engine):** applied via the **same** workspace `cli.json` overlay used for effort (`<work_dir>/.kiro/settings/cli.json`), written deterministically before every spawn and on each restart by `_write_tool_search_overlay` (called from `AcpProvider.__init__` and `start()`), scoped to `ACP_BACKENDS_TOOL_SEARCH_OVERLAY`. The engine activates deferral only when the agent's `tools` also grants `tool_search`, so on this channel the loader invariant is the engine's. When enabled it writes the flat keys `toolSearch.enabled=true` plus `toolSearch.minPct`/`toolSearch.minTokens`, taken from `agent.tool_search_min_pct` / `agent.tool_search_min_tokens` (defaults `5` / `50000`, mirroring kiro-cli's own thresholds; clamped to 0-100 and >= 0, non-numeric falls back to the default); when disabled it writes `toolSearch.enabled=false` and drops both thresholds.
 - **Why the thresholds are not forced to 0:** deferral costs a round-trip — a deferred tool's spec is absent from the model's tool list, so the first direct call fails with `A tool with the name '<name>' does not exist` and has to be recovered with `tool_search`. That only pays once the specs are genuinely large, which is what the thresholds express (kiro-cli defers when EITHER is exceeded). An earlier build hard-coded both to `0`, imposing the round-trip on every install including ones far below the threshold. Setting both to `0` still restores unconditional deferral for operators who want it. The thresholds are written **explicitly** rather than omitted, so a machine carrying the old forced zeros is actually migrated instead of silently keeping them.
-- Writing both `true` and `false` makes the KiroCrew toggle authoritative over any value in the user's global `~/.kiro/settings/cli.json`. The write is merge-safe with the effort `chat.modelDefaults` keys in the same file.
+- Writing both `true` and `false` makes the Kiro Crew toggle authoritative over any value in the user's global `~/.kiro/settings/cli.json`. The write is merge-safe with the effort `chat.modelDefaults` keys in the same file.
 - **KAS:** never opens `cli.json`; it reads the setting from the ACP `initialize` request, `clientCapabilities._meta.kiro.settings.toolSearch` — a process-wide channel filled by `AcpRuntime._handshake_client_capabilities`, entered from the spawn path only when the harness answers `client_meta_settings` (the harnesses in `ACP_BACKENDS_CLIENT_META_SETTINGS`; every other host reads its constant with no new step), from the same `agent.tool_search*` values (`agent_sdk/tool_search.py`). KAS defers **every** MCP spec when told to and does not check that a loader is mounted, so the client keeps the invariant: `enabled` is sent as `true` only when the spawn agent's spec grants `tool_search` — named in `tools`, or via `"*"` / `@builtin` — and does not take it back in `excludedTools`; it is sent as an explicit `false` otherwise — never omitted, so a host default cannot flip a session into "deferred, unreachable". The spec judged is the one the KAS projection puts on the wire (`AcpRuntime._projected_spawn_spec`: the freshness gate's snapshot for a derived agent, else `load_agent_spec` on the user-level agents directory after the same `ensure_agent_materialized` self-heal the projection runs) — never a project checkout's `.kiro/agents` spec, which that projection does not consult; an unreadable spec grants nothing. The setting is process-wide, so every later `create_session` on a deferral-enabled process judges the payload it is about to send: a projection that grants no loader — another agent, or the same agent whose spec has since lost the grant — is refused with `AcpToolSurfaceBindingError` (an `AcpWorkspaceBindingError`), which the run-runtime caller already answers by giving that session a runtime of its own. The check lives in `AcpRuntime._kas_custom_agents`, the projection seam both `create_session` and `load_session` go through, so a resumed session is judged the same way. It is deliberately one-directional: a process whose handshake sent `enabled: false` may serve a later session whose agent does grant the loader — that session simply runs with full tool specs, today's behaviour and never a loss of tools — whereas the reverse pairing loses every MCP tool, which is the only shape worth a refusal. Every KAS-capable runtime constructor threads the same resolved settings — the foreground provider, its resume-respawn fallback, the companion-runtime kwargs mirror (`session_allocation._collect_parent_runtime_kwargs`, reading the parent's `LLMProvider.tool_search_settings` capability — default `None`, answered by `AcpProvider`; harness-parity H14) and the background runtime (`session_background`) — so no KAS process is left to the host's default. KAS does not honour the two thresholds as an activation floor — deferral there is all-or-nothing, with `toolSearch.neverDefer` as its keep-list — but they are forwarded verbatim so the setting means one thing.
 - **Non-kiro-family backends** — no-op on both channels. `_apply_tool_search_overlay` returns early when the backend does not read the overlay, the handshake channel is filled only for members of `ACP_BACKENDS_CLIENT_META_SETTINGS`, and both are silent when no toggle value was threaded in (`tool_search is None`).
 - **Native-resume compatibility:** for a direct dashboard turn with Tool Search enabled (dashboard session identity and no resumable linked-channel identity), the kiro backend does not use `session/load`. Before provider acquisition, dashboard chat resolves the slot's dedicated Slack field unconditionally and uses the channel-neutral `SessionMap.mirror` link only when `mirror_accepts_inbound` is true. Thus inbound-capable Telegram/Discord links remain distinguishable when they reuse a `dashboard:*` key after restart, while outbound-only iMessage/WhatsApp mirrors still take the direct-dashboard recovery path. A loaded transcript can return without Tool Search's activated schemas: `tool_search` reports a match, but the next inference still cannot invoke that tool. The provider instead creates a fresh native session and sets `_history_replay_needed`, so `SessionManager` marks conversation replay pending against the rebuilt tool registry. Only this direct-dashboard compatibility branch also makes `defer_replay_sid_promotion` true; `SessionMap` keeps the prior full-history SID durable while that lease is pending, allocation does not publish the fresh SID yet, and `close_all()` refuses to overwrite the retained mapping while `provider_switch_replay` remains armed. Generic `session/load` recovery still requests history replay but publishes its fresh SID immediately because non-dashboard dispatchers do not own the dashboard settlement contract; a later channel restart therefore resumes the recovered native transcript rather than the stale pre-recovery SID. Replay settlement runs from the dashboard turn's `finally`, so exceptions, task cancellation, early returns, and synthetic terminals cannot bypass it. A landed, non-synthetic replay-bearing `end_turn` promotes the fresh SID, as does confirmed `/clear` after native history deletion. Cancellation, incomplete streams, and every other non-committed terminal leave the prior SID in place and re-arm replay, so a second gateway restart cannot strand a slash-only or discarded transcript. That lease drives every replayable dashboard session-start prompt block (history, ContextBuilder, member context, folder, persona, and context telemetry). `AgentSpawn` hooks remain keyed to the actual provider spawn so script side effects execute once; a slash-first turn does not re-fire them during replay. Non-destructive native slash commands bypass `ContextBuilder` and leave the lease intact; a confirmed `/clear` consumes it at `EVENT_CLEAR_STATUS` so later replay cannot restore deleted history. Authorization, shutdown, or pre-dispatch Stop aborts preserve it. Async stream creation is not acceptance: a replay-bearing non-slash turn records acceptance in runner-local state only when its stream yields the first provider event, while the shared lease remains armed throughout the in-flight turn. Empty streams and pre-output failures therefore retain replay without settlement, and a concurrent shutdown can observe only the still-pending old SID. Final settlement synchronously promotes the fresh SID and consumes the lease only for a landed, non-synthetic, non-empty `end_turn`; every empty-response verdict is unlanded for replay durability, including the terminal give-up rung when retry budget is exhausted or auto-continue is disabled. If an accepted turn ends cancelled, the still-armed lease carries forward because kiro-cli discards that turn; the next prompt receives the full older replay plus its cancelled-turn preamble. This trades the native resume latency win for a usable dashboard tool surface without losing prior conversation or undoing an explicit clear. Setting `agent.tool_search=false` keeps dashboard-native `session/load`; a dashboard-keyed resumable channel turn and every channel dispatcher remain on native resume regardless of Tool Search.
@@ -450,7 +526,7 @@ If the parent session is alive but returned no policy, deny-by-default applies �
 
 Provider-level recovery mechanisms that fire automatically without user intervention:
 
-**Interactive transient-5xx retry:** the interactive dashboard/Slack `chat_runner` stream loop retries a transient backend 5xx (InternalServerError / DispatchFailure / ConnectionReset, JSON-RPC `-32603`) through the shared `llm_helpers` transient classifier + backoff, **without** resetting the still-alive session. Auth/validation errors are excluded (fail-fast); on retry-budget exhaustion a clean error surfaces on a still-resumable session. The unattended `stream_and_collect` path retries on the same classifier, so both callers behave alike.
+**Interactive transient-5xx retry:** the interactive dashboard/Slack `chat_runner` stream loop retries a transient backend 5xx (InternalServerError / DispatchFailure / ConnectionReset, JSON-RPC `-32603`) through the shared `llm_helpers` transient classifier + backoff, **without** resetting the still-alive session. Auth/validation errors are excluded (fail-fast); on retry-budget exhaustion a clean error surfaces on a still-resumable session. The unattended `stream_and_collect` path uses the same classifier, but its same-model and fallback-chain retries replay the original prompt only while no assistant text or tool call has occurred across any attempt. Any fired tool call makes a later transient error terminal on that path, including when the tool completed without producing text.
 
 A transient 5xx that arrives *after* the turn already emitted output (the `_turn_emitted` guard is set once any assistant token streams or a tool call fires) no longer drops the turn. Instead it **RECOVERS ONCE**: the streamed partial is preserved as a finalized assistant message, a brief recovery notice is appended, and a *continue* instruction (not the original prompt) is re-queued onto the SAME live ACP session — which still holds the interrupted turn's context (original prompt, streamed partial, and any completed tool results) — so the model resumes from where it stopped rather than restarting. The recovery is one-shot per genuine user turn: the allowance is consumed only when a recovery is actually enqueued and is refreshed at the start of the next real user turn, never on the synthetic recovery turn, so a repeated post-token 5xx during recovery surfaces a clean error instead of looping. When Stop is active or the turn is nested (`_prompt_depth != 0`) the partial + notice are still shown but nothing is re-queued (the allowance is left unconsumed). This recovery **also applies to turns that already fired a tool call** — an ACCEPTED TRADEOFF (owner decision), rather than failing fast: a mid-stream 5xx is rare, and the continue instruction tells the model to resume and not re-run tools that already completed. A residual double-execution risk remains only for a side-effecting/destructive tool that was still *in flight* when the 5xx hit; the owner accepts that narrow risk in favor of recovering the turn.
 
@@ -460,7 +536,7 @@ A transient 5xx that arrives *after* the turn already emitted output (the `_turn
 
 ### Installation
 
-KiroCrew drives `kiro-cli` over ACP — install it per its own docs, ensure it is
+Kiro Crew drives `kiro-cli` over ACP — install it per its own docs, ensure it is
 on `PATH`, and run `kiro-cli login`. `kirocrew doctor` reports its status.
 
 

@@ -32,18 +32,26 @@
     "argv": [
       "/opt/bin/dsh",
       "--profile",
-      "acp"
+      "acp",
+      "--patch",
+      "/opt/run/kiro_crew_dsh_gate.patch.yml"
     ],
     "env_added": {
       "DSH_PERMISSION_MODE": "workspace-write",
+      "KIROCREW_DSH_GATE_SESSION": "<nonce>",
       "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
+      "KIROCREW_SCRATCH": "<scratch>",
       "KIROCREW_SESSION_KEY": "golden-session",
       "KIROCREW_SPAWNED": "1",
       "KIROCREW_STUB_SESSION_TOKEN": "<session-token>",
-      "PATH": "<augmented-path>"
+      "KIRO_CHAT_LOG_FILE": "<scratch-log>",
+      "PATH": "<augmented-path>",
+      "TEMP": "<scratch>",
+      "TMP": "<scratch>",
+      "TMPDIR": "<scratch>"
     },
-    "spawn_label": "dsh --profile acp",
-    "stderr_label": "dsh"
+    "spawn_label": "/opt/bin/dsh --profile acp --patch /opt/run/kiro_crew_dsh_gate.patch.yml",
+    "stderr_label": "/opt/bin/dsh --profile acp --patch /opt/run/kiro_crew_dsh_gate.patch.yml"
   },
   "goose": {
     "argv": [

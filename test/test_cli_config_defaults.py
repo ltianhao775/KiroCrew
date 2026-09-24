@@ -346,7 +346,8 @@ def test_an_appended_coerced_entry_is_detected_without_editing_the_detector(monk
     """
     appended = SD.CoercedValue(
         dotted_key="agent.provider",
-        resolves_to="acp",
+        resolves_to=lambda _v: "acp",
+        default="acp",
         reason="names a withdrawn provider",
         is_coerced=lambda v: v == "gone",
     )

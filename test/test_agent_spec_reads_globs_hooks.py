@@ -117,6 +117,26 @@ class TestAgentSkillGlobsHardenedRead:
         (d / "big.json").write_text(body, encoding="utf-8")
         assert agent_skill_globs("big", agents_dir=d) == []
 
+    def test_a_global_agent_is_reopened_from_the_passed_agents_dir(self, tmp_path: Path) -> None:
+        """With BOTH ``agents_dir`` and ``project_dir`` given, a global-scope winner
+        is reopened from ``agents_dir``, not from the machine's real kiro home.
+
+        Differential on that choice: the spec exists ONLY under ``agents_dir``, so
+        resolving to the default home instead would read nothing and return ``[]``.
+        The expanded glob anchors on the project root, which is what
+        ``expand_skill_uri`` does whenever a project is in play.
+        """
+        d = _agents_dir(tmp_path)
+        (d / "mapped.json").write_text(
+            _spec("mapped", "skill://skills/foo/SKILL.md"), encoding="utf-8"
+        )
+        project = tmp_path / "proj"
+        (project / ".kiro" / "agents").mkdir(parents=True)
+
+        globs = agent_skill_globs("mapped", agents_dir=d, project_dir=str(project))
+
+        assert globs == [str(project / "skills" / "foo" / "SKILL.md")]
+
     def test_appledouble_sidecar_is_skipped(self, tmp_path: Path) -> None:
         """A ``._`` sidecar never contributes a mapping, even with a matching name."""
         d = _agents_dir(tmp_path)

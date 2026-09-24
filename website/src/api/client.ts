@@ -58,7 +58,11 @@ export const SKILLS_TIMEOUT_MS = 15_000
 export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 import { installApiTransport } from './apiTransport'
 import type { SessionSummary } from '../types/sessionSummary'
-import { queryClient, resolveDefaultMemoryMode } from './queryClient'
+import {
+  queryClient,
+  invalidateAcrossQueryClients,
+  resolveDefaultMemoryMode,
+} from './queryClient'
 import { getStoredConsent } from '../utils/themeConsent'
 import { recordError, parseErrorCode, requestPath } from '../utils/errorReport'
 import { i18nT } from '../i18n/t'
@@ -99,6 +103,17 @@ function themeConsentSha(colorTheme?: string): string | null {
  *  path to write. The caller (`revealOrOpen`) writes the clipboard silently — the
  *  affordance that routed here already promised a copy. */
 type RevealResult = { copy?: string }
+
+/** Static-validation verdict for a pending auto-skill candidate's bundled
+ *  scripts, served on both the pending list entries and the detail payload
+ *  (`/api/skills/-/pending[/{slug}]`). `ok: true` with an empty report when the
+ *  candidate has no scripts; on failure `report` maps each offending file to
+ *  its flagged constructs. The same report rides the 422
+ *  `script_validation_failed` approve refusal. */
+export interface SkillScriptValidation {
+  ok: boolean
+  report: Record<string, string[]>
+}
 
 export type McpShareReason = {
   code: string
@@ -237,6 +252,11 @@ export interface ConnectionMintState {
   state: 'idle' | 'minting' | 'waiting' | 'granted' | 'failed' | 'expired'
   oauth_url?: string
   reason?: string
+  /** Copy-ready "host/path" of the authorization URL the credential gate
+   *  refused. Present only beside reason === 'mint_url_rejected', and only when
+   *  the backend could reduce the URL to a string the oauth_endpoints.json
+   *  loader would accept (query, fragment, port and userinfo are never sent). */
+  rejected_endpoint?: string
   /** Opaque id of the backend row, unique across gateway restarts as well as
    *  within one process. Reported so a row can be told apart from its
    *  successor for the same provider. */
@@ -379,6 +399,14 @@ export interface BrowserViewData {
   url: string | null
   port: number | null
   reason: string | null
+  /** Dashboard-origin relay path (`/browser-view/<token>/`) to FRAME the view
+   * through — same origin as the dashboard, so it works over an SSH forward or
+   * tunnel with no second port. The embedded per-instance capability token is
+   * the relay's auth (the panel frames it in an opaque-origin sandbox that
+   * sends no cookies). Null unless running; absent entirely from an older
+   * gateway, in which case the panel falls back to framing the absolute
+   * loopback `url`. */
+  path?: string | null
 }
 
 /** Answer of POST /api/browser/open: the Browser panel's address bar on the
@@ -439,6 +467,51 @@ export interface DecisionsConsentData {
    * ever read as this one.
    */
   compaction?: boolean
+  /**
+   * Whether the owner consented to sending THE TEXT OF RECALLED MEMORIES — the extra
+   * egress category `memory.recall` needs. Absent reads as not consented, on the same
+   * terms as `tool_args`: a recalled memory is text the agent wrote down in an earlier
+   * conversation, so consent recorded against a message excerpt cannot stand for it.
+   */
+  memory_text?: boolean
+  /**
+   * Whether the owner consented to sending WAKE EVIDENCE — the transcript tail and
+   * pull-request readings the `nudge.wake` judge screens a tick against. Absent reads
+   * as not consented, on the same terms as the three above: this evidence comes from
+   * sessions the loop WATCHES rather than the one the owner is talking in, so none of
+   * the narrower yeses stands for it.
+   */
+  nudge_evidence?: boolean
+  /**
+   * One row per decision point this GATEWAY ships, projected from the seam's own
+   * registry (`decisions/gate.py`). The card lists these rather than an array
+   * written here, so a build that ships another point lights up a row with no
+   * frontend edit — the same arrangement the Agent Backend panel uses for its
+   * capability lines.
+   *
+   * Absent on a gateway older than the projection, which reads as no rows: the
+   * overview then says the points cannot be listed rather than inventing a list.
+   */
+  points?: DecisionPointData[]
+}
+
+/** One decision point as the gateway reports it. */
+export interface DecisionPointData {
+  /** The gateway's identifier, e.g. `skills.select`. Also the decision log's. */
+  id: string
+  /**
+   * The keystone scope this point needs on top of consent itself (`tool_args`), or
+   * null when consent alone is enough. The point's own panel draws its switch from
+   * this, so a new scope needs no per-point branch here.
+   */
+  needs_scope: string | null
+  /**
+   * The EFFECTIVE answer, not a switch position: `active`, `needs_scope` (consent
+   * stands but this point's egress category was never granted), or `off` (nothing
+   * is sent at all — no consent, a moved endpoint, or a governance pin). Computed
+   * server-side so the row and the gate cannot disagree.
+   */
+  status: string
 }
 
 /** Which side of a logged decision a reader's verdict is about. */
@@ -1367,8 +1440,21 @@ export interface AcpBackendProbe {
    * of the `policy_id` fallback for a name: a bare `private_memory_mcp` in
    * front of a reader is worse than one line fewer, while a chip with no text
    * at all is worse than a policy id.
+   *
+   * `available` is a BOOL on every line, including an unmeasured one, where it is
+   * false: a reader that ignores `measured` gets the fail-closed not-available
+   * answer and never a promise. `measured` is absent from a gateway that predates
+   * the third state, which is why the panel tests it for `=== false` rather than for
+   * falsiness -- absent means measured, the two-level answer that gateway is sending.
+   * `unmeasured_reason` is a machine CODE (`no_driven_capture`), labelled in the
+   * panel like every other id on the card, and is `''` on a measured line.
    */
-  capabilities?: { id: string; available: boolean }[]
+  capabilities?: {
+    id: string
+    available: boolean
+    measured?: boolean
+    unmeasured_reason?: string
+  }[]
   /**
    * Ids of the SECURITY notes that hold for this harness: which layer confines
    * the agent, whether Crew hands its own credential to the child, how an
@@ -1783,7 +1869,7 @@ function showSessionExpiredBanner(lead?: string): void {
         // `data === undefined` narrows it to queries that never carried a
         // successful value: exactly the ones the lapse broke, and the only ones
         // with nothing to overwrite a draft with.
-        void queryClient.invalidateQueries({
+        invalidateAcrossQueryClients({
           predicate: (q) => q.state.status === 'error' && q.state.data === undefined,
         })
       })
@@ -2459,13 +2545,8 @@ export interface KiroBonusCreditGrantPayload {
 export interface KiroUsagePayload {
   available?: boolean
   /**
-   * Why usage is unavailable when `available` is false (e.g. `api_key_auth`,
-   * `scrape_disabled`, `signin_required`).
-   *
-   * `signin_required` and `scrape_disabled` are deliberately distinct: the first
-   * is fixed by signing in again and costs nothing, the second by opting into a
-   * billed scrape. Reporting the second for the first told users to spend credits
-   * on a fetch that cannot authenticate.
+   * Why usage is unavailable when `available` is false (`api_key_auth` or
+   * `signin_required`); absent when the gateway simply holds no reading.
    */
   reason?: string
   credits_used?: number
@@ -2482,6 +2563,13 @@ export interface KiroUsagePayload {
   email?: string
   account_type?: string
   start_url?: string
+}
+
+/** `POST /api/sessions/usage/refresh` — the GET envelope plus the declined-scrape marker. */
+export interface KiroUsageRefreshResponse {
+  usage?: KiroUsagePayload
+  skipped?: 'scrape_parked'
+  retry_after?: number
 }
 
 export interface KiroBonusCreditGrant {
@@ -3681,10 +3769,28 @@ export const api = {
     history: { t: number; mb: number }[]
   }>,
   sessionsUsage: () => fetch('/api/sessions/usage').then(j) as Promise<{ usage?: KiroUsagePayload }>,
+  /**
+   * Refresh the credit reading now (the account modal's Refresh button). Same
+   * `{usage}` envelope as `sessionsUsage`, so `parseKiroUsagePayload` reads
+   * both. `skipped: 'scrape_parked'` (with `retry_after` seconds) means the
+   * free API returned no plan and the gateway has parked the `/usage` scrape
+   * after repeated failures, so no new reading was fetched: `usage` is a
+   * same-identity prior reading dimmed `stale`, or an unavailable marker. The
+   * one refusal is 409 `refresh_in_flight` while a refresh is already running.
+   */
+  sessionsUsageRefresh: () => post('/api/sessions/usage/refresh').then(j) as Promise<KiroUsageRefreshResponse>,
   providerUsage: () => fetch('/api/usage').then(j),
   mcpProbeCache: () => fetch('/api/mcp/probe').then(j),
   // Agents
   agentsInstalled: () => fetch('/api/agents/installed').then(j),
+  // The Agent templates tab: roster with editability + references, create, delete.
+  // Editing goes through `agentPatch` (description, prompt, tools, allowedTools,
+  // model, skills); the server refuses the definition keys on a read-only spec
+  // (409 template_read_only) and a delete on a referenced one (409
+  // template_referenced, body.references lists what).
+  agentTemplates: () => fetch('/api/agents/templates').then(j),
+  agentTemplateCreate: (body: { name: string; description?: string; from?: string }) => post('/api/agents/templates', body).then(j),
+  agentTemplateDelete: (name: string) => fetch('/api/agents/detail/' + encodeURIComponent(name), { method: 'DELETE' }).then(j),
   agentDetail: (name: string) => fetch('/api/agents/detail/' + encodeURIComponent(name)).then(j),
   agentPatch: (name: string, body: object) => fetch('/api/agents/detail/' + encodeURIComponent(name), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(j),
   agentFork: (name: string, crew: string) => fetch('/api/agents/detail/' + encodeURIComponent(name) + '/fork', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ crew }) }).then(j),
@@ -3755,6 +3861,30 @@ export const api = {
     fetch(
       '/api/members/' + encodeURIComponent(slug) + '/panel?member=' + encodeURIComponent(member),
     ).then(j) as Promise<{ panel: CrewPanelMeta | null; html: string | null }>,
+  // The crewmate's self-maintained briefing markdown. Read-only from the UI
+  // (no editor: the file is agent-written and edited where the crewmate keeps
+  // it). `member` is the exact crew name (slugs are lossy).
+  memberBriefing: (slug: string, member: string) =>
+    fetch(
+      '/api/members/' + encodeURIComponent(slug) + '/briefing?member=' + encodeURIComponent(member),
+    ).then(j) as Promise<{
+      slug: string
+      member: string
+      /** Whether the platform can read the file safely (false on Windows). */
+      supported: boolean
+      /** Markdown content, or empty string when the crewmate has not written notes yet. */
+      text: string
+      /** Last-modified timestamp, or null when no notes file exists yet. */
+      updated_ts: number | null
+      /** The text above was redacted on the way out (a secret-like string or an
+       *  exfiltration URL replaced by its placeholder); the panel says so above
+       *  the notes. */
+      redacted: boolean
+      /** The file ran past the briefing cap, so the text above ends in the
+       *  truncation marker instead of the tail; the panel says so above the
+       *  notes. */
+      truncated: boolean
+    }>,
   updateKirocrewAgent: (name: string, body: object) =>
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
@@ -4093,7 +4223,12 @@ export const api = {
 
   // Auto-skill pending queue + lifecycle pin
   skillsPending: () => fetch('/api/skills/-/pending').then(j),
+  /** Detail payload carries `script_validation` (`SkillScriptValidation`) so the
+   *  review card can warn BEFORE the click that Approve cannot succeed as-is. */
   skillPendingDetail: (slug: string) => fetch('/api/skills/-/pending/' + encodeURIComponent(slug)).then(j),
+  /** Throws ApiError on refusal: 404 `pending_skill_not_found`, 409
+   *  `live_skill_exists`, 422 `script_validation_failed` (body carries a
+   *  `report` of `{file: [findings]}`), 409 `pending_approval_refused`. */
   approvePendingSkill: (slug: string) => post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/approve', {}).then(j),
   dismissPendingSkill: (slug: string) => post('/api/skills/-/pending/' + encodeURIComponent(slug) + '/dismiss', {}).then(j),
   dismissAllPendingSkills: (slugs: string[]) => post('/api/skills/-/pending/-/dismiss-all', { slugs }).then(j),
@@ -4274,6 +4409,7 @@ export const api = {
     transcribe_region?: string
     transcribe_profile?: string
     language_code?: string
+    polish?: boolean
   }) => put('/api/config/stt', body).then(j),
   // Recogniser availability plus the model catalog and the progress of any
   // download in flight. Separate from `sttConfig` because it is POLLED while a
@@ -4292,6 +4428,18 @@ export const api = {
   // not pay for the graph allocation. Fire-and-forget at every call site: a
   // failure only costs the latency it was meant to hide.
   sttPrewarm: () => post('/api/stt/prewarm', {}).then(j),
+  // Hand a FINISHED transcript to a fast model for punctuation and spacing, and
+  // get back both strings. Off unless `stt.polish` is on, and refused with 403
+  // when it is off — the switch is the consent, so this is never called
+  // speculatively. Returns `changed: false` (with `text === original`) whenever
+  // the model declined or its reply failed the server's length guard, which the
+  // caller treats as "keep what you have" rather than as a failure.
+  sttPolish: (text: string) => post('/api/stt/polish', { text }).then(j) as Promise<{
+    ok: boolean
+    changed: boolean
+    text: string
+    original: string
+  }>,
   sttTranscribe: (blob: Blob, ext = 'webm') => {
     const fd = new FormData()
     fd.append('audio', blob, `recording.${ext}`)
@@ -4457,7 +4605,7 @@ export const api = {
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
   /** `config` carries the folder settings the create modal collects. Each is
    *  omitted when empty so the backend applies its own default. */
-  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[] }) =>
+  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; icon?: string; tags?: string[]; steering_dirs?: string[] }) =>
     post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
   updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
   /** Set several folders' `order` in ONE atomic request. The sidebar drag
@@ -4571,8 +4719,11 @@ export const api = {
   // Sessions (history)
   // `excludeOpen` drops sessions already open as a tab — for the sidebar's
   // Older-sessions pane, which is the complement of the tab list above it.
-  // Off by default: every other caller wants the full inventory.
-  sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '')).then(j),
+  // `userOnly` drops machine namespaces (`subagent_`, `wf_`, …), whose transcripts
+  // have no title and so render their own storage key as one. NOT `taskrunner_`: that
+  // namespace also holds real conversations, so the server keeps it listed.
+  // Both off by default: every other caller wants the full inventory.
+  sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false, userOnly = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '') + (userOnly ? '&user_only=1' : '')).then(j),
   sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   // Federated session search across the local gateway + every CONNECTED remote
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).
@@ -4801,15 +4952,18 @@ export const api = {
     if (q) p.set('q', q)
     return fetch(`/api/path-complete?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string; outside?: boolean }>
   },
-  /** Upload files via browser File API (cross-platform) */
-  uploadFiles: async (files: File[]) => {
+  /** Upload files via browser File API (cross-platform).
+   *  `signal` lets the composer abort an upload still in flight: the
+   *  request dies client-side and the server unlinks its partials through
+   *  the disconnect path the upload handler already has. */
+  uploadFiles: async (files: File[], signal?: AbortSignal) => {
     // Downscale oversized images client-side so they fit the model's image
     // limits before they ever reach the server (see resizeImage.ts).
     const prepared = await Promise.all(files.map(f => resizeImageForModel(f)))
     const resized = prepared.map(p => p.info).filter((i): i is ResizeInfo => i !== null)
     const fd = new FormData()
     prepared.forEach(p => fd.append('file', p.file))
-    const res = await fetch('/api/upload/file', { method: 'POST', body: fd })
+    const res = await fetch('/api/upload/file', { method: 'POST', body: fd, ...(signal ? { signal } : {}) })
     checkSessionExpired(res)
     let body: { paths?: unknown; error?: string }
     try { body = await res.json() } catch { body = {} }
@@ -4892,6 +5046,8 @@ export const api = {
     import_onboarded?: boolean
     /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
     privacy_acked?: boolean
+    /** Set once the first-run Meet CrewMates flow was finished or dismissed. */
+    crewmates_onboarded?: boolean
   }) =>
     put('/api/config/theme', body).then(j),
   // Voice
@@ -5298,12 +5454,19 @@ export const api = {
   // read, so a view read before a revoke turns egress back on. Omitted, the route reads
   // the switch and the endpoint off the keystone under its own lock, and the write moves
   // only the scopes named. A body with neither the switch nor a scope is a 400.
-  saveDecisionsConsent: (enabled?: boolean, endpoint?: string, toolArgs?: boolean, compaction?: boolean) =>
+  saveDecisionsConsent: (
+    enabled?: boolean,
+    endpoint?: string,
+    toolArgs?: boolean,
+    compaction?: boolean,
+    memoryText?: boolean,
+  ) =>
     put('/api/decisions/consent', enabled === undefined
       ? {
         endpoint,
         ...(toolArgs === undefined ? {} : { tool_args: toolArgs }),
         ...(compaction === undefined ? {} : { compaction }),
+        ...(memoryText === undefined ? {} : { memory_text: memoryText }),
       }
       : enabled
         ? {
@@ -5311,8 +5474,28 @@ export const api = {
           endpoint,
           ...(toolArgs === undefined ? {} : { tool_args: toolArgs }),
           ...(compaction === undefined ? {} : { compaction }),
+          ...(memoryText === undefined ? {} : { memory_text: memoryText }),
         }
         : { enabled }).then(j) as Promise<DecisionsConsentData>,
+  // A SCOPE on its own, with `enabled` deliberately OMITTED and no endpoint echo.
+  // A per-point scope switch is not a review of an address, so it must not restate
+  // consent to one; the gateway preserves the recorded switch and endpoint for an
+  // absent `enabled`, and refuses the write outright (409, or 403 under a
+  // governance pin) unless consent is already in force for the address config
+  // names. So the omission can only ever move a scope under a consent that
+  // already stands.
+  saveDecisionsScope: (scope: string, value: boolean) =>
+    put('/api/decisions/consent', { [scope]: value }).then(j) as Promise<DecisionsConsentData>,
+  // The prior-conversation CEILING, on the keystone beside the switch it belongs to
+  // and NOT through the config route. What it bounds is how much of the conversation
+  // leaves the machine, so it is consent, and consent does not live in an
+  // agent-writable file: config.json carries what the seam ASKS for and this number
+  // is the ceiling that request is clamped to. `enabled` is omitted for the reason a
+  // scope omits it -- raising a ceiling is not a review of an address -- so the
+  // gateway preserves the recorded switch and endpoint and refuses the write unless
+  // consent already stands for the address config names.
+  saveDecisionsHistoryBudget: (chars: number) =>
+    put('/api/decisions/consent', { history_budget_chars: chars }).then(j) as Promise<DecisionsConsentData>,
   // One reader's verdict on one side of one decision, from the transcript's
   // decision strip. `verdict: null` takes an answer back, which is why the field
   // is nullable rather than absent — the server records the retraction.

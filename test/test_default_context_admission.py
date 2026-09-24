@@ -476,6 +476,79 @@ class TestBackgroundBudget:
         finally:
             store.close()
 
+    def test_startup_directive_tier_is_bound_by_lessons_startup_both_paths(self, rig, tmp_path):
+        # The four startup renderers pass ``directive_budget=caps.lessons_startup``
+        # and hand each store the model-safe ceiling as the outer bound the tier is
+        # taken smaller than (``hard_cap`` on the vector store, ``cap`` on the JSONL
+        # store -- same role, different name). This drives the FULL startup path
+        # through ``build_session_context`` -- not the stores directly -- so that
+        # reverting ``directive_budget`` at any renderer to ``caps.lessons`` reddens
+        # this test. With a rule set far larger than the startup allowance, the
+        # rendered ``[Learned corrections]`` block must be bound at
+        # ``caps.lessons_startup`` (~37,000): greater than the ordinary
+        # ``caps.lessons`` (~7,458, the pre-fix regression this PR undoes) and no
+        # larger than ``caps.lessons_startup`` plus header/footer framing (so not
+        # the ceiling). At the 200K window used here the ceiling is 100,000, well
+        # above 37,000, so only the startup allowance can bind.
+        builder, memory, _, lessons, _ = rig
+        caps = ctx._resolve_caps(200_000)
+        assert caps.lessons_startup > caps.lessons  # guards the fixture's premise
+        assert caps.protected_context > caps.lessons_startup  # ceiling not the binder
+        frame_slack = 2_000
+
+        def rule_block(text: str) -> int:
+            start = text.find("[Learned corrections")
+            end = text.find("[End of learned corrections]")
+            assert start >= 0 and end > start
+            return len(text[start:end])
+
+        # ~200 rules of ~825 chars ~ 165,000 chars of rules: far above 37,000 and
+        # far below the 100,000 ceiling, so only the startup allowance can bind.
+        def make_rows(prefix):
+            return [
+                {
+                    "ts": f"2026-03-{(i % 28) + 1:02d}T00:00:00+00:00",
+                    "rule": f"{prefix} rule {i:03d} keep this rule intact "
+                    + (f"word{i:03d} " * (825 // 8)),
+                    "category": "tool",
+                    "negative": None,
+                    "repo_scope": None,
+                }
+                for i in range(200)
+            ]
+
+        # ---- JSONL path: the rig's default LessonStore, no vector store ----
+        lessons.path.parent.mkdir(parents=True, exist_ok=True)
+        lessons.path.write_text(
+            "".join(json.dumps(r) + "\n" for r in make_rows("JSONL")), encoding="utf-8"
+        )
+        jtext = builder.build_session_context(
+            session_key="dashboard:synthetic", model_window=200_000
+        )
+        jlen = rule_block(jtext)
+        assert caps.lessons < jlen <= caps.lessons_startup + frame_slack
+
+        # ---- Vector path: attach a populated vector store, which wins over JSONL ----
+        vector = VectorMemoryStore(db_path=tmp_path / "startup-vec.db")
+        vector.init()
+        try:
+            for i, r in enumerate(make_rows("VECTOR")):
+                vector.set_semantic(
+                    f"lesson.{i:012x}",
+                    {"rule": r["rule"], "category": "tool", "negative": None},
+                    confidence=1.0,
+                    source="user_explicit",
+                )
+            vector.embed_fn = Mock(side_effect=AssertionError("background model call"))
+            memory.vector_store = vector
+            vtext = builder.build_session_context(
+                session_key="dashboard:synthetic", model_window=200_000
+            )
+        finally:
+            vector.close()
+        vlen = rule_block(vtext)
+        assert caps.lessons < vlen <= caps.lessons_startup + frame_slack
+
 
 class TestExactMetering:
     @pytest.mark.parametrize("lifecycle", ["fresh", "warm", "resume", "reinjection", "minimal"])

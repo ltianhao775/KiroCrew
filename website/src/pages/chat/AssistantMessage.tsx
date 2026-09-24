@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, memo, useRef, useId, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { Copy, Check, Volume2, Code, Eye, ClipboardList, CheckCircle, RefreshCw, ChevronLeft, ChevronRight, GitFork, Loader2, Link2, Compass, Clock, Pin, PinOff, MoreHorizontal, Share2, X } from 'lucide-react'
+import { Copy, Check, Volume2, Code, Eye, ClipboardList, CheckCircle, RefreshCw, ChevronLeft, ChevronRight, GitFork, Loader2, Link2, Compass, Clock, MessageSquare, Pin, PinOff, MoreHorizontal, Share2, X } from 'lucide-react'
 import { lazy, Suspense } from 'react'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../../components/ui/dropdown-menu'
 import { copyToClipboard } from '../../utils/clipboard'
@@ -15,7 +15,8 @@ import { applySearchHighlights, clearSearchHighlights } from '../../utils/domHig
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import FileChangeChips, { type FileChangeEntry } from '../../components/FileChangeChips'
 import DecisionStrip from './DecisionStrip'
-import { readDecisionRecords } from './decisionRecord'
+import { readDecisionRecords, readMemoryRecallInStrip } from './decisionRecord'
+import MemoryRecallStrip from './MemoryRecallStrip'
 import type { FileChipStyle } from './ChatSettings'
 import { loadChatConfig } from './ChatSettings'
 import { useSmoothStream } from '../../hooks/useSmoothStream'
@@ -97,7 +98,7 @@ const LazyShareMessageModal = lazy(() => import('./share/ShareMessageModal'))
     unavailable fork affordance that sits outside it. */
 const ACTIONS_REVEAL_CLS = `flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`
 
-const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, planTaskId, onApplyPlan, slotRunning, onSpeak, timestamp, timestampTitle, showFooter = true, revealActions = false, onRegenerate, variants, variantIdx, onSwitchVariant, isRegenerating, onFork, onPlanFromHere, forkIndex, forkMessageId, onLoadEarlier, loadingOlder, earlierRemaining, onQuote, onAsk, messageTs, slotKey, slotTitle, mode, fileChanges, onOpenDiff, fileChipStyle, artifactPaths, turnStats, decisionsStrip, linkPreviews, pinned, onTogglePin, suppressSteerAck, prevUserText, shareEnabled = false }: { content: string; isStreaming: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; planTaskId?: string; onApplyPlan?: (steps: PlanStepInput[]) => Promise<boolean>; slotRunning?: boolean; onSpeak?: (content: string) => void; timestamp?: string; timestampTitle?: string; showFooter?: boolean; revealActions?: boolean; onRegenerate?: () => void; variants?: { content: string; ts?: string }[]; variantIdx?: number; onSwitchVariant?: (index: number) => void; isRegenerating?: boolean; onFork?: (index: number, messageId?: string) => void | Promise<void>; onPlanFromHere?: (index: number, messageId?: string) => void | Promise<void>; forkIndex?: number; forkMessageId?: string; onLoadEarlier?: () => void; loadingOlder?: boolean; earlierRemaining?: number; onQuote?: (text: string, rect: DOMRect) => void; onAsk?: (text: string, rect: DOMRect) => void; messageTs?: string; slotKey?: string; slotTitle?: string; mode?: string; fileChanges?: FileChangeEntry[]; onOpenDiff?: (path: string, modified: string, original: string) => void; fileChipStyle?: FileChipStyle; artifactPaths?: Set<string>; turnStats?: TurnStats; /** Raw `decisions_strip` record off the message, validated here. Absent renders nothing. */ decisionsStrip?: unknown; linkPreviews?: boolean; pinned?: boolean; onTogglePin?: () => void; /** Drop the steer chip: this turn's steer was a system policy notice, not the user's. */ suppressSteerAck?: boolean; /** The user question this reply answered — enables the share card's Q&A pairing. */ prevUserText?: string; /** Governance answer from `/api/dashboard/config` (`social_share_enabled`). The host passes it explicitly; an absent prop hides Share, so a forgotten wire fails closed. */ shareEnabled?: boolean }) {
+const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, planTaskId, onApplyPlan, slotRunning, onSpeak, timestamp, timestampTitle, showFooter = true, revealActions = false, onRegenerate, variants, variantIdx, onSwitchVariant, isRegenerating, onFork, onPlanFromHere, forkIndex, forkMessageId, onLoadEarlier, loadingOlder, earlierRemaining, onQuote, onAsk, messageTs, slotKey, slotTitle, mode, fileChanges, onOpenDiff, fileChipStyle, artifactPaths, turnStats, decisionsStrip, linkPreviews, pinned, onTogglePin, suppressSteerAck, prevUserText, shareEnabled = false, bubbleClassName, onReplyInThread }: { content: string; isStreaming: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; planTaskId?: string; onApplyPlan?: (steps: PlanStepInput[]) => Promise<boolean>; slotRunning?: boolean; onSpeak?: (content: string) => void; timestamp?: string; timestampTitle?: string; showFooter?: boolean; revealActions?: boolean; onRegenerate?: () => void; variants?: { content: string; ts?: string }[]; variantIdx?: number; onSwitchVariant?: (index: number) => void; isRegenerating?: boolean; onFork?: (index: number, messageId?: string) => void | Promise<void>; onPlanFromHere?: (index: number, messageId?: string) => void | Promise<void>; forkIndex?: number; forkMessageId?: string; onLoadEarlier?: () => void; loadingOlder?: boolean; earlierRemaining?: number; onQuote?: (text: string, rect: DOMRect) => void; onAsk?: (text: string, rect: DOMRect) => void; messageTs?: string; slotKey?: string; slotTitle?: string; mode?: string; fileChanges?: FileChangeEntry[]; onOpenDiff?: (path: string, modified: string, original: string) => void; fileChipStyle?: FileChipStyle; artifactPaths?: Set<string>; turnStats?: TurnStats; /** Raw `decisions_strip` record off the message, validated here. Absent renders nothing. */ decisionsStrip?: unknown; linkPreviews?: boolean; pinned?: boolean; onTogglePin?: () => void; /** Drop the steer chip: this turn's steer was a system policy notice, not the user's. */ suppressSteerAck?: boolean; /** The user question this reply answered — enables the share card's Q&A pairing. */ prevUserText?: string; /** Governance answer from `/api/dashboard/config` (`social_share_enabled`). The host passes it explicitly; an absent prop hides Share, so a forgotten wire fails closed. */ shareEnabled?: boolean; /** Extra classes on the `.message-bubble` element — a host that draws the reply as a bordered bubble (a crewmate's chat) passes its surface and corners here; the stable theming hook itself is untouched. */ bubbleClassName?: string; /** Open (or start) the reply thread on this message. Only a crewmate's chat offers it. */ onReplyInThread?: () => void }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [applied, setApplied] = useState(false)
   // Successful Copy / Copy-link presses flash on the icon for 1.5s. Text-copy
@@ -323,6 +324,10 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   // Every decision this reply carries, not just the first: a turn can be decided
   // by more than one point, and each gets its own row.
   const decisionRecords = useMemo(() => readDecisionRecords(decisionsStrip), [decisionsStrip])
+  // The memory record rides the same field and is found in it rather than read
+  // from it: it is drawn by its own component, so the strip reader above declines
+  // it and at most one of the two claims any given record.
+  const memoryRecord = useMemo(() => readMemoryRecallInStrip(decisionsStrip), [decisionsStrip])
   const turnStatsTitle = (() => {
     if (!turnStats) return undefined
     const elapsed = fmtTurnElapsed(turnStats.elapsed_ms)
@@ -363,14 +368,20 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   const forkItemsInMenu = forkIndex === undefined || !!forkMessageId
   const oldMenuContext = !!(onFork || onPlanFromHere) && (shareEnabled || forkItemsInMenu)
   const hasSpeak = !!onSpeak && text.trim().length > 0
-  const menuAvailable = oldMenuContext || hasSpeak
+  // A crewmate's chat offers "Reply in thread" as a ROW button -- the one action
+  // a thread starts from, so it stays visible. The row's cap is two peer
+  // controls (the max-two-buttons rule): Reply takes one seat and More the
+  // other, so on that surface Copy and the raw-view toggle move into More.
+  const threadRow = !!onReplyInThread
+  const menuAvailable = oldMenuContext || hasSpeak || threadRow
   useEffect(() => {
     if (!menuAvailable || isStreaming || !showFooter) setOverflowOpen(false)
   }, [isStreaming, menuAvailable, showFooter])
   // A reply that previously had no overflow swaps Copy for More. That keeps the
   // footer's peer-control count unchanged while making Speak available for short
   // replies too. Existing overflow footers retain their familiar inline Copy.
-  const copyInMenu = hasSpeak && !oldMenuContext
+  const copyInMenu = (hasSpeak || threadRow) && !oldMenuContext
+  const rawInMenu = threadRow
   const copyMessage = () => {
     const stripped = stripKeepVisibleMarker(steerCleaned)
     copyToClipboard(stripped === steerCleaned ? stripped : stripped.trimEnd()).then((ok) => {
@@ -414,6 +425,14 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
               <span className="flex items-center gap-2">
                 {copyOutcomeIcon(copied, <Copy className="lucide-inline shrink-0" />)}
                 <span>{copyOutcomeLabel(copied, i18nT('pages.chat.assistantMessage.copy_text'))}</span>
+              </span>
+            </DropdownMenuItem>
+          )}
+          {rawInMenu && text.length > 20 && (
+            <DropdownMenuItem className="[@media(hover:none)]:min-h-10" data-testid="toggle-raw-view" aria-pressed={rawMode} onSelect={toggleRaw}>
+              <span className="flex items-center gap-2">
+                {rawMode ? <Eye className="lucide-inline shrink-0" /> : <Code className="lucide-inline shrink-0" />}
+                <span>{rawMode ? i18nT('pages.chat.assistantMessage.rendered_view') : i18nT('pages.chat.assistantMessage.raw_markdown')}</span>
               </span>
             </DropdownMenuItem>
           )}
@@ -494,9 +513,9 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
 
   return <div data-role="assistant" className="group/msg">
     {/* 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md */}
-    <div ref={contentRef} className="message-bubble msg-content group/bubble relative text-sm leading-6 text-text overflow-hidden" data-testid="message-bubble" style={rawMode && rawBoxHeight !== null && !isStreaming
-      ? { overflowWrap: 'anywhere', wordBreak: 'break-word', height: rawBoxHeight, overflowY: 'auto' }
-      : { overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+    <div ref={contentRef} className={`message-bubble mc-message-font-scope msg-content group/bubble relative leading-relaxed text-text overflow-hidden${bubbleClassName ? ` ${bubbleClassName}` : ''}`} data-testid="message-bubble" style={rawMode && rawBoxHeight !== null && !isStreaming
+      ? { overflowWrap: 'anywhere', wordBreak: 'break-word', height: rawBoxHeight, overflowY: 'auto', fontSize: 'var(--mc-message-font-size, 14px)' }
+      : { overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       <MessageErrorBoundary rawContent={smoothedText}>
         <MarkdownRenderer content={smoothedText} streaming={isStreaming} onFileOpen={onFileOpen} onFolderOpen={onFolderOpen} onArtifactOpen={onArtifactOpen} onSessionOpen={onSessionOpen} sessions={sessions} activeSession={activeSession} rawMode={rawMode} messageTs={messageTs} slotKey={slotKey} glow={isStreaming} smooth={smooth} linkPreviews={linkPreviews && !draining} collapseDiffs mdCardToggle />
       </MessageErrorBoundary>
@@ -553,6 +572,9 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
         disclosureKey={messageTs ? `dstrip-${record.point}-${messageTs}` : undefined}
       />
     ))}
+    {memoryRecord && (
+      <MemoryRecallStrip record={memoryRecord} disclosureKey={messageTs ? `mstrip-${messageTs}` : undefined} />
+    )}
     {fileChanges && fileChanges.length > 0 && !isStreaming && (
       /* Pass `onFileOpen` by IDENTITY — a `(p) => onFileOpen(p)` wrapper here is
          a new function every render, which busts FileChangeChips' memo and
@@ -601,6 +623,7 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
             alignment the mono was actually there for — and it holds the action
             row below at the same x across messages. */}
         {timestamp && <span className="text-muted text-[12px] leading-5 tabular-nums mr-2" title={timestampTitle}>{timestamp}</span>}
+        {onReplyInThread && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" data-testid="reply-in-thread" title={i18nT('pages.chat.thread.reply_in_thread')} aria-label={i18nT('pages.chat.thread.reply_in_thread')} onClick={onReplyInThread}><MessageSquare size={14} /></button>}
         {!copyInMenu && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.copy')} aria-label={copyOutcomeLabel(copied, i18nT('pages.chat.assistantMessage.copy'))} onClick={copyMessage}>{copyOutcomeIcon(copied, <Copy size={14} />)}</button>}
         {messageTs && slotKey && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.copy_link_to_message')} aria-label={copyOutcomeLabel(linkCopied, i18nT('pages.chat.assistantMessage.copy_link_to_message'))} onClick={() => { copySessionLink(slotKey, slotTitle, messageTs, mode).then(flashCopy(setLinkCopied), () => flashCopy(setLinkCopied)(false)) }}>{copyOutcomeIcon(linkCopied, <Link2 size={14} />)}</button>}
         {messageTs && onTogglePin && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={pinned ? i18nT('pages.chat.assistantMessage.unpin_message') : i18nT('pages.chat.assistantMessage.pin_message')} aria-label={pinned ? i18nT('pages.chat.assistantMessage.unpin_message') : i18nT('pages.chat.assistantMessage.pin_message')} aria-pressed={!!pinned} onClick={onTogglePin}>{pinned ? <PinOff size={14} /> : <Pin size={14} />}</button>}
@@ -613,7 +636,7 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
             pin button carries it: the glyph names the view a click will GET
             (code brackets while rendered, an eye for "preview" while raw) and
             aria-pressed says which one is showing. Speak lives in More. */}
-        {text.length > 20 && <button className={`p-0.5 rounded transition-colors ${rawMode ? 'text-text' : 'text-muted hover:text-text'}`} aria-pressed={rawMode} data-testid="toggle-raw-view" title={rawMode ? i18nT('pages.chat.assistantMessage.rendered_view') : i18nT('pages.chat.assistantMessage.raw_markdown')} aria-label={rawMode ? i18nT('pages.chat.assistantMessage.switch_to_rendered_view') : i18nT('pages.chat.assistantMessage.switch_to_raw_markdown_view')} onClick={toggleRaw}>{rawMode ? <Eye size={14} /> : <Code size={14} />}</button>}
+        {text.length > 20 && !rawInMenu && <button className={`p-0.5 rounded transition-colors ${rawMode ? 'text-text' : 'text-muted hover:text-text'}`} aria-pressed={rawMode} data-testid="toggle-raw-view" title={rawMode ? i18nT('pages.chat.assistantMessage.rendered_view') : i18nT('pages.chat.assistantMessage.raw_markdown')} aria-label={rawMode ? i18nT('pages.chat.assistantMessage.switch_to_rendered_view') : i18nT('pages.chat.assistantMessage.switch_to_raw_markdown_view')} onClick={toggleRaw}>{rawMode ? <Eye size={14} /> : <Code size={14} />}</button>}
         {onRegenerate && !slotRunning && <button className="text-muted hover:text-text p-0.5 rounded transition-colors" title={i18nT('pages.chat.assistantMessage.regenerate')} aria-label={i18nT('pages.chat.assistantMessage.regenerate_response')} onClick={onRegenerate}><RefreshCw size={14} /></button>}
         {hasVariants && (() => {
           const curIdx = activeIdx

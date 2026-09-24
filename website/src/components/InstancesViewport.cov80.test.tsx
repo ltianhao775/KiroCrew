@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, waitFor } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from '../test/helpers'
 import InstancesViewport from './InstancesViewport'
@@ -94,6 +94,93 @@ describe('InstancesViewport relay listener', () => {
     post('zzq-string')
     post(null)
     expect(store.getState().instances.unread['cd-1']).toBeUndefined()
+  })
+
+  describe('mc-native-notify relay (a pane cannot post an OS banner itself)', () => {
+    const CONSTRUCTED: Array<{ title: string; options: NotificationOptions | undefined }> = []
+    const INSTANCES: Array<{ onclick: (() => void) | null }> = []
+    const ENVELOPE = { type: 'mc-native-notify', v: 1, title: 'Approval required', body: 'Bash', tag: 'kirocrew-approval', silent: true }
+
+    function stubNotification(permission: 'granted' | 'default') {
+      class FakeNotification {
+        static permission = permission
+        static requestPermission = vi.fn()
+        onclick: (() => void) | null = null
+        constructor(title: string, options?: NotificationOptions) {
+          CONSTRUCTED.push({ title, options })
+          INSTANCES.push(this)
+        }
+      }
+      vi.stubGlobal('Notification', FakeNotification)
+      return FakeNotification
+    }
+
+    beforeEach(() => { CONSTRUCTED.length = 0; INSTANCES.length = 0 })
+    afterEach(() => { vi.unstubAllGlobals() })
+
+    it('posts the banner for a warm-tunnel origin, title prefixed with the instance name, tag namespaced per id', async () => {
+      stubNotification('granted')
+      const store = warmStore()
+      renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+      await waitFor(() => expect(api.listInstances).toHaveBeenCalled())
+
+      post(ENVELOPE)
+      await waitFor(() => expect(CONSTRUCTED).toHaveLength(1))
+      expect(CONSTRUCTED[0]).toEqual({
+        title: 'Zzq One: Approval required',
+        options: { body: 'Bash', tag: 'cd-1:kirocrew-approval', silent: true },
+      })
+    })
+
+    it('clicking the relayed banner brings that instance\'s tab forward', async () => {
+      stubNotification('granted')
+      const store = warmStore(null)
+      renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+      expect(store.getState().instances.activeId).toBeNull()
+
+      post(ENVELOPE)
+      await waitFor(() => expect(INSTANCES).toHaveLength(1))
+      act(() => { INSTANCES[0].onclick?.() })
+      expect(store.getState().instances.activeId).toBe('cd-1')
+    })
+
+    it('ignores the envelope from an unowned loopback port and from a foreign origin', async () => {
+      stubNotification('granted')
+      const store = warmStore()
+      renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+
+      post(ENVELOPE, 'http://127.0.0.1:9999')
+      post(ENVELOPE, 'https://evil.example')
+      post(ENVELOPE, 'https://127.0.0.1:7778')
+      expect(CONSTRUCTED).toHaveLength(0)
+    })
+
+    it('ignores a malformed envelope from a trusted origin', async () => {
+      stubNotification('granted')
+      const store = warmStore()
+      renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+
+      post({ ...ENVELOPE, title: 42 })
+      post({ ...ENVELOPE, v: 2 })
+      post({ ...ENVELOPE, silent: 'no' })
+      post({ type: 'mc-native-notify', v: 1 })
+      expect(CONSTRUCTED).toHaveLength(0)
+    })
+
+    it('posts nothing and never prompts when this frame lacks the grant', async () => {
+      const N = stubNotification('default')
+      const store = warmStore()
+      renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(document.querySelector('iframe')).not.toBeNull())
+
+      post(ENVELOPE)
+      expect(CONSTRUCTED).toHaveLength(0)
+      expect(N.requestPermission).not.toHaveBeenCalled()
+    })
   })
 
   it('re-mints the token when the pane reports an expired session', async () => {

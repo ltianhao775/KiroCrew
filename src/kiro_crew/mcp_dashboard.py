@@ -102,9 +102,12 @@ from kiro_crew.validation import (
     CHAT_TAG_LIST_SCHEMA,
     CHAT_TAG_UPDATE_SCHEMA,
     MCP_DASHBOARD_SCHEMAS,
+    SESSION_ADOPT_SCHEMA,
     SESSION_CLOSE_SCHEMA,
     SESSION_CREATE_SCHEMA,
+    SESSION_FORK_SCHEMA,
     SESSION_READ_MESSAGE_SCHEMA,
+    SESSION_RELEASE_SCHEMA,
     SESSION_SEND_SCHEMA,
     SESSION_STOP_SCHEMA,
     validate_tool_args,
@@ -123,9 +126,12 @@ SERVER_VERSION = "1.0.0"
 #: be gated for identity but reachable from a channel agent.
 SESSION_CONTROL_TOOLS: tuple[str, ...] = (
     "session_create",
+    "session_fork",
     "session_stop",
     "session_close",
     "session_send",
+    "session_adopt",
+    "session_release",
     "session_read_message",
 )
 
@@ -174,7 +180,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "folder never moves anything — file sessions into it with "
                 "chat_folder_move_session. An app agent may create at the top level "
                 "or inside a folder it created itself, and the new folder belongs to "
-                "it; creating inside one of the person's folders is refused."
+                "it; creating inside one of the person's folders is refused. A crew "
+                "member follows the same rule: it owns the folders it creates and "
+                "may nest only under its own."
             ),
             "inputSchema": {
                 "type": "object",
@@ -212,7 +220,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "the anchor. An app agent may move only a folder it created itself, "
                 "and only to the top level or under another of its own; positioning "
                 "is refused outright when it would renumber siblings the app does "
-                "not own."
+                "not own. A crew member is bound by the same own-folders-only rule."
             ),
             "inputSchema": {
                 "type": "object",
@@ -250,7 +258,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "folder id or human path — the folder must already exist "
                 "(chat_folder_create makes one). Metadata only: the session keeps its "
                 "transcript, model, and any running turn. ARCHIVED (history) sessions "
-                "cannot be moved — revive one into the sidebar first, then call this."
+                "cannot be moved — revive one into the sidebar first, then call this. "
+                "An app agent may file only its own sessions; a crew member may file "
+                "only a session it owns or created."
             ),
             "inputSchema": {
                 "type": "object",
@@ -318,7 +328,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "``status`` marks it a status tag (one a Trello-style column can "
                 "filter on). Create only — rename, recolor or reflag with chat_tag_update; "
                 "this server can never delete a tag, so nothing here can lose a label "
-                "the person put on a session."
+                "the person put on a session. An app agent and a crew member cannot "
+                "write the shared vocabulary at all (a coined tag has no owner in the "
+                "person's list); they read it with chat_tag_list and assign existing "
+                "tags with chat_tag_assign."
             ),
             "inputSchema": {
                 "type": "object",
@@ -346,7 +359,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "and columns filtering on it keep filtering on it — a rename changes "
                 "the label people see, nothing else. This server can create and "
                 "update tags but never delete one, so nothing here can lose a label "
-                "the person put on a session."
+                "the person put on a session. An app agent and a crew member cannot "
+                "write the shared vocabulary; they assign existing tags with "
+                "chat_tag_assign instead."
             ),
             "inputSchema": {
                 "type": "object",
@@ -377,7 +392,8 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "with the current list instead of overwriting their click; re-read and "
                 "retry. Metadata only: the transcript, model and any running turn are "
                 "untouched. ARCHIVED (history) sessions cannot be tagged — revive one "
-                "into the sidebar first."
+                "into the sidebar first. An app agent may tag only its own sessions; "
+                "a crew member may tag only a session it owns or created."
             ),
             "inputSchema": {
                 "type": "object",
@@ -409,7 +425,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "close it — so use it to stand up a workstream alongside this one (watch a "
                 "build, grind a long refactor) rather than to hide work. It starts empty: "
                 "the person is the one who types the first message into it. Returns its "
-                "key; pass that as `target` to the other session tools."
+                "key; pass that as `target` to the other session tools. To open a session "
+                "that already CARRIES a transcript (splitting your own investigation into "
+                "several sessions), use session_fork instead."
             ),
             "inputSchema": {
                 "type": "object",
@@ -440,6 +458,67 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "creation — a folder id or a '/'-separated human path. Missing "
                             "path segments are created (mkdir -p), like chat_folder_create's "
                             "`parent`. Omit to leave the session at the top level."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "session_fork",
+            "description": (
+                "Open a NEW chat session that CARRIES the transcript of an existing one — "
+                "the same thing as the dashboard's Fork button. The child holds a copy of "
+                "the source's messages up to and including the fork point (the whole "
+                "transcript by default), so it starts with the context already built "
+                "instead of empty; use it to split a long investigation into several "
+                "sessions that each know what was found so far. By default the source is "
+                "YOUR OWN session. The child inherits the source's agent, model, memory "
+                "store and mode, project and folder exactly as a human fork does — there "
+                "is deliberately no agent, model or mode override here (a fork must stay "
+                "inside the memory boundary its transcript came from); to open a session "
+                "bound to a different agent use session_create. It starts IDLE: the copied "
+                "messages are history, and no turn runs until you session_send into it or "
+                "the person types. It appears in the user's sidebar like any other session, "
+                "for them to read, take over and close. Returns its key; pass that as "
+                "`target` to the other session tools."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "The session to copy from: a session key from list_sessions, a "
+                            "slot key, or its exact unique title. Omit to fork YOUR OWN "
+                            "session. Forking another session requires the same "
+                            "authorization as reading it with session_read_message."
+                        ),
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "Short name for the new session, shown in the sidebar. Omit to "
+                            "keep the fork's own `Fork of <source title>`."
+                        ),
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": (
+                            "Sidebar folder to file the new session into — a folder id or a "
+                            "'/'-separated human path, created if missing (mkdir -p), the same "
+                            "as session_create's `folder`. Omit to leave it in the source's "
+                            "folder."
+                        ),
+                    },
+                    "at_message_index": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Fork point: the position of the LAST message to carry, counting "
+                            "the source's user and assistant messages from 0 (system and "
+                            "tool rows are not counted). Messages after it are left behind. "
+                            "Omit to carry the whole transcript."
                         ),
                     },
                 },
@@ -540,6 +619,58 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["target", "message"],
+            },
+        },
+        {
+            "name": "session_adopt",
+            "description": (
+                "Take another session UNDER yours, so the sidebar shows it nested "
+                "beneath this one and you are recorded as the session that holds "
+                "it. Use it when you are taking over work someone else started: "
+                "adopt each session you are now running, and the sessions THEY "
+                "opened come with them, because the tree hangs on the session and "
+                "not on a path. A session that already has a parent can be "
+                "adopted — that is the takeover — and the parent it had is kept in "
+                "the record. Refused if the target is already above you in the "
+                "tree, which would make a loop. Nothing about the target's work "
+                "changes: it keeps its own conversation, its turns and its tools. "
+                "session_release undoes it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
+            "name": "session_release",
+            "description": (
+                "Let a session out from under its parent, so it stands on its own "
+                "in the sidebar again. The counterpart of session_adopt, and the "
+                "only way to undo one. You may release a session you hold, and you "
+                "may release YOURSELF from whoever holds you — so a session whose "
+                "conductor has stopped running is not stuck under it. Refused for a "
+                "session that has no parent, and for one that hangs under somebody "
+                "else. Sessions the released one holds stay with it: it keeps its "
+                "own subtree and only its own edge upward goes."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Session key from list_sessions, or its exact title. Your "
+                            "own key releases you from your parent."
+                        ),
+                    },
+                },
+                "required": ["target"],
             },
         },
         {
@@ -1414,6 +1545,67 @@ def _refuse_tree_shaping_if_unverifiable(verb: str) -> tuple[str, str, str | Non
     return caller_key, scope, None
 
 
+def _resolve_folder_for_new_session(folder_ref: str, verb: str) -> tuple[str, str, str, str | None]:
+    """``(folder_id, folder_label, made_note, error)`` for filing a NEW session.
+
+    Shared by ``session_create`` and ``session_fork``, which file a child the same
+    way: the reference is resolved with ``chat_folder_create``'s `parent`
+    semantics -- missing path segments are CREATED -- and creating folders is
+    tree shaping, so the same gate applies rather than a second authorization
+    path: a caller that could not reshape the tree by creating a folder must not
+    reach the same write by naming the path here. The gate's verified key is what
+    the segment creation writes under, per its own contract.
+
+    An empty reference resolves to ``("", "", "", None)``: nothing to file.
+    ``made_note`` names any path segments the mkdir -p walk created, and it is
+    reported on BOTH outcomes -- those segments persist even when the create
+    itself is then refused, the same partial-report posture chat_folder_create
+    takes, since folder deletion is deliberately not a capability this server
+    has.
+    """
+    if not folder_ref:
+        return "", "", "", None
+    gate_key, _gate_app, gate = _refuse_tree_shaping_if_unverifiable(verb)
+    if gate:
+        return "", "", "", gate
+    # An app-scoped caller may create folders, but it can NEVER complete a
+    # session create or fork (the endpoints refuse `app_scoped_caller`), so
+    # resolving the folder for it would only leave created path segments behind
+    # for a call that cannot succeed. This is a side-effect guard, not a second
+    # authorization home: the endpoint's refusal stays authoritative for the
+    # create itself.
+    scope_rows, scope_err = _get_rows("/api/chat/slots")
+    if scope_err:
+        return "", "", "", redact(f"Error: {scope_err}")
+    if _caller_app_scope(gate_key, scope_rows):
+        return (
+            "",
+            "",
+            "",
+            (
+                "Error: an app-scoped session cannot create sessions, so there is "
+                "nothing to file — folder resolution is refused before it would "
+                "create path segments for a create that cannot succeed."
+            ),
+        )
+    chat_folders, folders_err = _get_rows("/api/chat/folders")
+    if folders_err:
+        return "", "", "", redact(f"Error: {folders_err}")
+    fld_id, created_segments, fld_err = _ensure_chat_folder_path(
+        folder_ref, chat_folders, session_key=gate_key
+    )
+    made_note = ""
+    if created_segments:
+        made_note = f" (created folder path: {'/'.join(created_segments)})"
+    if fld_err:
+        # Refuse the whole create: the caller asked for a session filed in this
+        # folder, and "created but unfiled" would silently honor half of that.
+        # No SESSION exists yet; path segments the mkdir -p walk already created
+        # DO persist and are reported in `made_note`.
+        return "", "", made_note, redact(f"Error: {fld_err}{made_note}")
+    return fld_id, _chat_folder_paths(chat_folders).get(fld_id, fld_id), made_note, None
+
+
 def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     """Dispatch one validated tool call."""
     caller_key = ""
@@ -1442,57 +1634,13 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     if name == "session_create":
         args = validate_tool_args(args, SESSION_CREATE_SCHEMA)
         payload: dict[str, Any] = {"title": args.get("title", ""), "agent": args.get("agent", "")}
-        folder_ref = str(args.get("folder") or "")
-        folder_label = ""
-        made_note = ""
-        if folder_ref:
-            # Filing at creation resolves the reference with
-            # ``chat_folder_create``'s `parent` semantics — missing path segments
-            # are CREATED — and creating folders is tree shaping, so the same
-            # gate applies rather than a second authorization path: a caller
-            # that could not reshape the tree by creating a folder must not
-            # reach the same write by naming the path here. The gate's
-            # verified key is what the segment creation writes under, per its
-            # own contract.
-            gate_key, _gate_app, gate = _refuse_tree_shaping_if_unverifiable(
-                "filing a new session at creation"
-            )
-            if gate:
-                return gate
-            # An app-scoped caller may create folders, but it can NEVER complete
-            # session_create (the endpoint refuses `app_scoped_caller`), so
-            # resolving the folder for it would only leave created path
-            # segments behind for a call that cannot succeed. This is a
-            # side-effect guard, not a second authorization home: the
-            # endpoint's refusal stays authoritative for the create itself.
-            scope_rows, scope_err = _get_rows("/api/chat/slots")
-            if scope_err:
-                return redact(f"Error: {scope_err}")
-            if _caller_app_scope(gate_key, scope_rows):
-                return (
-                    "Error: an app-scoped session cannot create sessions, so there is "
-                    "nothing to file — folder resolution is refused before it would "
-                    "create path segments for a create that cannot succeed."
-                )
-            chat_folders, folders_err = _get_rows("/api/chat/folders")
-            if folders_err:
-                return redact(f"Error: {folders_err}")
-            fld_id, created_segments, fld_err = _ensure_chat_folder_path(
-                folder_ref, chat_folders, session_key=gate_key
-            )
-            if created_segments:
-                made_note = f" (created folder path: {'/'.join(created_segments)})"
-            if fld_err:
-                # Refuse the whole create: the caller asked for a session filed
-                # in this folder, and "created but unfiled" would silently honor
-                # half of that. No SESSION exists yet; path segments the mkdir -p
-                # walk already created DO persist and are reported in
-                # `made_note` — the same partial-report posture
-                # chat_folder_create takes, since folder deletion is
-                # deliberately not a capability this server has.
-                return redact(f"Error: {fld_err}{made_note}")
+        fld_id, folder_label, made_note, fld_err = _resolve_folder_for_new_session(
+            str(args.get("folder") or ""), "filing a new session at creation"
+        )
+        if fld_err:
+            return fld_err
+        if fld_id:
             payload["folder_id"] = fld_id
-            folder_label = _chat_folder_paths(chat_folders).get(fld_id, fld_id)
         resp = _post(
             "/api/session-control/create",
             payload,
@@ -1505,6 +1653,33 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}.{made_note} "
             "It is empty and waiting in the user's sidebar; watch it with "
             "session_read_message."
+        )
+
+    if name == "session_fork":
+        args = validate_tool_args(args, SESSION_FORK_SCHEMA)
+        payload = {"source": args.get("source", ""), "title": args.get("title", "")}
+        if args.get("at_message_index") is not None:
+            payload["at_message_index"] = args["at_message_index"]
+        fld_id, folder_label, made_note, fld_err = _resolve_folder_for_new_session(
+            str(args.get("folder") or ""), "filing a forked session at creation"
+        )
+        if fld_err:
+            return fld_err
+        if fld_id:
+            payload["folder_id"] = fld_id
+        resp = _post(
+            "/api/session-control/fork",
+            payload,
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return redact(f"Error: could not fork the session: {resp['error']}{made_note}")
+        filed = f" filed in `{folder_label}`" if folder_label else ""
+        return redact(
+            f"\U0001f500 Forked `{resp.get('source')}` into `{resp.get('target')}` "
+            f"({resp.get('title')}) carrying {resp.get('messages')} message(s){filed}."
+            f"{made_note} It is idle and waiting in the user's sidebar; seed it with "
+            "session_send and watch it with session_read_message."
         )
 
     if name == "session_stop":
@@ -1578,6 +1753,43 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         return (
             f"\U0001f4e8 Queued for `{target}` — it is mid-turn, so your message runs "
             f"when the current turn ends.{queued_note} Poll with session_read_message."
+        )
+
+    if name == "session_adopt":
+        args = validate_tool_args(args, SESSION_ADOPT_SCHEMA)
+        resp = _post(
+            "/api/session-control/adopt",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not adopt that session: {resp['error']}"
+        target = resp.get("target", args["target"])
+        previous = resp.get("previous_parent") or ""
+        took_over = (
+            f" It was under `{previous}` before, and that is recorded."
+            if previous
+            else " It was a root before."
+        )
+        return (
+            f"\U0001f91d Adopted `{target}` — the sidebar now nests it under this "
+            f"session, along with anything it opened.{took_over}"
+        )
+
+    if name == "session_release":
+        args = validate_tool_args(args, SESSION_RELEASE_SCHEMA)
+        resp = _post(
+            "/api/session-control/release",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not release that session: {resp['error']}"
+        target = resp.get("target", args["target"])
+        previous = resp.get("previous_parent") or ""
+        return (
+            f"\U0001f513 Released `{target}` from `{previous}` — it stands on its own "
+            "in the sidebar again, keeping whatever it opened under itself."
         )
 
     if name == "session_read_message":

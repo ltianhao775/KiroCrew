@@ -57,6 +57,8 @@ __all__ = [
     "provider_error_client",
     "resolve_pin_spelling",
     "run_kiro_native_commands",
+    "skill_view_alias_census",
+    "skill_view_sidecar_dirs",
 ]
 
 
@@ -564,3 +566,30 @@ def projected_session_mcp_servers(
     from kiro_crew.acp.session_mcp import session_mcp_servers
 
     return session_mcp_servers(agent, work_dir=work_dir)
+
+
+def skill_view_alias_census(agents_dir: "Path") -> dict[str, int]:
+    """Count projected skill-view aliases as plain integers; reads, never writes.
+
+    The keys are ``total``, ``leased``, ``foreign_home``, ``foreign_leased``,
+    ``unreadable_leases`` and ``truncated``; their meaning is the projection
+    module's, and so is the data-home identity the foreign split is judged
+    against.
+    """
+    from kiro_crew.acp.skill_projection import census_projected_aliases
+
+    return census_projected_aliases(agents_dir)
+
+
+def skill_view_sidecar_dirs() -> tuple[str, str]:
+    """``(metadata, leases)``: the two non-spec directory names beside the aliases.
+
+    For messages that point an operator at them; their contents stay the
+    projection module's business.
+    """
+    from kiro_crew.acp.skill_projection import (
+        _PROJECTION_LEASE_DIR_NAME,
+        _PROJECTION_METADATA_DIR_NAME,
+    )
+
+    return (_PROJECTION_METADATA_DIR_NAME, _PROJECTION_LEASE_DIR_NAME)

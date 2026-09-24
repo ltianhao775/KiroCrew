@@ -61,6 +61,11 @@ CANONICAL: dict[str, dict] = {
     },
     "session/class": {"memory": "persistent", "app": "secretary", "channel": True},
     "session/closed": {"reason": "reset"},
+    "session/adopted": {
+        "parent": {"slot": "chat-9", "sid": "acp-sess-adopter"},
+        "previous_parent": {"slot": "chat-3", "sid": "acp-sess-former"},
+    },
+    "session/released": {"previous_parent": {"slot": "chat-9", "sid": "acp-sess-adopter"}},
     "turn/started": {"turn": 3, "actor": "user", "depth": 0, "message_seq": 11, "attempt": 2},
     "turn/refused": {"turn": 4, "actor": "cron", "reason": "gateway_closing", "depth": 1},
     "turn/completed": {
@@ -202,6 +207,33 @@ CANONICAL: dict[str, dict] = {
         "facts_omitted": [],
         "observed_at": 1789000002.5,
     },
+    "radar/recorded": {
+        "crew_id": "c_0a1b2c3d",
+        "owner": "kirodotdev",
+        "repo": "KiroCrew",  # brand-ok: the repository name
+        "number": 2251,
+        "phase": "implementing",
+        "next": "add the Windows branch to _safe_chmod",
+        "tried": {"approach": "hasattr guard", "rejected_because": "loses the ACL"},
+        "branch": "fix/safe-chmod-2251",
+        "pr_number": 2271,
+        "ci_state": {"state": "running", "round": 3},
+        "event": "entered implementing: the test already fails",
+        "event_kind": "implement",
+    },
+    "work/recorded": {
+        "slot": "dashboard:3",
+        "actor": "worker",
+        "by": "dashboard:9",
+        "action": "report",
+        "item_id": "it_0badc0de",
+        "status": "progress",
+        "summary": "scoped tests green, opening the PR next",
+        "artifacts": {"branch": "feat/x", "pr": "123"},
+        "pr": 123,
+        "event": "progress: scoped tests green",
+        "event_kind": "report",
+    },
 }
 
 
@@ -227,7 +259,18 @@ def test_every_type_written_today_is_declared_and_nothing_else_is():
     # had never declared -- four subagent/*, background/completed and plan/updated --
     # joined it. The first five stopped a fold outright; plan/updated was skipped
     # instead, which the class fold reads as damage.
-    assert len(SESSION_ENTRY_TYPES) == 29
+    #
+    # The two past those six are the crew-facing boards' own records: the Issue Radar
+    # crew's ``radar/recorded`` and the work ledger's ``work/recorded``. A board's
+    # writes are entries in this log rather than a second record beside it.
+    #
+    # The two past THOSE are the session tree's: ``session/adopted`` and
+    # ``session/released``, which move a session under a new parent and back to a root.
+    # They are declared for the reason everything here is -- ``KNOWN_TYPES`` is derived
+    # from this registry, so an undeclared type in a log stops every later fold of it --
+    # and not because any fold of ONE log branches on them: the session tree is folded
+    # across logs.
+    assert len(SESSION_ENTRY_TYPES) == 33
     # Nine types the vocabulary owns that nothing writes. Declaring one would state
     # a shape no writer produces, and the first emitter to land would have to
     # satisfy a contract written without it. They pass through undeclared instead.
@@ -272,10 +315,12 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
     # vocabulary that arrives from a provider, the gateway's teardown reasons or a
     # subagent runtime would turn "the upstream set grew" into a lost entry.
     #
-    # The two actor sets, the ledger's event_kind, the observation's producer and a
-    # plan row's state are the only ones a producing site clamps -- the last computed
-    # as done-or-open from one boolean, so a third value has no path to the entry. A
-    # type with no
+    # The two actor sets, the ledger's event_kind, the observation's producer, a plan
+    # row's state and the radar ledger's three vocabularies are the only ones a producing
+    # site clamps: a plan row's state is computed as done-or-open from one boolean, so a
+    # third value has no path to the entry, and the crew store refuses an unknown phase
+    # or event kind before anything is appended, and coerces an unknown skip scope to
+    # ``other``, so no value outside these sets ever reaches an entry. A type with no
     # producing site cannot qualify, however small its spec vocabulary looks: there
     # is no code enforcing the set, so the first resolver to report a value outside
     # it would have the entry refused rather than recorded.
@@ -291,6 +336,18 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
         ("ledger/recorded", "event_kind"),
         ("object/observed", "producer"),
         ("plan/updated", "state"),
+        ("radar/recorded", "phase"),
+        ("radar/recorded", "scope"),
+        ("radar/recorded", "event_kind"),
+        # The work ledger clamps every one of these before it builds the entry:
+        # the vocabularies are declared beside the type and the writer imports
+        # them, so the closed enum and the writer's refusal are one set.
+        ("work/recorded", "actor"),
+        ("work/recorded", "action"),
+        ("work/recorded", "state"),
+        ("work/recorded", "verdict"),
+        ("work/recorded", "status"),
+        ("work/recorded", "event_kind"),
     }
     emitted = set(_types_with_a_producing_site())
     assert {spec_type for spec_type, _ in closed} <= emitted
@@ -721,11 +778,18 @@ def test_a_group_refuses_a_citing_entry_the_registry_rejects():
     assert crew_log_path("session", SESSION).read_bytes() == before
 
 
-def test_a_crew_append_is_untouched_by_the_registry():
+def test_an_undeclared_crew_append_is_untouched_by_the_registry():
+    """A crew type outside the two declared contracts still passes through.
+
+    The crew kind owns eight domains and two of them carry a declaration, so the
+    registry has to answer per TYPE rather than per kind: a family with no writer
+    stays writable, which is what keeps a guest app and a future family from
+    needing a registry entry before they can record anything.
+    """
     crew = CrewLog.create("crew", "qa")
     joined = crew.append("member/joined", {}, src="gateway")
     crew.append(
-        "crew/report",
+        "crew/finding",
         {"anything": 1},
         src="crew:qa",
         ref={"unit": "crew", "id": "qa", "from": joined.seq},
@@ -936,7 +1000,10 @@ def test_the_markdown_dump_marks_the_sampled_types():
 
 
 def test_the_markdown_dump_is_empty_for_a_kind_with_no_declarations():
-    assert render_markdown("crew").strip() == "# Declared `crew` crew log entry types"
+    # The MEMBER kind is that kind: its vocabulary, writers and projections are
+    # owned by the member event log, so nothing is declared here for it and the
+    # renderer answers with a heading and no sections.
+    assert render_markdown("member").strip() == "# Declared `member` crew log entry types"
 
 
 def test_the_cli_prints_the_tables_and_refuses_anything_else(capsys):

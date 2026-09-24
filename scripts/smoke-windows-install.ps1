@@ -447,7 +447,7 @@ try {
 
   # -s: no user site-packages, so the installed payload is what runs.
   $gateway = Start-Process -FilePath $bundledPython -ArgumentList @(
-    "-s", "-m", "kiro_crew", "gateway", "--no-open", "--port", "$gatewayPort"
+    "-s", "-P", "-m", "kiro_crew", "gateway", "--no-open", "--port", "$gatewayPort"
   ) -WorkingDirectory $installLocation -RedirectStandardOutput $gatewayStdout `
     -RedirectStandardError $gatewayStderr -WindowStyle Hidden -PassThru
 

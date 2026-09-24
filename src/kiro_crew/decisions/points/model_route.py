@@ -62,6 +62,7 @@ import uuid
 from typing import Any, Callable, Mapping, Sequence
 
 from kiro_crew import decisions as core
+from kiro_crew import model_registry
 from kiro_crew.decisions import log as _log
 from kiro_crew.decisions.points import build_history, history_budget, prior_turns
 from kiro_crew.decisions.types import Answer, Choice, Question
@@ -101,11 +102,35 @@ TIER_DESCRIPTIONS: dict[str, str] = {
     ),
 }
 
+#: The one prompt sentence that is not a tier description: which way an error
+#: costs more. It names no model and no price, the rule the descriptions above
+#: follow, so the oracle judges the work rather than pricing the turn.
+TIER_ASYMMETRY = (
+    "Being wrong in the two directions does not cost the same. A turn put in a "
+    "lower tier than it needs gets less room to work in and a worse answer; a "
+    "turn put higher only costs more. So answer simple only when the request is "
+    "self-contained and you can see the whole of it -- a request that is a plan, "
+    "a judgement call, several instructions at once, or that names work you "
+    "cannot see, is not simple however short it is."
+)
+
 #: Characters of the current message sent with the question -- the SAME bound
 #: ``skills.select`` applies, because it is the same text answering a question
 #: about the same turn, and two different excerpt sizes would mean the consent
 #: text describes one of them.
 MAX_MESSAGE_CHARS = 2000
+
+#: Characters per token, the same rough divisor ``skills.select`` and
+#: ``compaction.keep`` estimate with. A real tokenizer is not worth importing for a
+#: fitting decision, and over-estimating costs one downgrade while under-estimating
+#: costs a history. It is calibrated on LATIN text, which is why
+#: :func:`prompt_tokens` does not apply it to every character.
+CHARS_PER_TOKEN = 4
+
+#: Lowest tier probability that may move a turn to a SMALLER context window. A
+#: CONSTANT for ``memory.recall``'s reason: it is the meaning of the answer
+#: rather than a knob, and a configurable one could turn the guard off unseen.
+MIN_DOWNGRADE_P = 0.80
 
 #: Every tier unpinned. No model id is hardcoded here, because one an account is
 #: not entitled to fails on the first prompt
@@ -134,6 +159,11 @@ UNPINNED = ""
 ERROR_UNKNOWN_MODEL = "model-not-advertised"
 ERROR_NO_SWITCH = "no-switch-seam"
 ERROR_SWITCH_FAILED = "switch-failed"
+
+#: A downgrade the window rules refused: the tier's model has a SMALLER context
+#: window than the session's, and either the answer is under
+#: :data:`MIN_DOWNGRADE_P` or the turn's own history would not fit there.
+ERROR_WINDOW_REFUSED = "smaller-window-refused"
 
 #: The module the strip hand-off lives in, resolved by name at call time so a
 #: build without it is a no-op rather than an import error on a turn path.
@@ -170,7 +200,8 @@ def questions() -> list[Question]:
     return [
         Choice(
             QUESTION_ID,
-            "How hard is this request for an AI coding assistant? " f"Answer one of: {described}.",
+            "How hard is this request for an AI coding assistant? "
+            f"Answer one of: {described}. {TIER_ASYMMETRY}",
             options=list(TIERS),
         )
     ]
@@ -266,8 +297,6 @@ def _same_model(left: str, right: str) -> bool:
     the frontend's ``normalizeModelKey`` fallback exactly.
     """
     try:
-        from kiro_crew import model_registry
-
         canonical_left = model_registry.canonical_key(left)
         canonical_right = model_registry.canonical_key(right)
         if canonical_left and canonical_right:
@@ -275,6 +304,99 @@ def _same_model(left: str, right: str) -> bool:
     except Exception:
         logger.debug("model.route: canonical model comparison unavailable", exc_info=True)
     return left.strip().lower().replace(".", "-") == right.strip().lower().replace(".", "-")
+
+
+def known_window(model_id: str) -> int | None:
+    """*model_id*'s context window in tokens when the registry KNOWS it, else ``None``.
+
+    ``has_known_window`` is the gate rather than ``model_window`` alone, which
+    answers a guessed reference for an id it does not list: vetoing a switch on a
+    guess pins routing to the session's own model for every unlisted one.
+
+    Asked as written and then case-folded, because BOTH registry lookups are
+    spelling-sensitive while :func:`resolve_model` accepts an owner's pin on a lossless
+    fold and answers the spelling THEY wrote. Asked only as written, a pin cased
+    differently from the registry's entry reads as a window nothing knows -- and that
+    is the answer that refuses nothing, so the pin would carry the very shrink these
+    rules exist to refuse. ``.`` and ``-`` are deliberately NOT folded together: the
+    registry keeps those entries distinct because they are two different windows.
+    """
+    name = str(model_id or "").strip()
+    if not name:
+        return None
+    for candidate in (name, name.lower()):
+        try:
+            canonical = model_registry.canonical_key(candidate) or candidate
+            found = (
+                model_registry.model_window(canonical)
+                if model_registry.has_known_window(canonical)
+                else None
+            )
+        except Exception:
+            logger.debug("model.route: no known window for %r", model_id, exc_info=True)
+            return None
+        if isinstance(found, int) and found > 0:
+            return found
+    return None
+
+
+def prompt_tokens(text: str) -> int:
+    """Estimated tokens the prompt a turn SENDS adds to what a context meter reports.
+
+    The meter answers for the transcript a session ALREADY holds, and the turn a
+    window rule is deciding for adds its whole assembled prompt on top -- the person's
+    words plus every prefix the turn carries, not the excerpt the answer was
+    classified from. Without it a large prompt over a small history passes a fit test
+    taken on the history alone and then crosses the threshold at the end of that same
+    turn -- which is the compaction the rule exists to prevent, so leaving it out
+    makes the rule pass exactly what it is for. An estimate, deliberately: see
+    :data:`CHARS_PER_TOKEN`.
+
+    The divisor answers for LATIN text. CJK, Indic and symbol-dense input tokenizes
+    several times denser, so applying it to every character reads such a prompt as a
+    quarter of its size and clears the shrink this rule exists to refuse -- on
+    ordinary input rather than a crafted one. So only ASCII is divided, and every
+    other character is counted as a token of its own. That is the conservative
+    direction and the only one that is safe here: it can refuse a downgrade the
+    prompt would in fact have fitted, which costs one turn on a larger window, while
+    the opposite costs a history nothing recovers.
+    """
+    raw = str(text or "")
+    dense = sum(1 for ch in raw if ord(ch) > 127)
+    return (len(raw) - dense) // CHARS_PER_TOKEN + dense
+
+
+def is_smaller_window(*, current: int | None, target: int | None) -> bool:
+    """Whether moving from *current* to *target* SHRINKS the room a turn has.
+
+    ``False`` when either window is unknown: an unknown window is not evidence of a
+    shrink. THE one place that answers this, because both window rules are scoped by
+    it and a caller deciding it a second way could govern a different set of moves.
+    """
+    if current is None or target is None:
+        return False
+    return target < current
+
+
+def permits_smaller_window(p: float | None, *, current: int | None, target: int | None) -> bool:
+    """Whether a tier's model may be applied, given the two context windows.
+
+    ``True`` for every move to a window at least as large as the current one: the
+    harm is one-directional, and room that does not shrink changes nothing about
+    what fits. ``True`` as well when either window is unknown (``None``), which is
+    :func:`known_window`'s answer for a model the registry has not met -- refusing
+    there makes routing inert on exactly the models nothing is known about.
+
+    A SMALLER window needs the answer's own probability at :data:`MIN_DOWNGRADE_P`
+    or above. An absent one does not clear it: the rule asks the answer to carry
+    the move, and a row with no number carries nothing. The floor sits in a gap
+    rather than on a slope -- tier answers cluster below 0.75 and above 0.86.
+    """
+    if not is_smaller_window(current=current, target=target):
+        return True
+    if not isinstance(p, (int, float)) or isinstance(p, bool):
+        return False
+    return float(p) >= MIN_DOWNGRADE_P
 
 
 async def routed_model(
@@ -445,7 +567,13 @@ def publish_outcome(session_key: str | None, outcome: dict[str, Any]) -> bool:
 
 
 def record_error(
-    session_key: str | None, *, turn_id: str, tier: str, latency_ms: int, error: str
+    session_key: str | None,
+    *,
+    turn_id: str,
+    tier: str,
+    latency_ms: int,
+    error: str,
+    p: float | None = None,
 ) -> None:
     """One row for a tier that arrived and could not be applied. Never raises.
 
@@ -453,7 +581,14 @@ def record_error(
     routing for a receipt to describe and no pair of models for a reader to rate.
     Blocking (the append is filesystem IO), so a caller on the event loop hands it
     to a thread.
+
+    *p* is the refused answer's own probability, recorded when the category is
+    about the ANSWER rather than about a model id: a reader tells the two window
+    rules apart by whether that number clears the floor.
     """
+    extra: dict[str, Any] = {"turn_id": turn_id, "tier": tier}
+    if p is not None:
+        extra["p"] = p
     try:
         _log.append(
             _log.build_row(
@@ -461,7 +596,7 @@ def record_error(
                 session_key=session_key,
                 latency_ms=latency_ms,
                 error=error,
-                extra={"turn_id": turn_id, "tier": tier},
+                extra=extra,
             )
         )
     except Exception:

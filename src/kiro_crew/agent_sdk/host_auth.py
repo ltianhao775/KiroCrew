@@ -74,8 +74,8 @@ from kiro_crew.agent_sdk.backends import (
 )
 
 # ── Where a harness's entitlement comes from ──
-# Three named sources rather than a free string: the doctor row, the panel and the
-# logout policy all branch on this, and a typo'd fourth spelling would read as a
+# Named sources rather than a free string: the doctor row, the panel and the
+# logout policy all branch on this, and a typo'd spelling would read as a
 # harness nobody has an answer for instead of failing the parity test.
 
 #: Signed in through the HOST's own identity store -- the one ``kiro-cli login``
@@ -87,9 +87,23 @@ ENTITLEMENT_HOST_IDENTITY_STORE = "host_identity_store"
 #: itself. Kiro Crew never reads it and only ever checks that it exists.
 ENTITLEMENT_OWN_CREDENTIAL_FILE = "own_credential_file"
 
-# Two sources, because two are constructed. A harness whose entitlement arrives
+#: Entitled by a key Kiro Crew holds in ITS OWN secret vault and hands to the
+#: harness's process as an environment variable at spawn.
+#:
+#: The third source, and it is what lets a harness be enforced with NO carve-out in
+#: :attr:`AgentAuthDeclaration.adapter_own_leaves`: the key never has to be readable
+#: as a file inside the child's tree, so the credential leaves stay masked for the
+#: whole process tree instead of being spared for it. Only usable by a harness that
+#: (a) resolves a provider credential from its inherited environment and (b) keeps
+#: that class of variable away from the shells it spawns itself -- both properties of
+#: the harness, verified against it rather than assumed, which is why this is a
+#: declared source and not a flag any driver may set.
+ENTITLEMENT_HOST_VAULT = "host_vault"
+
+# Three sources, because three are constructed. A harness whose entitlement arrives
 # from the ambient cloud environment (an AWS profile, an instance role) rather than
-# from a file it owns would add a third here, with its label, when it exists.
+# from a file it owns or from Crew's vault would add a fourth here, with its label,
+# when it exists.
 
 #: Entitlement source -> what to call it in front of an operator.
 #:
@@ -101,12 +115,14 @@ ENTITLEMENT_OWN_CREDENTIAL_FILE = "own_credential_file"
 ENTITLEMENT_LABELS: Dict[str, str] = {
     ENTITLEMENT_HOST_IDENTITY_STORE: "kiro-cli's own sign-in",
     ENTITLEMENT_OWN_CREDENTIAL_FILE: "the harness's own credential file",
+    ENTITLEMENT_HOST_VAULT: "a key in Kiro Crew's secret vault",
 }
 
 ENTITLEMENT_SOURCES: FrozenSet[str] = frozenset(
     {
         ENTITLEMENT_HOST_IDENTITY_STORE,
         ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        ENTITLEMENT_HOST_VAULT,
     }
 )
 
@@ -160,11 +176,23 @@ class AgentAuthDeclaration:
     #: EXFILTRATION -- a shell the model spawns inside the harness can read the file
     #: and send the secret somewhere. That is a real residual risk and it is carried
     #: knowingly, because the alternative is a harness that cannot sign in at all.
-    #: Four harnesses carry it today, and the maintainer weighed and accepted this
-    #: exact trade rather than it being an oversight. What bounds it is the
-    #: subset rule above: the exclusion can only re-open a file this same
-    #: declaration put on the floor, so no harness can reach another harness's
-    #: credential or anything the floor fences for a different reason.
+    #: Four harnesses carry it today -- codex, OpenCode, pi and goose -- and the
+    #: maintainer weighed and accepted this exact trade rather than it being an
+    #: oversight. What bounds it is the subset rule above: the exclusion can only
+    #: re-open a file this same declaration put on the floor, so no harness can reach
+    #: another harness's credential or anything the floor fences for a different
+    #: reason.
+    #:
+    #: It is NOT the only shape an enforced harness can take. A harness declaring
+    #: :data:`ENTITLEMENT_HOST_VAULT` is fed its key as an environment variable at
+    #: spawn and declares ``()`` here, so its credential leaves stay masked for the
+    #: whole process tree and the exfiltration path above does not exist for it. The
+    #: DeepSeek Harness is the first enforced harness of that shape: it resolves a
+    #: provider key from its inherited environment, and it scrubs every variable
+    #: whose NAME matches ``/KEY|PASSWORD|SECRET|TOKEN/i`` before spawning any child
+    #: of its own, so the key is invisible to the shells it runs. A harness that can
+    #: be entitled that way must be, rather than carrying a carve-out it does not
+    #: need.
     adapter_own_leaves: Tuple[str, ...]
 
     #: What an operator DOES to sign this harness in. Rendered VERBATIM.
@@ -601,33 +629,71 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # whether the right file is fenced under an override should not have to
         # re-derive which prefix this variable replaces.
         override_relative_leaves=(".credentials.yaml", ".env"),
-        # Nothing excluded from the mask, because no mask is applied: this harness's
-        # routing is ``UNVERIFIED``, so it is outside ``tool_gate.ENFORCED_ROUTINGS``,
-        # ``adapter_hidden_credential_dirs`` returns empty for it, and there is
-        # nothing to carve an exception out of. Declaring one anyway would be an
-        # assertion about a control that never runs. The leaves above still stand:
-        # they are what the READ GATE fences from the agent's own file tools, which is
-        # a separate control and does run.
+        # NOTHING excluded, and for this harness that is a positive choice rather than
+        # the absence of one. Its routing is ``VERIFIED_GATE_EXTENSION``, inside
+        # ``tool_gate.ENFORCED_ROUTINGS``, so ``adapter_hidden_credential_dirs``
+        # denies its child the whole read-gate floor -- both leaves above included --
+        # and an enforced harness that needs a FILE to authenticate has to carve one
+        # back out. This one does not need a file: its own credential layering resolves
+        # a provider key from the INHERITED PROCESS ENVIRONMENT first, above both files
+        # (verified against the installed harness: ``dsh-credentials-local`` documents
+        # inherited environment > ``$DSH_HOME/.credentials.yaml`` > ``<cwd>/.env`` >
+        # ``$DSH_HOME/.env``, and a credential reference IS an environment-variable
+        # name). So Crew hands it the key from its own vault instead
+        # (``agent.deepseek_env`` -> ``acp/client.py``) and both leaves stay masked for
+        # the WHOLE process tree.
+        #
+        # That is what closes the residual every other enforced harness carries. A
+        # carve-out removes the leaf for the whole sandboxed tree, and this harness
+        # ships a ``bash`` tool, so a command it runs could read its own provider key
+        # out of the spared file; the gate sees that command, but the read itself is
+        # one ``open()`` and the sensitive-path matcher is not the enforcement point.
+        # Feeding the key through the environment removes the file from the equation:
+        # the harness scrubs every inherited variable whose name matches
+        # ``/KEY|PASSWORD|SECRET|TOKEN/i`` before spawning ANY child of its own
+        # (``dsh-subprocess``'s ``scrubbedParentEnv``, used by both its bash and its
+        # terminal tools), and Crew REFUSES to inject a name outside that class for
+        # exactly that reason.
+        #
+        # One residual remains, named rather than closed, and MEASURED rather than
+        # argued. In the confined mode Crew pins, the harness runs each tool command
+        # inside its own per-call Landlock domain (``landlock-run``), and Landlock
+        # scopes ptrace-class access to a process's own domain or its children -- so
+        # ``cat /proc/<harness pid>/environ`` from the model's shell answers
+        # ``Permission denied`` (observed live, same uid, under Crew's sandbox wrap:
+        # every ancestor from the harness process up to the gateway refused, the
+        # gateway's own environ never carried the key, and ``env`` in the shell counted
+        # zero copies). What stands between the shell and the harness's environ is
+        # that per-call sandbox, and the harness's ``danger-full-access`` mode drops
+        # it -- so that mode is where the residual lives (not driven here: the
+        # harness refuses to compose that mode with this profile's defaults, so its
+        # read was not observed either way). Escalating to that mode is itself a
+        # ``session/request_permission`` this routing's gate sees, so the exposure is
+        # two gated steps rather than one ungated read.
         adapter_own_leaves=(),
         # States the ACTION only, and asserts no state, because for this harness
         # there may be no state to assert: a provider route pointed at a model served
         # on the operator's own machine needs no key at all.
         sign_in_remedy=(
-            "DeepSeek Harness holds its own provider key. Save one in its "
-            "configuration to reach a hosted model. A model served locally on this "
-            "machine needs no key: point a provider route at it instead. Neither is "
-            "checked here, because the harness reads them itself."
+            "DeepSeek Harness reaches a hosted model with a provider key Kiro Crew "
+            "holds for it. Save the key under Settings → Secrets, then map it in "
+            "agent.deepseek_env under the environment-variable name the provider "
+            "expects, such as DEEPSEEK_API_KEY. A model served locally on this "
+            "machine needs no key: point a provider route at it instead."
         ),
         signed_out_message=(
-            "DeepSeek Harness has no provider key. Save one in its configuration, or "
-            "point a provider route at a model served locally on this machine, then "
-            "start a new chat."
+            "DeepSeek Harness has no provider key. Save one under Settings > Secrets "
+            "and map it in `agent.deepseek_env` (for example "
+            "`DEEPSEEK_API_KEY: secret://my-dsh-key`), or point a provider route at a "
+            "model served locally on this machine, then start a new chat."
         ),
         # Excluded deliberately, and for this harness the reason is stronger than a
         # separate store: there is no host credential on the wire at all, so a
         # ``kiro-cli logout`` cannot bear on whether a running session still works.
+        # The vault this harness draws on is Crew's SECRET vault, which a kiro-cli
+        # logout does not touch either.
         host_logout_retires_children=False,
-        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        entitlement_source=ENTITLEMENT_HOST_VAULT,
     ),
 )
 
@@ -811,6 +877,7 @@ __all__ = [
     "AgentAuthDeclaration",
     "AgentInteractiveLogin",
     "ENTITLEMENT_HOST_IDENTITY_STORE",
+    "ENTITLEMENT_HOST_VAULT",
     "ENTITLEMENT_LABELS",
     "ENTITLEMENT_OWN_CREDENTIAL_FILE",
     "ENTITLEMENT_SOURCES",

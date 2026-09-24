@@ -139,14 +139,14 @@ def test_the_page_matches_the_session_control_group_and_the_channel_block(
     from kiro_crew.channel import CHANNEL_AGENT_BLOCKED_TOOLS
     from kiro_crew.mcp_dashboard import SESSION_CONTROL_TOOLS
 
-    assert len(SESSION_CONTROL_TOOLS) == 5
+    assert len(SESSION_CONTROL_TOOLS) == 8
     for tool in SESSION_CONTROL_TOOLS:
         assert f"`{tool}`" in doc_text
         assert tool in CHANNEL_AGENT_BLOCKED_TOOLS, (
             f"{tool} left the channel containment list; the page tells a channel agent "
-            "it is blocked from all five"
+            "it is blocked from all eight"
         )
-    assert "all five\nsession tools" in doc_text or "all five session tools" in doc_text
+    assert "all eight\nsession tools" in doc_text or "all eight session tools" in doc_text
 
 
 def test_every_tabulated_refusal_code_is_one_the_source_raises(doc_text: str) -> None:
@@ -252,18 +252,21 @@ def test_the_queue_row_matches_what_each_verb_does_to_the_queue(doc_text: str) -
 
 
 def test_the_documented_switch_defaults_match_config(doc_text: str) -> None:
-    """``agent.session_control`` and ``agent.member_dispatch`` defaults, from the section."""
+    """The agent switches the doc's table states, each read off ``AgentConfig``."""
     from kiro_crew.config.sections import AgentConfig
 
     agent_cfg = AgentConfig()
-    assert agent_cfg.session_control is True
-    assert agent_cfg.member_dispatch is True
-    for key in ("agent.session_control", "agent.member_dispatch"):
-        assert f"`{key}`" in doc_text
+    switches = ("session_control", "member_dispatch", "crew_panel")
+    for name in switches:
+        assert getattr(agent_cfg, name) is True, name
+        assert f"`agent.{name}`" in doc_text, name
     switch_table = doc_text.split("### Switches and ceilings", 1)[1]
-    assert (
-        switch_table.count("| `true` |") == 2
-    ), "the switches table must state both defaults as true, matching AgentConfig"
+    # Counted from the tuple above rather than written as a literal, so adding a
+    # fourth switch to the section fails on the missing ROW rather than on a
+    # number nobody updated.
+    assert switch_table.count("| `true` |") == len(
+        switches
+    ), "the switches table must state every default as true, matching AgentConfig"
 
 
 def test_the_documented_limits_match_their_constants(doc_text: str) -> None:

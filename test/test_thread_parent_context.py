@@ -116,7 +116,7 @@ class FakeSessionManager:
     def dequeue(self, key):
         return None
 
-    def clear_queue(self, key):
+    def clear_queue(self, key, owned_by=None):
         pass
 
 

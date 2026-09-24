@@ -38,6 +38,7 @@ const {
   openPetWindow,
   closePetWindow,
   petWindowCount,
+  rearmBlankedCompanionWindows,
   setOverlayLogger,
   setOverlayTarget,
   registerOverlayIpc,
@@ -335,6 +336,17 @@ async function reconcileOnce() {
     if (petWindowCount() === 0) {
       openPetWindow();
       log("crew-companion: enabled — overlays opened");
+    }
+    // A display overlay or hidden notification owner latched on an error document
+    // is reloaded here and nowhere else: this tick's probe was just answered with
+    // the credential set above, so the reload carries one the gateway accepts,
+    // and a reload per 5s tick is the whole retry budget. "unknown" returned
+    // before this line on purpose — a gateway that cannot answer the probe cannot
+    // serve the page either. Freshly opened windows are still loading and have
+    // nothing latched, so this is a no-op right after openPetWindow.
+    const rearmed = rearmBlankedCompanionWindows();
+    if (rearmed > 0) {
+      log(`crew-companion: re-armed ${rearmed} window(s) hidden on an error document`);
     }
   } finally {
     reconciling = false;

@@ -200,6 +200,15 @@ def _actual_type_name(value: object) -> str:
 #:   unreadable section so the loader records its degradation and the creation
 #:   guard refuses instead of treating the operator's setting as absent.
 #:
+#: * ``workspaces``: the table names WHERE the Global V1 memory workspaces
+#:   live, some possibly at absolute directories outside the data home, and the
+#:   folder-steering memory-store fence is built from it. Repairing a malformed
+#:   table to ``{}`` reads as "no workspaces configured", and a fence built
+#:   from that covers only the default directory -- so a steering root that
+#:   contains an operator's external workspace would be admitted and read.
+#:   Preserved, the loader records ``DEGRADED_WORKSPACES`` and the fence
+#:   refuses every root until the table is readable again.
+#:
 #: Exact-match only: this is a per-path judgment, not a subtree rule. The
 #: registry is only half of a fix — a preserved value changes nothing unless
 #: the loader RECORDS the degradation and a gate reads
@@ -212,6 +221,7 @@ _FAIL_CLOSED_PATHS = frozenset(
         "dashboard",
         "dashboard.tailscale",
         "memory",
+        "workspaces",
     }
 )
 

@@ -903,8 +903,8 @@ class TestPodApiUnixTransport:
     ) -> None:
         """Refuse before minting: an undeliverable credential is still a credential.
 
-        ``mint_token`` sends the pod's ``.local_secret`` to get one back, so a
-        request that cannot be delivered must not pay for a token first.
+        ``mint_token`` sends the pod's own internal-API credential to get one back,
+        so a request that cannot be delivered must not pay for a token first.
         """
         monkeypatch.setattr(
             rt, "mint_token", lambda *args, **kwargs: pytest.fail("minted before refusing")

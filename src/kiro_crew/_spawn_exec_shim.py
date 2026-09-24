@@ -40,8 +40,10 @@ ahead of this code -- and it also halves interpreter startup.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
+import time
 
 try:
     import resource as _resource
@@ -57,6 +59,14 @@ _ARGV_SEPARATOR = "--"
 # that only sees the exit status can still tell an exec failure from the
 # command's own nonzero exit.
 _EXEC_FAILED = 127
+# A target that raises these from ``execv`` is transiently absent, not broken:
+# the Kiro CLI replaces its own executable during an update, and a spawn landing
+# inside that rename window sees ENOENT or ETXTBSY until the replacement settles.
+_EXECV_RETRYABLE_ERRNOS = (errno.ENOENT, errno.ETXTBSY)
+# Six tries over two seconds ride out that window. Reporting it as exit 127
+# instead would make the parent mark the runtime dead with no retry.
+_EXECV_RETRY_ATTEMPTS = 6
+_EXECV_RETRY_DELAY_S = 0.4
 # Matches sandbox.session_host_preexec: raise NOFILE to the inherited hard cap,
 # or to this floor when the kernel reports no ceiling at all.
 _UNLIMITED_NOFILE_FLOOR = 65536
@@ -288,17 +298,26 @@ def main(argv: list[str] | None = None) -> int:
     _apply_rlimits(pairs)
     if want_oom_bias:
         _bias_oom_score()
-    try:
-        # execv, not execve: the environment this process was given IS the
-        # environment the caller built for the command, and passing it through
-        # untouched avoids rebuilding the whole mapping under the new limits.
-        # No PATH search -- the caller resolves argv[0] so a missing command
-        # surfaces as FileNotFoundError at the spawn, as it did without a shim.
-        os.execv(encoded[0], encoded)
-    except OSError as exc:
-        sys.stderr.write(f"spawn shim: cannot execute {args[0]!r}: {exc.strerror}\n")
-        return _EXEC_FAILED
-    return _EXEC_FAILED  # pragma: no cover - execv does not return on success
+    # execv, not execve: the environment this process was given IS the
+    # environment the caller built for the command, and passing it through
+    # untouched avoids rebuilding the whole mapping under the new limits.
+    # No PATH search -- the caller resolves argv[0] in the parent, so a target
+    # that was already missing at resolve time failed the spawn there.
+    # The retry rides out the CLI self-update rename window, which the
+    # runtime spawn path owns. A terminal (--ctty-fd) command that is already
+    # missing must fail fast instead of stalling the shell for the budget.
+    attempts = 1 if ctty_fd is not None else _EXECV_RETRY_ATTEMPTS
+    for attempt in range(attempts):
+        try:
+            os.execv(encoded[0], encoded)
+        except OSError as exc:
+            if exc.errno in _EXECV_RETRYABLE_ERRNOS and attempt < attempts - 1:
+                time.sleep(_EXECV_RETRY_DELAY_S)
+                continue
+            sys.stderr.write(f"spawn shim: cannot execute {args[0]!r}: {exc.strerror}\n")
+            return _EXEC_FAILED
+        return _EXEC_FAILED  # pragma: no cover - execv does not return on success
+    return _EXEC_FAILED  # pragma: no cover - the loop returns on every attempt
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a spawned process

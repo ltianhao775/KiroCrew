@@ -9,8 +9,12 @@ existing config raises, and a genuinely absent one still starts from ``{}``.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -779,17 +783,16 @@ class TestEveryConfigWriterIsLocked:
 
 
 class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
-    """The second config-writer family may shrink but never grow.
+    """The second config-writer family is empty and may not regrow.
 
     ``TestEveryConfigWriterIsLocked`` above covers calls to
-    ``write_config_atomically``. A second family reaches ``config.json``
+    ``write_config_atomically``. A second family reached ``config.json``
     through ``kiro_crew.agent._atomic_json_write``, takes no advisory lock on
-    the ``<path>.lock`` sidecar, and is therefore invisible to that scan --
-    ``loader.py``'s own docstring names the set and calls converting it
-    follow-up work. Those writers hold only the in-process asyncio
+    the ``<path>.lock`` sidecar, and is therefore invisible to that scan. Such
+    a writer holds only the in-process asyncio
     ``_get_config_lock()``, which serializes callers on this event loop and
-    nothing else, so one of them can still land between a lock holder's read
-    and write and silently revert it.
+    nothing else, so it can land between a lock holder's read and write and
+    silently revert it.
 
     The shape matters for channels specifically. Each per-channel settings
     saver in ``messaging.py`` is a hand-copied credential-write skeleton, and
@@ -803,11 +806,12 @@ class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
     to record. Both directions are enforced, because a baseline that is allowed
     to rot stops describing the code and starts hiding it.
 
-    To clear an entry, route the write through ``update_config_locked`` (see
-    ``api_feishu_config_save`` and ``api_imessage_config_save`` for the shape:
-    stage the mutation in a closure, return ``None`` to skip a no-op write, and
-    map ``ConfigReadError`` to the handler's existing corrupt-config response),
-    then delete its line below.
+    The baseline is empty: every writer routes through ``update_config_locked``
+    (a channel saver through ``messaging._LockedSectionWrite``; see
+    ``api_feishu_config_save`` for the inline shape: stage the mutation in a
+    closure, return ``None`` to skip a no-op write, and map ``ConfigReadError``
+    to the handler's existing corrupt-config response). A new entry is a new
+    unlocked config writer and is refused, not recorded.
     """
 
     #: ``loader.py`` only names this family in prose; it owns the locked
@@ -822,18 +826,7 @@ class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
     #: ``file.py:function`` for every writer still on the unlocked path.
     #: Keyed by function rather than line so an unrelated edit above does not
     #: churn it. THIS LIST MAY ONLY SHRINK.
-    _BASELINE = frozenset(
-        {
-            "core.py:api_stt_config",
-            "mcp.py:api_mcp_gateway_enable",
-            "messaging.py:_discord_config_save_locked",
-            "messaging.py:_slack_config_save_locked",
-            "messaging.py:_telegram_config_save_locked",
-            "messaging.py:_wecom_config_save_locked",
-            "messaging.py:api_teams_config_save",
-            "messaging.py:api_webex_config_save",
-        }
-    )
+    _BASELINE: frozenset[str] = frozenset()
 
     @classmethod
     def _is_config_path_call(cls, node) -> bool:
@@ -998,3 +991,149 @@ class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
             "path and ``unrelated`` writes a different file; neither may be "
             "flagged, or the ratchet cannot be cleared by honest code."
         )
+
+
+class TestAutoUpdateToggleHoldsBothConfigLocks:
+    """The auto-update toggle must exclude the LEGACY config writers too.
+
+    ``config.json`` has two writer generations that do not exclude each other.
+    ``update_config_locked`` takes the sidecar advisory flock, covering the CLI,
+    the boot refresh and a second gateway process. The legacy dashboard handlers
+    -- ``core.py``'s theme/settings PUT, the agents endpoint, ``security.py``,
+    ``messaging.py``, ``mcp.py``, ``computer_use.py`` -- do their own
+    read-modify-write of the same file while holding ONLY the loop-side
+    ``_get_config_lock`` asyncio lock, which the flock does not exclude.
+
+    So a bare ``asyncio.to_thread(update_config_locked, ...)`` here is right about
+    the event loop and wrong about exclusion: a theme save landing between this
+    endpoint's read and its write commits from a snapshot taken before it and
+    silently reverts the flag the user just toggled. ``run_config_write`` is the
+    one entry point that holds both.
+
+    Probing the lock from INSIDE the worker is what makes this behavioural rather
+    than a shape assertion: it fails on the defect, not on the spelling of the
+    dispatch.
+    """
+
+    class _Req:
+        async def json(self):
+            return {"enabled": False}
+
+    @pytest.mark.asyncio
+    async def test_the_loop_side_lock_is_held_across_the_write(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.handlers import updates
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(_REAL_SETTINGS, indent=2), encoding="utf-8")
+        monkeypatch.setattr(updates, "config_path", lambda: path)
+
+        seen: dict = {}
+        real = updates.update_config_locked
+
+        def _spy(*args, **kwargs):
+            seen["locked"] = _get_config_lock().locked()
+            seen["thread"] = threading.current_thread()
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(updates, "update_config_locked", _spy)
+
+        resp = await updates.api_update_auto(self._Req())
+        assert resp.status == 200
+        assert seen, "the config write never ran"
+        # Red-before with the bare `asyncio.to_thread` dispatch: False is not True.
+        assert seen["locked"] is True, (
+            "config.json was rewritten without the loop-side lock, so a legacy "
+            "dashboard writer could interleave and revert the toggle"
+        )
+        # And the reason the old dispatch existed is preserved: the blocking
+        # flock wait still happens off the event loop.
+        assert (
+            seen["thread"] is not threading.current_thread()
+        ), "the blocking write must stay off the event loop"
+
+    @pytest.mark.asyncio
+    async def test_the_loop_side_lock_is_released_afterwards(self, tmp_path, monkeypatch):
+        """Holding it is only correct if the handler also gives it back."""
+        from kiro_crew.dashboard.handlers import updates
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(_REAL_SETTINGS, indent=2), encoding="utf-8")
+        monkeypatch.setattr(updates, "config_path", lambda: path)
+
+        resp = await updates.api_update_auto(self._Req())
+        assert resp.status == 200
+        assert not _get_config_lock().locked()
+        assert json.loads(path.read_text(encoding="utf-8"))["auto_update"] is False
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_config_still_fails_closed_and_releases(
+        self, tmp_path, monkeypatch
+    ):
+        """The fail-closed contract must survive the new dispatch.
+
+        ``run_config_write`` awaits the worker through ``asyncio.shield``, so a
+        writer exception has to propagate unchanged for the 500 arm to stay
+        reachable -- and the lock must not be stranded on that path.
+        """
+        from kiro_crew.dashboard.handlers import updates
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        path = tmp_path / "config.json"
+        torn = json.dumps(_REAL_SETTINGS, indent=2)[:-20]
+        path.write_text(torn, encoding="utf-8")
+        monkeypatch.setattr(updates, "config_path", lambda: path)
+
+        resp = await updates.api_update_auto(self._Req())
+        assert resp.status == 500
+        assert path.read_text(encoding="utf-8") == torn
+        assert not _get_config_lock().locked()
+
+    def test_the_dispatch_cannot_regress_to_a_one_lock_offload(self):
+        """Static guard so nobody reintroduces the bare offload silently.
+
+        The behavioural tests above prove the lock is held today. This names the
+        site if the dispatch is ever changed back, and it is written as an AST
+        walk rather than a substring search so a reformat cannot defeat it.
+        """
+        from kiro_crew.dashboard.handlers import updates
+
+        source = Path(inspect.getsourcefile(updates)).read_text(encoding="utf-8")
+        offenders = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and func.attr == "to_thread"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "asyncio"
+            ):
+                continue
+            for arg in node.args:
+                if isinstance(arg, ast.Name) and arg.id == "update_config_locked":
+                    offenders.append(func.lineno)
+        assert not offenders, (
+            "update_config_locked dispatched with a bare asyncio.to_thread at "
+            f"updates.py:{offenders} -- that holds only the sidecar flock; use "
+            "run_config_write, which holds both config locks"
+        )
+
+    def test_the_ratchet_can_actually_fail(self):
+        """A scan that matches nothing passes vacuously; prove it does not."""
+        tree = ast.parse(
+            "import asyncio\n"
+            "async def f():\n"
+            "    await asyncio.to_thread(update_config_locked, p, mutate=m)\n"
+        )
+        found = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "to_thread"
+            and any(isinstance(a, ast.Name) and a.id == "update_config_locked" for a in n.args)
+        ]
+        assert len(found) == 1

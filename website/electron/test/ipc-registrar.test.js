@@ -49,6 +49,7 @@ const SHELL_LISTENERS = [
   "badge:set",
   "dev-mode-changed",
   "focus-mode-chrome",
+  "focus-mode-watch-cursor",
   "memory-sample",
   "mic:denied",
   "theme-accent-changed",
@@ -285,6 +286,7 @@ function harness({
     chrome: {
       setThemeAccent: recordWindow("chrome.setThemeAccent"),
       focusMode: recordWindow("chrome.focusMode"),
+      watchFocusCursor: recordWindow("chrome.watchFocusCursor"),
       windowControl: recordWindow("chrome.windowControl"),
       setThemeMode: recordWindow("chrome.setThemeMode"),
       setTitlebarMode: recordWindow("chrome.setTitlebarMode"),
@@ -452,13 +454,13 @@ test("registerShell owns the exact shell channel set and is idempotent", () => {
 
   assert.deepEqual([...h.handlers.keys()].sort(), SHELL_HANDLES);
   assert.deepEqual([...h.listeners.keys()].sort(), SHELL_LISTENERS);
-  assert.equal(h.handlers.size + h.listeners.size, 35);
+  assert.equal(h.handlers.size + h.listeners.size, 36);
 
   // boot-complete is a further non-update host channel, but it is deliberately
   // gateway-owned and scoped to a single connecting WebContents. Registering it
   // globally here would weaken its sender check and leak listeners.
   assert.match(GATEWAY_SOURCE, /ipcMain\.on\("boot-complete", onComplete\)/);
-  assert.equal(h.handlers.size + h.listeners.size + 1, 36);
+  assert.equal(h.handlers.size + h.listeners.size + 1, 37);
   assert.equal(h.handlers.has("boot-complete"), false);
   assert.equal(h.listeners.has("boot-complete"), false);
 
@@ -517,6 +519,7 @@ test("shell handlers preserve sender, argument, and return shapes", async () => 
   const chromeCases = [
     ["theme-accent-changed", "chrome.setThemeAccent", ["#8E48FF"]],
     ["focus-mode-chrome", "chrome.focusMode", [sender, false]],
+    ["focus-mode-watch-cursor", "chrome.watchFocusCursor", [sender, true]],
     ["window-control", "chrome.windowControl", [sender, "maximize", senderFrame]],
     ["theme-mode-changed", "chrome.setThemeMode", ["dark"]],
     ["titlebar-overlay-theme", "chrome.setTitlebarMode", ["light"]],

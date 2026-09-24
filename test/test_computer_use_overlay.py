@@ -417,8 +417,8 @@ class TestSupervisorLifecycle:
         overlay = CursorOverlay()
         await overlay.move_to(1.0, 1.0)
         argv = spawned["argv"][0]
-        assert argv[1:] == ("-s", "-m", OVERLAY_MODULE)
-        assert "kiro_crew.computer_use" in argv[3]
+        assert argv[1:] == ("-s", "-P", "-m", OVERLAY_MODULE)
+        assert "kiro_crew.computer_use" in argv[4]
 
     @pytest.mark.asyncio
     async def test_spawn_uses_the_platform_compat_isolation_flags(self, enabled, spawned):

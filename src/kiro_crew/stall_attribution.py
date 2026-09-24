@@ -187,6 +187,17 @@ def attribute_dump(dump_path: Path, cron_base_dir: Path) -> StallAttribution:
             attribution.unrelated_abandoned.append(marker)
         # else: a foreign-domain marker this host cannot judge -- neither
         # evidence for this dump nor a run known to be dead; left alone.
+    # Markers are one file per RUN (``cron_inflight.marker_path``): a cancelled
+    # run's finalizer may still be pending when a replacement run of the same
+    # job writes its own, so a hard exit in that window leaves two files for
+    # one job. They are one piece of evidence -- the job -- and the newest
+    # start is the run that was in flight; two candidates for one job must not
+    # read as "several jobs in flight" and pause nothing.
+    attribution.candidates = _one_per_job(attribution.candidates)
+    named = {m.job_id for m in attribution.candidates}
+    attribution.unrelated_abandoned = _one_per_job(
+        [m for m in attribution.unrelated_abandoned if m.job_id not in named]
+    )
     # The cron service's breaker sweeps the abandoned markers on the boot after
     # the crash, and the doctor runs later: what it read is kept in a record
     # beside them, keyed by the dump. Live markers, if any survived, win.
@@ -203,6 +214,16 @@ def attribute_dump(dump_path: Path, cron_base_dir: Path) -> StallAttribution:
                 seen.add(marker.job_id)
         attribution.candidates.sort(key=lambda m: m.started_at)
     return attribution
+
+
+def _one_per_job(markers: list[RunningMarker]) -> list[RunningMarker]:
+    """One marker per job id -- the newest start -- in start order."""
+    newest: dict[str, RunningMarker] = {}
+    for marker in markers:
+        current = newest.get(marker.job_id)
+        if current is None or marker.started_at > current.started_at:
+            newest[marker.job_id] = marker
+    return sorted(newest.values(), key=lambda m: m.started_at)
 
 
 def attribute_latest_stall(

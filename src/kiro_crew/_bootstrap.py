@@ -41,11 +41,12 @@ from pathlib import Path
 from typing import Callable
 
 # Module scope, not function-local: these are the only package imports this file
-# can safely make at import time. dep_sync imports the standard library only
-# (asserted by a test) and `__version__` needs nothing beyond the package
-# itself (`kiro_crew.__init__` imports only the standard library), so neither
-# can raise the ModuleNotFoundError this file exists to heal.
+# can safely make at import time. dep_sync and stdlib_shadow import the standard
+# library only (each asserted by a test) and `__version__` needs nothing beyond
+# the package itself (`kiro_crew.__init__` imports only the standard library), so
+# none can raise the ModuleNotFoundError this file exists to heal.
 from kiro_crew import __version__, dep_sync
+from kiro_crew.stdlib_shadow import refuse_if_stdlib_shadowed
 
 _PIP_TIMEOUT_SECS = 300
 
@@ -109,6 +110,11 @@ def _self_heal(missing: str) -> bool:
 
 def main() -> None:
     """Import the real CLI, self-healing a stale editable install once."""
+    # A stdlib name resolving from the launch directory, PYTHONPATH or a
+    # site-packages tree is refused here, before `--version` and before the
+    # CLI import: the shadow is already loaded (`kiro_crew.__init__` imports
+    # asyncio), so nothing later can be trusted to fail in a readable way.
+    refuse_if_stdlib_shadowed()
     # Fast-path for bare `--version`: skip importing `kiro_crew.cli` (~250ms
     # of module-scope imports `--version` never uses) on the console-script
     # path. Mirrored by the `__main__` guard for `python -m`; only the bare

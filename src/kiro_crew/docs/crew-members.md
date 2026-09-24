@@ -69,7 +69,10 @@ over an ordinary session — the context you built up with it is where you left 
 Member threads are deliberately kept out of the Sessions list; the Crew Members
 page is their only home. The right-hand panel is the same one the chat page
 docks, so Files, Artifacts, Terminal and Browser all work against the thread,
-and its first tab is a read-only **Crew summary** of what the crewmate uses.
+and it opens on three crewmate tabs: **Notes** (what it learned — its own
+standing notes, read-only here), **Work log** (what it did) and **Dashboard**
+(the page it publishes itself). Setup — template, wake sources, memory, cloud —
+lives on the crewmate's detail page, not in the panel.
 
 A few situations make Kiro Crew refuse to open a thread rather than guess:
 
@@ -133,7 +136,7 @@ restore treat it.
 |---|---|
 | Crewmate | A named assistant of yours: template + workspace + memory + model. Picking one runs work as that crewmate, on its memory. |
 | Agent template | A shared spec in `~/.kiro/agents/`. Picking a template runs the shared template on the shared default memory and creates no crewmate. The chat agent picker groups the two separately for exactly this reason. |
-| Remote instance | Another Kiro Crew gateway this dashboard can reach, under **Settings → Instances**. A different machine, not a different assistant. |
+| Remote crew | Another Kiro Crew gateway this dashboard can reach, under **Settings → Remote Crew**. A different machine, not a different assistant. |
 
 ## Where you can pick a crewmate
 

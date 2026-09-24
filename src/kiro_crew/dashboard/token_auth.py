@@ -439,6 +439,14 @@ _state: TokenStateManager = TokenStateManager(max_concurrent_nonces=MAX_CONCURRE
 # so artifact and widget frames load a real document instead. See
 # dashboard/handlers/sandbox_doc.py for the full security model.
 # Same exposure class as /assets/: static non-secret files.
+# /browser-view/ is the same-origin relay for the Playwright CLI browser view:
+# auth is the per-instance capability token embedded in the path, minted by
+# the view supervisor and disclosed only through the cookie-authed, owner-gated
+# /api/browser/view payload (the panel frames the relay in an opaque-origin
+# sandbox that carries no cookies, exactly like /artifact-app/ above). The
+# relay constant-time-compares the token BEFORE running its per-request
+# ownership probes and answers a uniform 404 without it. See
+# dashboard/handlers/browser_view_relay.py for the full security model.
 _BYPASS_PREFIXES = (
     "/assets/",
     "/static/",
@@ -446,12 +454,20 @@ _BYPASS_PREFIXES = (
     "/vendor/",
     "/artifact-app/",
     "/sandbox-doc/",
+    "/browser-view/",
 )
 _BYPASS_EXACT = {
     "/logo.png",
     # Alias of /logo.png for clients that hardcode the favicon path instead of
     # parsing <link rel="icon"> — same handler, same static-asset exposure.
     "/favicon.ico",
+    # The bare relay path (no trailing slash, so the /browser-view/ prefix
+    # above misses it). It is a registered relay route carrying no token
+    # segment, and the relay's contract is a UNIFORM 404 for every tokenless
+    # or wrong-token request — without this entry the middleware answers 403
+    # first, handing an unauthenticated prober a response that distinguishes
+    # the bare path from the tokened misses.
+    "/browser-view",
     "/manifest.json",
     "/sw.js",
     "/pcm-worklet.js",
@@ -620,6 +636,12 @@ SPA_FALLBACK_EXCLUDED_PREFIXES = (
     # 200 and render nothing, and a future non-/api GET registered beside it in
     # routes/realtime.py would inherit the same silent fallback.
     "/feature-videos/",
+    # The browser-view relay (handlers/browser_view_relay.py). A data route
+    # authenticated by its own capability path token: its handler must always
+    # answer — the uniform 404 without the token, the proxied view with it —
+    # never the SPA shell, which would render the dashboard inside the
+    # Browser panel's own frame.
+    "/browser-view",
 )
 
 # App window entries (`/app-windows/<app>/<name>.html`) are their own Vite bundles, served
@@ -2023,7 +2045,7 @@ def caller_names_a_missing_slot(slots: object, session_key: str) -> bool:
 #: widen — the point of the header is that a NEW internal caller surfaces as
 #: ``unknown-internal`` in the audit until someone decides what to call it,
 #: instead of silently inheriting another component's label.
-KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard", "kirocrew-crew-log"})
+KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard", "kirocrew-crew-log", "kirocrew-debug"})
 
 
 def request_origin(
@@ -2176,6 +2198,44 @@ def effective_request_app(state: object, request: web.Request) -> str:
         getattr(state, "_slots", None),
         request.headers.get("X-Session-Key", ""),
     )
+
+
+#: Request key under which the chat folder/tag gate
+#: (``handlers/_shared.py``'s ``private_chat_route_refusal``) stamps the VERIFIED
+#: member principal (``member:<store>``) when it admits a member caller. The
+#: constant lives HERE, the lowest layer, so the gate that writes it and
+#: :func:`folder_principal` that reads it share one key and cannot drift.
+MEMBER_CHAT_PRINCIPAL_KEY = "member_chat_principal"
+
+
+def folder_principal(state: object, request: web.Request) -> str:
+    """The principal that owns a folder written by *request*, or ``""``.
+
+    The generalisation of :func:`effective_request_app` from "which app" to
+    "which non-person principal", so the chat-folder tree fence
+    (``chat_folders``' ``owner_app`` comparisons) can be one uniform check
+    across app AND crew-member callers instead of two:
+
+    * an APP caller -> its bare app name, EXACTLY what
+      :func:`effective_request_app` returns and what ``owner_app`` has always
+      stored, so every folder written before members existed keeps its meaning
+      and no migration is needed;
+    * an admitted crew MEMBER caller -> ``"member:<store>"``, read from the
+      principal the gate already stamped on the VERIFIED scope (never a second
+      config read on the event loop, never a body value). App names are
+      validated identifiers that never begin ``member:``, so the two principal
+      spaces cannot collide;
+    * the person -> ``""`` (absent/empty ``owner_app``), unchanged.
+
+    Ordering matters: the app claim is checked FIRST. A member never carries an
+    app claim (``request["app"]`` is set only for a resolved app), so the two
+    arms are mutually exclusive, but checking the app first keeps an app's
+    principal byte-identical to what it was.
+    """
+    app = effective_request_app(state, request)
+    if app:
+        return app
+    return str(request.get(MEMBER_CHAT_PRINCIPAL_KEY) or "")
 
 
 def _cron_job_owner(jobs: object, job_id: str) -> str:

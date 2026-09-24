@@ -204,6 +204,12 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 # one leaf list means a new secret is added once and covered in both locations.
 _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
 _CREW_SECRET_LEAVES: list[str] = [
+    # Gateway diagnostics, for the reason the sandbox mask gives: the rows carry
+    # frame labels, folded stacks and process detail, and the owner-gated read
+    # routes redact them on the way out while the files themselves do not. A file
+    # tool reading the directory would bypass that filter. Whole directory: the
+    # day files rotate by name.
+    "diag",
     ".env",
     # Owner-authored meetings edits are deliberately outside the meeting
     # directories agents write. They are returned verbatim to the owner and may
@@ -349,6 +355,22 @@ _CREW_SECRET_LEAVES: list[str] = [
     # straight off disk, and a corrupted record reads as ABSENT to the store —
     # silent loss the conductor cannot see. No legitimate file-tool reader.
     "work-ledger",
+    # The cross-process work root (``work_root``). Not credentials either: the
+    # hazard is WRITE, and it is specific to this root's deterministic keys. A key
+    # is an issue or pull-request number so a later run can compute it again, so a
+    # name here is GUESSABLE in a way a random-suffixed scratch name is not. An
+    # unmarked directory at a key is refused rather than adopted, but the marker
+    # that lifts that refusal is a NAME IN THE CODE, so a writer inside this root
+    # can plant the tree and the marker together and ``allocate_work`` then rejoins
+    # it. Without this entry an agent's auto-approved file tools are such a writer:
+    # they could furnish a key some job will use, and that job would take the
+    # planted contents as its own prior state. The sandbox mask on the same leaf
+    # stops a spawned subprocess; this entry stops the file tools, and the root
+    # needs both because either alone leaves the other path open. The ``scratch``
+    # root is deliberately NOT here: it is the agent's own sanctioned write area,
+    # named to it by ``$KIROCREW_SCRATCH``. ``work_root`` opens these paths directly
+    # rather than through this gate, so the sweep and every consumer keep working.
+    "work",
     # Every append-only per-unit crew log, crew and session alike (crew_log/store.py).
     # Not credentials, but the design's whole premise is that the crew log is the
     # AUTHORITY and the context window only a cache: a conductor reads a unit's
@@ -500,6 +522,13 @@ _CREW_SECRET_LEAVES: list[str] = [
     # the OS-sandbox counterpart is ``sandbox._CREW_HIDDEN_LEAVES``. Only the
     # gateway opens the path.
     "tag-grants",
+    # Crewmate teams (``crew_teams.py``): the owner's grouping of the roster. Not
+    # a secret, but it decides which team view a crewmate's questions and work
+    # roll up into, and a crewmate must not be able to move itself or a sibling.
+    # Whole directory (``atomic_write`` temp sibling); the OS-sandbox counterpart
+    # is ``sandbox._CREW_HIDDEN_LEAVES``. Opened only by the gateway and by the
+    # operator's own ``kirocrew agent create`` / ``delete``, never by an agent tool.
+    "crew-teams",
     # The operator's OAuth consent-endpoint extension
     # ({additional_authorization_endpoints: [{host, path}]}). Each entry widens
     # the banner-only OAuth entropy carve-out (_OAUTH_AUTHORIZATION_ENDPOINTS),
@@ -605,9 +634,9 @@ _CREW_SECRET_LEAVES: list[str] = [
     # unintended-account outcome the gate exists to prevent. Reading it is
     # fenced too: the file names the account id and caller ARN that a profile
     # resolves to, which is reconnaissance an agent should not get for free from
-    # the shared gate. The authenticated dashboard ``/api/aws/consent`` handler
-    # and the ``kirocrew aws-consent`` CLI are the only writers and open the
-    # path directly, not through this gate, so both keep working.
+    # the shared gate. The authenticated dashboard ``/api/aws/consent`` handler is
+    # the only writer and opens the path directly, not through this gate, so it
+    # keeps working.
     "aws_service_consent.json",
     # Recorded consent to send conversation state to the external decision
     # provider (Jev). Same class of control as ``aws_service_consent.json``
@@ -1391,7 +1420,8 @@ class PathResolutionStalled(RuntimeError):
 
 
 def _stall_prefix(expanded: str) -> str:
-    """The path prefix a stall is charged to: the first two components.
+    """The path prefix a stall is charged to: the first two components, extended
+    by one when the second names a container of home directories.
 
     A wedged mount stalls everything beneath its mount point, and mount points
     sit at depth one or two (``/home/<user>`` autofs, ``/Volumes/<share>``,
@@ -1410,6 +1440,30 @@ def _stall_prefix(expanded: str) -> str:
     the profile refused path resolution for essentially the whole host -- the exact
     opposite of the per-mount isolation this function exists to provide.
 
+    **The key never ENDS on a container of homes**, a component spelled ``home``.
+    A host whose homes sit one level deeper than ``/home`` reproduces the
+    ``C:\\Users`` collapse on POSIX: two components of ``/local/home/<user>/ws/f``
+    is ``/local/home``, which holds every user, every workspace and checkout, the
+    data home and the credential stores, so one stall anywhere under it refused
+    path resolution for the whole host (kirodotdev/KiroCrew#12386).  When the
+    second component is such a container the key takes one more, so the boundary
+    is the home directory itself -- ``/local/home/<user>`` -- exactly the key a
+    ``/home/<user>`` layout already gets.  Every other key is unchanged, and the
+    container alone (``/local/home``) stays its own key.
+
+    The rule is lexical, like the rest of this function: it must not touch the
+    filesystem, because it is consulted BEFORE deciding whether to probe at all
+    and it names the prefix charged when the ``$HOME`` anchor itself stalls.  A
+    mount-derived key (``os.path.ismount`` walked upward) would both ``lstat``
+    the very mount that may be wedged and, on a single-filesystem host, reach
+    ``/`` -- a process-wide key, worse than the collapse.  The price of a lexical
+    key stands: two spellings of one tree (``/home/<user>`` and its
+    ``/local/home/<user>`` target) remain two keys, each paying its own timeout.
+    And when the container is itself ONE wedged mount (an NFS ``/export/home``),
+    each user's tree pays its own timeout and pins its own worker -- the cost a
+    ``/home/<user>`` autofs layout already carries per user, bounded the same
+    way, by the pool size -- in exchange for the isolation this key exists for.
+
     A UNC share root is returned whole: ``\\\\server\\share`` IS the mount point,
     and ``splitdrive`` already reports it as the drive, so no component of the
     remainder belongs in the key.
@@ -1420,6 +1474,17 @@ def _stall_prefix(expanded: str) -> str:
         return drive
     parts = rest.split(os.sep)
     keep = 3 if parts and parts[0] == "" else 2  # leading "" for an absolute path
+    # A component spelled ``home`` is a CONTAINER of home directories, never a home:
+    # ``/home/<user>`` is the common layout, and the layouts that put the homes one
+    # level deeper all keep the word -- ``/local/home/<user>`` on a cloud desktop
+    # (where ``/home/<user>`` is a symlink into it), ``/usr/home`` on FreeBSD,
+    # ``/var/home`` on Fedora Silverblue, ``/export/home`` on Solaris and NFS
+    # servers.  ``Users`` needs no entry: it only ever sits at depth one
+    # (``/Users/<user>``, ``C:\Users\<user>``), where the key already ends on the
+    # user.  Matched exactly: the container is spelled by the OS or the
+    # administrator, not by the agent.
+    if len(parts) > keep and parts[keep - 1] == "home":
+        keep += 1  # the container holds every user: key on the home beneath it
     return (drive + os.sep.join(parts[:keep])) or normalized
 
 
@@ -1921,6 +1986,87 @@ def _candidate_forms(
     return candidates
 
 
+class _BuiltTargets(set[str]):
+    """The target set, plus whether building it traversed a symlink.
+
+    A plain ``set`` wherever it is consumed -- membership, iteration, equality
+    and the casefold contract are all unchanged -- carrying one extra fact that
+    only the CACHE needs and no matcher does: did any path this build actually
+    RESOLVED come back spelled differently from the path it was asked about.
+
+    WHICH paths those are is the entire scope of the flag, so they are named here
+    rather than left to be read as "every target". The build resolves five classes
+    of path and no others: ``$HOME``, ``KIROCREW_OS_HOME``, each entry of the
+    CALLER'S ``home_dirs`` list that carries a crew prefix, re-anchored under
+    ``KIROCREW_HOME``, the agents dir under ``KIRO_HOME``, and each harness
+    credential leaf re-anchored under its own home override. Every
+    other member of the set comes from ``_anchor`` or
+    ``_anchor_both_separators``, neither of which touches the filesystem, so the
+    bulk of the set cannot report a traversal at all.
+
+    An ordinary symlinked dotfile under ``$HOME`` can set this flag, and a
+    dotfile-managed home is therefore a case to look for. The trigger is the union
+    this build already resolves: a crew-prefixed entry of the caller's
+    ``home_dirs`` under ``KIROCREW_HOME``, the agents dir under ``KIRO_HOME``, or a
+    DECLARED credential leaf under whichever harness variable relocates it. So a
+    symlinked ``sessions`` or ``models`` leaf under a ``KIROCREW_HOME`` that sits
+    below ``$HOME`` pins the write tier, and a symlinked ``goose`` directory under
+    whatever ``XDG_CONFIG_HOME`` resolves to pins the tier handed that leaf. Read
+    that second one literally: the leaf resolved is
+    ``$XDG_CONFIG_HOME/goose/secrets.yaml``, so it is the exported root that has to
+    contain the symlink. A host whose ``XDG_CONFIG_HOME`` points somewhere other
+    than ``~/.config`` can symlink ``~/.config/goose`` all it likes and no build
+    will resolve it. What CANNOT set it is a dotfile in none of those classes,
+    because the bulk targets are never resolved. The roots themselves cannot
+    either: ``_resolve_root_anchors`` canonicalises every root first, so the
+    symlink has to sit BELOW the resolved root -- which is why relocating the
+    exported config root alone does not trip it while a symlinked ``goose``
+    directory under it does.
+
+    The LEAF-BEARING override roots are ``KIROCREW_HOME``, ``KIRO_HOME``, and every
+    variable in ``host_auth.home_override_env_vars()``. That table is the
+    enumeration; naming the variables or their count here would be a second place
+    to forget the next harness, which is the documentation defect this docstring
+    exists to remove. ``_OVERRIDE_ROOT_ENVS`` carries one more root,
+    ``KIROCREW_OS_HOME``, which is resolved as a root but bears no leaf class of
+    its own -- its entries are joined lexically by ``_anchor_both_separators``.
+
+    The crew-prefix class is the caller's list, not a fixed set of leaves. The
+    crew-prefix arm loops over the ``home_dirs`` it was handed and resolves every
+    entry carrying a prefix, and the three callers hand it three different lists:
+    the read gate passes ``_SENSITIVE_HOME_DIRS``, ``is_sensitive_write_path``
+    passes ``_SENSITIVE_HOME_DIRS + _WRITE_PROTECTED_HOME_PATHS``, and
+    ``_is_keystone_publish_artifact`` passes ``_KEYSTONE_ARTIFACT_PARENTS``. So no
+    one class of leaf describes the resolved population: on the write tier a
+    symlinked write-protected crew leaf that holds no secret sets the flag too,
+    and the three builds can disagree about it on one host.
+
+    That fact is what bounds the deeper-leaf staleness the target cache always
+    carried. A resolved path that comes back different came through a symlink at
+    or below a resolved root, and THAT is the entry a repoint can move out from
+    under a cached set. When nothing resolved differently there is no
+    resolution-derived entry to go stale, so the long adaptive expiry is safe;
+    when one did, the expiry is pinned to the floor. See
+    :func:`_home_targets_ttl`.
+
+    The roots cannot trip it. Every root reaching the builder is already
+    canonical (:func:`_resolve_root_anchors` resolved them), so re-resolving one
+    returns the same string -- which matters on a host where ``$HOME`` is itself
+    a symlink, because flagging that would pin the floor on every cloud desktop
+    and the adaptive expiry would never apply anywhere.
+
+    Carried as an ATTRIBUTE rather than a second return value because
+    ``_home_dir_targets_uncached`` has several callers and three test doubles. A
+    widened signature would break each of them, whereas a double that returns a
+    plain ``set`` simply lacks the attribute and reads as the class default
+    below -- ``True``, the fail-safe answer, which selects the floor.
+    """
+
+    #: Fail-safe: an unknown build is treated as having traversed a symlink, so a
+    #: caller that cannot prove otherwise gets the short expiry.
+    resolution_differed: bool = True
+
+
 def _home_dir_targets_uncached(
     home_dirs: list[str],
     roots: _ResolvedRoots | None = None,
@@ -2097,7 +2243,24 @@ def _home_dir_targets_uncached(
             _full_real = resolve_target(_full)
             if _full_real is not None:
                 sensitive_targets.add(_full_real.casefold())
-    return sensitive_targets
+    # Did any path this build resolved come through a symlink? Read off the memo
+    # this build already filled -- the five classes named on ``_BuiltTargets``, so
+    # one entry on a host with no home override set and about eighty with every one
+    # set -- which costs one pass over that dict and no extra filesystem work: the
+    # resolutions themselves are the expense and they have already happened. The
+    # bulk of the set never appears here, because ``_anchor`` and
+    # ``_anchor_both_separators`` build it without resolving anything. Normalised
+    # on both sides so a separator or case
+    # difference cannot read as a symlink; a false positive here is merely the
+    # short expiry, a false negative would be the stale window this bounds.
+    differed = any(
+        value is not None
+        and os.path.normcase(os.path.normpath(value)) != os.path.normcase(os.path.normpath(key))
+        for key, value in resolved_paths.items()
+    )
+    built = _BuiltTargets(sensitive_targets)
+    built.resolution_differed = differed
+    return built
 
 
 # How long a built target set stays reusable. ``_home_dir_targets_uncached``
@@ -2110,7 +2273,7 @@ def _home_dir_targets_uncached(
 # Deliberately TTL-bounded rather than a plain ``lru_cache``: part of the set is
 # derived from FILESYSTEM state, so an unbounded cache would keep matching a
 # stale target if a symlink were repointed after the cache warmed — a gate that
-# fails OPEN. A few seconds bounds that window.
+# fails OPEN. ``_HOME_TARGETS_TTL_MAX_SECS`` bounds that window.
 #
 # The key is built from the RESOLVED roots (``Path.home().resolve()`` and the
 # resolved ``KIROCREW_HOME``), NOT from the raw env vars, because those two
@@ -2138,14 +2301,245 @@ def _home_dir_targets_uncached(
 # them.
 #
 # The TTL is therefore sized as small as it can be while still doing its job.
-# The value is 0.1s, NOT a "few seconds", because a skills walk issues thousands
+# The FLOOR is 0.1s, NOT a "few seconds", because a skills walk issues thousands
 # of calls in a burst and one build serves the whole burst either way. Measured
-# cold-walk cost against this constant:
+# cold-walk cost against a FIXED constant, on an idle interpreter:
 #     5.0s -> 0.95s    1.0s -> 0.93s    0.1s -> 0.95s    0.0s -> 4.66s
 # So 0.1s keeps the entire win while cutting the stale window 50x versus 5.0s.
 # Only 0.0 (no cache) closes the window completely, and that reverts to the 4.7s
-# scan whose GIL-held cost wedges the event loop — the defect this exists to fix.
+# scan whose GIL-held cost wedges the event loop -- the defect this exists to fix.
 _HOME_TARGETS_TTL_SECS = 0.1
+
+# ---------------------------------------------------------------------------
+# Why the expiry is not that floor alone.
+#
+# 0.1s was chosen against an IDLE interpreter, where one rebuild costs ~2ms, so
+# the cache spends ~2% of the wall clock rebuilding. But the rebuild is ~130
+# ``os.path.realpath`` calls and each syscall releases and re-acquires the GIL,
+# so its cost is set by CONTENTION, not by the disk. Measured on this repo's own
+# anchors -- 64-core Linux, local xfs, one mount, ``sys.getswitchinterval()``
+# 5ms -- with N sibling threads running pure Python:
+#     0 -> 2ms    1 -> 581ms    2 -> 399ms    4 -> 3859ms    8 -> 7456ms
+# A fixed 0.1s expiry does not move with that, so the share of the wall clock
+# spent rebuilding rises with load until the rebuild misses
+# ``_PATH_RESOLVE_REBUILD_TIMEOUT_SECS`` and the gate refuses ordinary project
+# files. That is the reported defect, and the filesystem is healthy throughout.
+#
+# So the expiry tracks the MEASURED cost of the build it is expiring:
+#
+#     ttl = clamp(last rebuild seconds * _HOME_TARGETS_TTL_COST_RATIO,
+#                 _HOME_TARGETS_TTL_SECS, _HOME_TARGETS_TTL_MAX_SECS)
+#
+# The ratio is the reciprocal of the share of the wall clock the gate may spend
+# rebuilding, so that share is held at ``1 / ratio`` at EVERY load level rather
+# than only at the one the constant was picked on. The rebuild's own duration is
+# the load signal, so no separate load metric is read and nothing has to be
+# configured per host.
+#
+# WHAT THIS DOES NOT FIX, stated rather than implied: an expiry controls how
+# OFTEN the rebuild is paid, never what ONE costs. Past roughly four contending
+# threads a single COLD rebuild already exceeds its own budget, and there every
+# expiry refuses alike -- measured, see ``scripts/measure_path_gate_ttl.py``.
+# Only a resolver outside this interpreter's GIL closes that case. This law's
+# job is narrower: it stops re-paying the contended cost every 100ms.
+#
+# THE TRADE, stated plainly: a longer expiry lengthens the window in which a
+# symlink swapped DEEPER inside the crew home (a keystone leaf, or an
+# intermediate directory on the way to one) is still answered from the stale
+# set -- the residual named above, now bounded by ``_HOME_TARGETS_TTL_MAX_SECS``
+# rather than by 0.1s. It does NOT widen the two reproduced bypasses, because
+# both repoint an ANCHOR and every anchor is part of the cache KEY: a repointed
+# ``$HOME`` or ``KIROCREW_HOME`` re-keys and misses the cache at any expiry,
+# which ``test_repointed_home_symlink_is_not_served_from_cache_at_the_longest_expiry``
+# pins at the maximum expiry as well as at the floor.
+#
+# Both inputs are NAMED constants, each pinned by a test, and each an OPERATOR
+# KNOB read once at import and fail-soft to its reviewed default:
+# ``KIROCREW_PATH_GATE_TTL_COST_RATIO`` and ``KIROCREW_PATH_GATE_TTL_MAX_SECS``.
+# So a host can trade the two the other way, or revert to one fixed 0.1s expiry
+# with a ratio of 0, without a release and without patching this file.
+# ---------------------------------------------------------------------------
+
+#: Environment overrides for the two inputs below, and the bounds each accepts.
+#: Read ONCE at import, like the resolver pool size: these size a cache that is
+#: already live by the first gate call, so a mid-run change would leave entries
+#: written under one policy being judged by another.
+_TTL_COST_RATIO_ENV = "KIROCREW_PATH_GATE_TTL_COST_RATIO"
+_TTL_COST_RATIO_DEFAULT = 50.0
+#: 0 is the REVERT: zero times any cost clamps to the floor for every input, so
+#: ``KIROCREW_PATH_GATE_TTL_COST_RATIO=0`` pins one fixed 0.1s expiry at every
+#: load level. That is deliberately the only spelling of the revert -- a separate
+#: private boolean said the same thing while being unreachable from outside the
+#: package, which made "operator lever" untrue. Above 1000 the clamp makes every
+#: load level select the ceiling anyway, so a larger value expresses nothing this
+#: cannot.
+_TTL_COST_RATIO_MIN = 0.0
+_TTL_COST_RATIO_MAX = 1000.0
+_TTL_MAX_SECS_ENV = "KIROCREW_PATH_GATE_TTL_MAX_SECS"
+_TTL_MAX_SECS_DEFAULT = 30.0
+#: The ceiling an operator may raise the ceiling TO. The measurement justifies
+#: nothing above about a minute -- that is the longest expiry the default ratio
+#: asks for at the heaviest load the gate can still serve, and past that load no
+#: expiry helps at all -- so 300s leaves generous headroom while refusing a value
+#: that could only widen the stale window. The floor is the shipped floor: a
+#: ceiling below it would invert the clamp.
+_TTL_MAX_SECS_MIN = 0.1
+_TTL_MAX_SECS_MAX = 300.0
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    """Read a float operator knob, falling back to *default*.
+
+    Fail-soft TO THE DEFAULT in every failure mode -- absent, unparseable, out of
+    range -- which is the conservative direction for both callers: the shipped
+    ratio and the shipped ceiling are the reviewed values, so a bad override can
+    only leave the reviewed behaviour in place and never widen the stale window
+    the ceiling bounds.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using the default of %s", name, raw, default)
+        return default
+    if not minimum <= value <= maximum:
+        logger.warning(
+            "%s=%s is outside %s..%s; using the default of %s",
+            name,
+            value,
+            minimum,
+            maximum,
+            default,
+        )
+        return default
+    return value
+
+
+#: Reciprocal of the share of the wall clock the gate may spend rebuilding
+#: anchors. 50 holds that share at 2%, and it is the value at which an idle
+#: interpreter selects the same 0.1s EXPIRY it selects today (2ms * 50 = the floor).
+#: Only that duration is unchanged: an entry's total age is the expiry plus the build
+#: that measured it, which for a 2ms build is the same to within those 2ms. So the
+#: default is observationally identical on an unloaded host, by arithmetic rather
+#: than by measurement.
+#: Chosen as the SMALLEST ratio that refused nothing and paid the fewest
+#: rebuilds at every load level the gate can still serve -- the same rule that
+#: chose the floor, applied to the ratio. Larger ratios paid no fewer rebuilds
+#: and only lengthened the stale window.
+_HOME_TARGETS_TTL_COST_RATIO = _env_float(
+    _TTL_COST_RATIO_ENV, _TTL_COST_RATIO_DEFAULT, _TTL_COST_RATIO_MIN, _TTL_COST_RATIO_MAX
+)
+
+#: Hard ceiling on the expiry, and therefore THE WORST-CASE STALE WINDOW for the
+#: deeper-leaf residual described above: 30 seconds, and never longer by any
+#: path through this module. Deliberately NOT derived from the ratio: at high
+#: contention the ratio asks for minutes (a 7.5s rebuild wants 375s), and this
+#: gives up the 2% share there rather than give up the freshness bound. Sized to
+#: cover what the load levels the gate can still SERVE actually ask for -- a 0.4s
+#: rebuild under two contending threads asks for 20s -- so the clamp binds only
+#: where a single cold rebuild is already at its own budget and no expiry helps.
+_HOME_TARGETS_TTL_MAX_SECS = _env_float(
+    _TTL_MAX_SECS_ENV, _TTL_MAX_SECS_DEFAULT, _TTL_MAX_SECS_MIN, _TTL_MAX_SECS_MAX
+)
+
+
+def _home_targets_ttl(rebuild_secs: float, *, resolution_differed: bool = True) -> float:
+    """How long a target set that took *rebuild_secs* to build stays reusable.
+
+    See the block above the constants for why this is a function of the build's
+    own cost rather than a constant.  *rebuild_secs* is the WALL time the cache
+    fill took, pool queue wait included: the caller blocked for all of it, and a
+    saturated pool is exactly a state in which refreshing less often is correct,
+    so the queue is part of the cost being amortised rather than noise to
+    subtract.
+
+    *resolution_differed* is what keeps the long expiry off the one class of
+    install it could hurt.  True means one of the paths the build RESOLVED came
+    back spelled differently -- in practice a symlinked leaf under a home-override
+    root, which is the whole population :class:`_BuiltTargets` enumerates -- and
+    that resolution-derived entry is exactly what a repoint can move out from
+    under a cached set, the deeper-leaf residual.  There the expiry is
+    pinned to the floor, so that window stays at 0.1s and does not grow.  False
+    means nothing resolved differently, so the set holds nothing a repoint can
+    stale WITHOUT first creating a symlink inside the crew home, which is a write
+    the write gate refuses; the adaptive expiry applies.  It defaults to True so
+    every caller that cannot prove otherwise gets the short expiry.
+
+    A STALLED rebuild never reaches here -- it raises and no entry is written --
+    so a dead mount cannot inflate the expiry.  A zero or negative duration (a
+    coarse clock, or a frozen one in tests) yields the floor, and so does a
+    ratio of zero, which is how an operator pins one fixed 0.1s expiry at every
+    load level.
+    """
+    if resolution_differed:
+        return _HOME_TARGETS_TTL_SECS
+    scaled = rebuild_secs * _HOME_TARGETS_TTL_COST_RATIO
+    return min(max(scaled, _HOME_TARGETS_TTL_SECS), _HOME_TARGETS_TTL_MAX_SECS)
+
+
+#: Last state :func:`_report_expiry_pin` reported, so the line is emitted once per
+#: TRANSITION rather than once per rebuild. A dict rather than a module global
+#: because it is written from inside a function.
+_home_targets_pin_state: dict[str, bool] = {}
+
+
+def _report_expiry_pin(pinned: bool) -> None:
+    """Say once, on each transition, which expiry the cache is actually selecting.
+
+    Without this the availability half self-disables in silence. On an install
+    whose RESOLVED leaf under a home-override root is a symlink -- a crew-prefixed
+    entry of the caller's ``home_dirs`` under ``KIROCREW_HOME``, the agent-spec dir
+    under ``KIRO_HOME``, or a declared harness credential leaf under any variable in
+    ``host_auth.home_override_env_vars()`` --
+    the build that was handed that leaf reports a traversal, ITS expiry is
+    therefore the floor, and both knobs read as no-ops for that tier to whoever
+    tunes them. The refusals then come back with nothing in the log to say why the
+    fix did not apply to this host.
+
+    A dotfile-managed home IS a case to look for. The trigger is narrower than
+    "any symlinked dotfile" but not exotic: the symlinked path has to fall in one
+    of the three classes above -- a crew-prefixed entry of the caller's
+    ``home_dirs`` under ``KIROCREW_HOME``, the agent-spec dir under ``KIRO_HOME``,
+    or a declared harness credential leaf -- and it has to sit BELOW the resolved
+    root, since ``_resolve_root_anchors`` canonicalises each root first. A
+    symlinked ``sessions`` leaf under a ``KIROCREW_HOME`` below ``$HOME`` is that
+    shape, and so is a ``goose`` directory symlinked into a store underneath
+    whatever ``XDG_CONFIG_HOME`` resolves to -- the leaf resolved is
+    ``$XDG_CONFIG_HOME/goose/secrets.yaml``, so the symlink has to be under the
+    exported root and not under ``~/.config`` unless that is the same directory. A
+    dotfile in none of those classes cannot report
+    a traversal, because the bulk targets are never resolved.
+
+    The dedup is ONE shared boolean, and that is weaker than per-build accuracy.
+    ``_home_targets_pin_state`` holds a single ``"pinned"`` key while
+    ``_cached_home_dir_targets`` calls this once per cache entry, and the three
+    ``home_dirs`` lists can resolve to different answers on one host -- a symlinked
+    crew leaf can pin the read and write builds while the keystone-artifact build
+    reports no traversal. So a steady host says it once only while every build
+    agrees; where they disagree the line alternates between the two messages
+    instead, and neither names which build it is about. Read a single line as "some
+    build selected this expiry", not as the state of every tier.
+    """
+    if _home_targets_pin_state.get("pinned") is pinned:
+        return
+    _home_targets_pin_state["pinned"] = pinned
+    if pinned:
+        logger.info(
+            "sensitive-path anchor cache: expiry pinned to the %.1fs floor because a "
+            "path under a home-override root resolved through a symlink, so the "
+            "cost-tracking expiry and both of its knobs do not apply while that holds",
+            _HOME_TARGETS_TTL_SECS,
+        )
+    else:
+        logger.info(
+            "sensitive-path anchor cache: cost-tracking expiry in force " "(ratio %s, cap %.1fs)",
+            _HOME_TARGETS_TTL_COST_RATIO,
+            _HOME_TARGETS_TTL_MAX_SECS,
+        )
+
+
 # key -> (expiry_monotonic, targets)
 _home_targets_cache: dict[tuple[object, ...], tuple[float, set[str]]] = {}
 # Only off-loop bulk readers acquire this lock. Event-loop gates retain their
@@ -2424,12 +2818,26 @@ def _cached_home_dir_targets(
         targets = _home_dir_targets_uncached(home_dirs, roots)
     else:
         targets = _rebuild_targets_bounded(home_dirs, roots)
+    # Read the clock AGAIN, and start the expiry here rather than at ``now``.
+    # Two reasons, neither of them visible while a rebuild costs 2ms. The interval
+    # between the two reads is the measured cost the expiry is a multiple of.
+    # And an expiry that started BEFORE the build would already have elapsed by
+    # the time a contended build returned -- a 2s build under a 0.1s expiry
+    # hands back an entry that is expired on arrival, so the next call rebuilds
+    # again and the cache stops being a cache exactly when it matters most.
+    built_at = time.monotonic()
+    # Read the flag off the built set, defaulting to the fail-safe answer: a test
+    # double or any future builder that returns a plain ``set`` carries no
+    # attribute and gets the floor rather than the long expiry.
+    differed = bool(getattr(targets, "resolution_differed", True))
+    _report_expiry_pin(differed)
+    ttl = _home_targets_ttl(max(0.0, built_at - now), resolution_differed=differed)
     # Bound the dict: the key space is tiny (two constant home_dirs lists ×
     # roots), but a test or embedder that churns KIROCREW_HOME must not grow it
     # without limit.
     if len(_home_targets_cache) > 32:
         _home_targets_cache.clear()
-    _home_targets_cache[key] = (now + _HOME_TARGETS_TTL_SECS, targets)
+    _home_targets_cache[key] = (built_at + ttl, targets)
     return targets
 
 
@@ -2440,7 +2848,7 @@ def _rebuild_targets_bounded(home_dirs: list[str], roots: _ResolvedRoots) -> set
     override roots and the ~40 keystone leaves under them -- are the paths the
     sensitive-target set is built FROM, as opposed to the agent-supplied
     candidate checked AGAINST it.  They are deliberately NOT ``realpath``'d
-    inline on the event loop every time the 0.1s cache expires: on a Windows
+    inline on the event loop every time the target cache expires: on a Windows
     desktop under heavy disk load (a full test run plus several subagents, all
     being scanned by real-time antivirus) ``realpath($HOME)`` blocks past the
     25s loop-stall watchdog from inside ``on_tool_call``, and the gateway exits
@@ -2465,7 +2873,7 @@ def _rebuild_targets_bounded(home_dirs: list[str], roots: _ResolvedRoots) -> set
     previous canonical set).  A pool fault is treated exactly like a stall, and
     a UNC home is probed here too (bounded): the candidate-side UNC shortcut is
     about tokens, not about the fence.  The stall is recorded, so the rebuild
-    does not re-probe the wedged mount every 0.1s -- it refuses without touching
+    does not re-probe the wedged mount on every expiry -- it refuses without touching
     the filesystem until the cooldown lapses.
     """
     try:

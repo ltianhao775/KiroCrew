@@ -20,6 +20,7 @@ whether a Slack session should skip memory writes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -57,7 +58,12 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.config.paths import kiro_agents_dir, peek_data_home
-from kiro_crew.constants import is_control_tag_tail, strip_control_comments
+from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    STEER_NOTICE_BOUND_SECS,
+    is_control_tag_tail,
+    strip_control_comments,
+)
 from kiro_crew.context import (
     ContextBuilder,
     build_cancelled_turn_preamble,
@@ -75,6 +81,7 @@ from kiro_crew.dashboard.chat_utils import (
     run_config_write,
 )
 from kiro_crew.dashboard.state import append_and_surface
+from kiro_crew.deny_notice import steer_refusal_notice
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import (
@@ -111,7 +118,7 @@ from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import canonical_key
-from kiro_crew.messaging.renderer import redaction_notice
+from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
@@ -135,8 +142,6 @@ from kiro_crew.safety_override import (
     yolo_policy_permits,
 )
 from kiro_crew.security import (
-    CREDENTIAL_REDACTION_TAGS,
-    EXFILTRATION_REDACTION_TAG_PREFIX,
     StreamRedactor,
     is_sensitive_path,
     redact,
@@ -240,6 +245,12 @@ _EDIT_INTERVAL = 1.0
 
 # Timeout for user to click approve/reject before auto-rejecting
 _APPROVAL_TIMEOUT = 120.0
+# Upper bound on the best-effort in-band deny notice steered into the running
+# turn before an expired approval prompt is rejected. The shared constant, so
+# this arm, the dashboard chat runner and the messaging TurnDriver cannot drift:
+# an unbounded await on a backpressured ACP stdin could stall the reject that
+# unblocks the turn. Module-level so a test can shorten it.
+_STEER_NOTICE_BOUND_SECS = STEER_NOTICE_BOUND_SECS
 
 # Slack Block Kit section text limit (3000 chars max); leave room for
 # markdown fences (``` ... ```) that wrap the tool input.
@@ -261,6 +272,22 @@ _STATUS_WORKING = "is working on your request"
 #: never replaces them, so the text already shown stays in the abandoned
 #: message — this line is what tells the reader the two belong together.
 _STREAM_CONTINUED = "_(continued)_\n\n"
+
+#: Appended to a stream that lost real answer text Slack would not accept. A
+#: refused append always attempts a rotation, so a for-good loss reaches finalize
+#: with the turn's text spread over more than one message: overwriting the message
+#: the reader is looking at would duplicate what the abandoned one already shows,
+#: and characters lost before a wait boundary are in nothing the turn still holds.
+#: The loss is disclosed rather than restated, because a reader who is told can
+#: ask again, while a reader who is told nothing reads a complete-looking answer
+#: with a hole in it.
+#:
+#: Shared by both stream paths so the two disclose a loss in the same words. It
+#: lives here because ``renderer`` imports from this module, not the reverse.
+DELIVERY_DEBT_NOTICE = (
+    "\n\n_[Part of this reply did not reach Slack and could not be restored here. "
+    "Ask for it again to see the missing text.]_"
+)
 
 # Max chars of reasoning to surface inline in Slack before truncating. Keeps
 # the 💭 Thinking block from becoming a wall of text; the full
@@ -302,6 +329,10 @@ def _condense_thinking(mrkdwn: str, *, limit: int = _THINKING_PREVIEW_LIMIT) -> 
 # Pending approvals: keyed by f"{channel}:{approval_msg_ts}"
 # Module-level dict — safe because gateway runs in a single asyncio event loop.
 _pending_approvals: dict[str, _PendingApproval] = {}
+# Strong references to teardown-time orphan-reject tasks (the CancelledError
+# arm of _request_approval): asyncio holds tasks weakly, and these are created
+# exactly while the loop is unwinding.
+_orphan_rejects: "set[asyncio.Task[bool]]" = set()
 
 # ── Phase-aware reaction constants ──────────────────────────────────────
 
@@ -820,6 +851,7 @@ async def _apply_privacy_mode(
     slack: SlackClientOps,
     sessions: SessionManager,
     reply_ts: str,
+    link_thread: bool = True,
 ) -> None:
     """Mark a session as *mode* and notify the user (idempotent).
 
@@ -829,13 +861,20 @@ async def _apply_privacy_mode(
     """
 
     async def _notify(message: str) -> None:
-        await slack.post_message(channel, message, reply_ts)
+        await slack.post_message(channel, message, reply_ts or None)
 
     async def _on_applied(_mode: str) -> None:
         # Register thread so follow-up messages pass the in_active_thread
         # gate in mention/observe channels without needing another @mention.
         # reply_ts is the bare Slack thread_ts; session_key may be namespaced.
-        sessions.set_slack_link(session_key, reply_ts, channel)
+        # Skipped when there is no thread, and when the caller says this session
+        # is not thread-scoped at all (``link_thread=False`` -- a flat 1:1 DM,
+        # whose session is keyed by the channel): claiming a thread there would
+        # hand the dashboard mirror one branch to post into. Posting is a
+        # separate decision, so the confirmation still lands where the modifier
+        # was typed.
+        if reply_ts and link_thread:
+            sessions.set_slack_link(session_key, reply_ts, channel)
 
     await privacy_mode.apply_mode(
         mode,
@@ -856,10 +895,18 @@ async def _apply_temporary_modifier(
     slack: SlackClientOps,
     sessions: SessionManager,
     reply_ts: str,
+    link_thread: bool = True,
 ) -> None:
     """Mark a session as temporary and notify the user (idempotent)."""
     await _apply_privacy_mode(
-        privacy_mode.MODE_TEMPORARY, session_key, user_id, channel, slack, sessions, reply_ts
+        privacy_mode.MODE_TEMPORARY,
+        session_key,
+        user_id,
+        channel,
+        slack,
+        sessions,
+        reply_ts,
+        link_thread,
     )
 
 
@@ -870,10 +917,18 @@ async def _apply_incognito_modifier(
     slack: SlackClientOps,
     sessions: SessionManager,
     reply_ts: str,
+    link_thread: bool = True,
 ) -> None:
     """Mark a session as incognito and notify the user (idempotent)."""
     await _apply_privacy_mode(
-        privacy_mode.MODE_INCOGNITO, session_key, user_id, channel, slack, sessions, reply_ts
+        privacy_mode.MODE_INCOGNITO,
+        session_key,
+        user_id,
+        channel,
+        slack,
+        sessions,
+        reply_ts,
+        link_thread,
     )
 
 
@@ -886,6 +941,7 @@ async def maybe_apply_privacy_modifiers(
     slack: SlackClientOps,
     sessions: SessionManager,
     reply_ts: str,
+    link_thread: bool = True,
 ) -> tuple[str, str, bool]:
     """Strip and apply the ``!temporary`` / ``!incognito`` privacy modifiers.
 
@@ -914,7 +970,9 @@ async def maybe_apply_privacy_modifiers(
         cmd_stripped, had_mode = privacy_mode.strip_token(cmd_text, mode)
         if not had_mode:
             continue
-        await _apply_privacy_mode(mode, session_key, user_id, channel, slack, sessions, reply_ts)
+        await _apply_privacy_mode(
+            mode, session_key, user_id, channel, slack, sessions, reply_ts, link_thread
+        )
         cmd_text = cmd_stripped
         text = pattern.sub("", text)
         text = " ".join(text.split()) or text  # collapse whitespace
@@ -1072,7 +1130,9 @@ def _get_agent_for_session(session_key: str) -> str:
     return _thread_agents.get(session_key) or _get_default_agent()
 
 
-def _discover_project_agents(project_dir: str | None) -> list[Path]:
+def _discover_project_agents(
+    project_dir: str | None, *, operation: str = "slack_project_agents"
+) -> list[Path]:
     """Return agent JSON files from <project_dir>/.kiro/ and .kiro/agents/.
 
     Delegates to :func:`agent_discovery.project_agent_files`, the one implementation
@@ -1081,8 +1141,14 @@ def _discover_project_agents(project_dir: str | None) -> list[Path]:
     ``*.agent-spec.json`` convention predates ``.kiro/agents/`` and is kept for
     continuity, but kiro-cli cannot activate such a name, so no dispatch surface may
     offer it.
+
+    *operation* names the Slack request whose scan this is, so a sensitive-project-dir
+    denial is attributed to the listing or the name resolution rather than to this
+    shared helper. The channel is fixed: every route here is Slack.
     """
-    return project_agent_files(project_dir, include_legacy=True)
+    return project_agent_files(
+        project_dir, include_legacy=True, operation=operation, source="slack"
+    )
 
 
 def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None:
@@ -1097,7 +1163,7 @@ def _resolve_agent_name(name: str, project_dir: str | None = None) -> str | None
     # but reading every spec to compare its declared name would still make a
     # checkout with many agents or slow storage slow to answer. At most the one
     # matching file is read, to return the name it declares.
-    for spec in _discover_project_agents(project_dir):
+    for spec in _discover_project_agents(project_dir, operation="slack_resolve_agent"):
         stem = spec.stem.removesuffix(".agent-spec")
         if stem != name and spec.stem != name:
             continue
@@ -2288,7 +2354,9 @@ async def _handle_slash_command(
         await sessions.remove(session_key)
         # Discover project-local agents: a directory listing of the checkout,
         # so off the loop like the metadata write above.
-        project_agents = await asyncio.to_thread(_discover_project_agents, resolved)
+        project_agents = await asyncio.to_thread(
+            _discover_project_agents, resolved, operation="slack_list_agents"
+        )
         agent_info = ""
         if project_agents:
             names = ", ".join(
@@ -3447,6 +3515,22 @@ async def handle_message(
     _show_thinking = KiroCrewConfig.load().slack.show_thinking
     _stream_had_redaction = False  # True when per-chunk redaction modified a streamed chunk
     _stream_delivered = False  # True once ANY real-text append is confirmed on the stream
+    # Delivery debt: real answer text Slack refused for good — the append failed
+    # AND its post-rotation retry failed, so those characters are on no message.
+    #
+    # Never cleared, including at a wait boundary. That boundary discards
+    # ``accumulated`` and abandons the message, so text lost before it can no
+    # longer be restated from anything the turn still holds — which is exactly why
+    # the debt has to outlive it and be disclosed at the end.
+    #
+    # Only the streaming finalize reads it. A refused append always attempts a
+    # rotation, so a for-good loss leaves the turn in one of two states: the
+    # rotation succeeded and the answer now spans two messages, where the loss is
+    # disclosed because restating the whole text in the message the reader is
+    # watching would repeat the abandoned one; or the rotation failed and the
+    # stream was demoted, where the end-of-turn ``chat.update`` already re-sends
+    # that segment's complete text and there is nothing left to disclose.
+    _stream_debt = False
     # Rolling-buffer redactor for the live Slack wire: withholds the trailing
     # credential-class run so a credential split across streaming chunks can't
     # reach Slack unredacted (issue 3). The final message is posted from the
@@ -3517,7 +3601,7 @@ async def handle_message(
         posted from the complete, fully-redacted ``accumulated`` at stop_stream,
         so the withheld tail is superseded — never lost.
         """
-        nonlocal _stream_had_redaction, _stream_delivered
+        nonlocal _stream_had_redaction, _stream_delivered, _stream_debt
         if not stream_ts:
             return True
         if channel_activation == ACTIVATION_REVIEW:
@@ -3545,23 +3629,59 @@ async def handle_message(
                 except Exception:
                     logger.warning("Slack append_stream failed after rotation", exc_info=True)
                     ok = False
-        # A delta that failed both the append and the post-rotation retry is
-        # not re-delivered: the real ``stop_stream`` deliberately ignores
-        # ``final_text``, and this is the same outcome the shipped client's
-        # REFUSED append produces on this path. Confirmed-delivery recovery
-        # for this class is a designed subsystem tracked as its own issue
-        # (delivery debt), deliberately not grown inside this guard sweep.
+        # A delta that failed both the append and the post-rotation retry is on no
+        # message. Record the debt rather than dropping it silently, so finalize
+        # can tell the reader. The early returns above are not deliveries and never
+        # reach here, so a withheld partial-credential run and a review-mode
+        # suppression do not count as lost text.
         #
-        # Record whether this real-text delivery was CONFIRMED. The early returns
-        # above (no stream, review mode, a wholly-withheld partial-credential
-        # delta) are not deliveries and deliberately do not reach here, so this
-        # flag rises only when actual answer text was accepted by Slack. The
-        # finalize path reads it to tell a used stream (answer reached, refused
-        # remainder is delivery-debt) from a stream that delivered NOTHING (every
-        # append refused -- the reader got no answer, which is a failed turn).
+        # Record whether this real-text delivery was CONFIRMED. The finalize path
+        # reads it to tell a used stream (answer reached, refused remainder is
+        # delivery debt) from a stream that delivered NOTHING (every append
+        # refused -- the reader got no answer, which is a failed turn).
         if ok:
             _stream_delivered = True
+        else:
+            _stream_debt = True
         return ok
+
+    async def _settle_stream_debt(ts: str) -> None:
+        """Disclose answer text Slack refused for good, on the message that lost it.
+
+        Called at every point a stream is abandoned, so the notice goes out while
+        an append can still reach the message the hole is in. Clearing the debt is
+        part of settling it: a second notice on a later message would report a gap
+        the reader has already been shown.
+
+        Sent directly rather than through ``_append_stream``: the notice is not
+        answer text, so it must not raise ``_stream_delivered`` and make a stream
+        that delivered no answer look like one that did.
+
+        ``append_stream`` reports a refusal by RETURNING False -- the client turns
+        every exception into that return -- so the return value is the whole
+        signal, and leaving it unread hides the very loss this notice exists to
+        disclose. The two refusals that takes fall inside one Slack rate-limit or
+        outage window, so they are correlated rather than independent. On refusal
+        post a separate message, which does not depend on the stream that just
+        refused.
+        """
+        nonlocal _stream_debt
+        if not _stream_debt:
+            return
+        _stream_debt = False
+        _notice_ok = False
+        try:
+            _notice_ok = await slack.append_stream(channel, ts, DELIVERY_DEBT_NOTICE)
+        except Exception:
+            logger.warning("Slack: appending the delivery-debt notice failed")
+        if not _notice_ok:
+            try:
+                await slack.post_message(channel, DELIVERY_DEBT_NOTICE, reply_ts)
+            except Exception:
+                logger.warning(
+                    "Slack: the delivery-debt notice reached neither the "
+                    "stream nor a separate message"
+                )
 
     async def _append_task(task_id: str, title: str, status: str, details: str = "") -> bool:
         """Append task card to stream. Never rotates — see below.
@@ -4254,6 +4374,14 @@ async def handle_message(
                     bracket_hold, _released = _resolve_comment_hold(bracket_hold, accumulated)
                     if _released:
                         await _append_stream(_released)
+                    # Last chance to tell the reader: the seal below drops
+                    # ``stream_ts`` and ``accumulated``, so a turn that ends with
+                    # no post-wait text opens no further stream and reaches no
+                    # other disclosure point, while the lost characters are gone
+                    # from the text a later message could restate. Settling here
+                    # also puts the notice on the message the gap is in. Ordered
+                    # after the tail append so a refusal of that tail counts.
+                    await _settle_stream_debt(stream_ts)
                     try:
                         await slack.stop_stream(channel, stream_ts)
                     except Exception:
@@ -4747,6 +4875,7 @@ async def handle_message(
         # yield is a landmine.
         _options_verdict_deferred = False  # set at the verdict step; read by both finallys
         _verdict_booked = not _turn_completed_ok  # model errors already booked
+        _title_pin_held: auto_title.RecordPin | None = None  # set under the permit
         # Bound before the first suspension point so the release finally can read
         # it on a cancellation landing at any await. Recomputed at the delivery
         # step below; the default False is correct for a cancellation BEFORE
@@ -4947,15 +5076,17 @@ async def handle_message(
         # artifact answers the question the user has -- "is what I am about to copy
         # still what the assistant wrote?" -- and stays correct wherever the
         # substitution happened (per-chunk, the StreamRedactor wire pass, the final
-        # render, or the post-decorator scan). Sum every tag the redactor can emit
-        # (`CREDENTIAL_REDACTION_TAGS`) so an encoded-credential-only reply is not
-        # missed.
+        # render, or the post-decorator scan). The shared ``count_redaction_tags``
+        # sums every tag the redactor can emit so an encoded-credential-only reply
+        # is not missed, and counts the exfiltration-URL tag by its prefix, because
+        # that tag interpolates the redacted domain and has no constant form to
+        # equality-compare. Kept as separate counts because the notice is worded
+        # by kind: the remedies differ (re-enter the secret vs re-check the URL).
         #
         # The thinking block (redacted separately below) adds to this SAME tally so a
         # single warning covers the turn if either the answer or the thinking was
         # rewritten -- one turn, one notice, never two identical warnings.
-        _cred_redactions = sum(clean_text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-        _url_redactions = clean_text.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+        _cred_redactions, _url_redactions = count_redaction_tags(clean_text)
 
         # ── Review mode: ephemeral draft instead of public post ──
         if channel_activation == ACTIVATION_REVIEW:
@@ -5101,6 +5232,20 @@ async def handle_message(
                 # wholly-refused-stream predicate when there WAS answer text.
                 if _answer_text_to_send:
                     _answer_reached = _stream_delivered
+                # Disclose real answer text Slack refused for good, while the
+                # stream is still open (an append after the seal is refused).
+                #
+                # Reaching here with debt means a rotation succeeded, because a
+                # refused append always attempts one and a failed rotation demotes
+                # the stream out of this branch. So the answer spans the abandoned
+                # message and this one: restating the whole text here would repeat
+                # what the reader already has above, and the characters lost before
+                # a wait boundary are absent from ``clean_text`` to restate at all.
+                # Saying so is what a reader can act on -- they can ask again --
+                # where a complete-looking answer with a hole in it gives them
+                # nothing to notice.
+                if _stream_debt:
+                    await _settle_stream_debt(stream_ts)
                 # The seal is decoration: the answer is already on screen, so a
                 # failed stop_stream does not un-deliver it.
                 try:
@@ -5165,6 +5310,25 @@ async def handle_message(
         # returns — and books a failure if both fail. The permit stays held across
         # the intervening decorations (fast, best-effort) so the deferred verdict
         # is still written under it.
+        # Pin the record for the naming turn while the permit is still held. Every
+        # release below is followed by Slack round-trips before the auto-title block,
+        # and a queued turn that takes the released permit can delete this key's
+        # record and re-mint it in that span. A pin read down there reads the
+        # REPLACEMENT, the guard matches it, and the title generated from this turn
+        # names a conversation it never ran in. While the permit is held no other
+        # turn for this key runs, so the identity read here is the record this turn
+        # is about. The same cheap ``is_titled`` peek the block below uses gates it,
+        # so an already-named conversation pays no thread hop.
+        #
+        # A key whose record has not landed yet pins ABSENT here and is re-pinned
+        # below once this turn's own row is written: with no record there is nothing
+        # a replacement can be mistaken for, and the first exchange stays nameable.
+        if (
+            not _had_error
+            and not _is_slack_restricted(session_key)
+            and not auto_title.is_titled(session_key)
+        ):
+            _title_pin_held = await auto_title.pin_record(conversation_log, session_key)
         _options_verdict_deferred = bool(_turn_completed_ok and options and _answer_reached)
         if not _options_verdict_deferred:
             if _turn_completed_ok:
@@ -5228,8 +5392,9 @@ async def handle_message(
             # review-mode branch). Count the fully redacted text before it is
             # condensed -- condensing can truncate, which would drop a placeholder
             # from the count even though the credential was still rewritten.
-            _cred_redactions += sum(thinking_mrkdwn.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-            _url_redactions += thinking_mrkdwn.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+            _thinking_creds, _thinking_urls = count_redaction_tags(thinking_mrkdwn)
+            _cred_redactions += _thinking_creds
+            _url_redactions += _thinking_urls
             thinking_block = _condense_thinking(thinking_mrkdwn)
             if thinking_ts:
                 try:
@@ -5540,14 +5705,46 @@ async def handle_message(
         # background task fails or returns SKIP, it unclaims the key so the next
         # message retries. A message arriving between claim and unclaim is
         # intentionally skipped (no duplicate).
-        if not _had_error and not _skip_writes and auto_title.try_claim(session_key):
-            track_background_task(
-                asyncio.create_task(
-                    _maybe_auto_title_slack(
-                        slack, sessions, channel, session_key, conversation_log, text, accumulated
+        if not _had_error and not _skip_writes and not auto_title.is_titled(session_key):
+            # The ``is_titled`` peek above is a cheap synchronous membership test on
+            # the same tracker ``try_claim`` checks below: once a key is claimed or
+            # titled the claim cannot be taken again, so without the peek the pin's
+            # thread hop would be paid and then discarded on every later message of
+            # every already-named conversation.
+            #
+            # Pin BEFORE claiming, and both before the task is scheduled. The pin
+            # read suspends on a thread, so claiming first would leave the claim
+            # held across that await with nothing scheduled yet to release it: a
+            # cancellation there (``!stop``) would strand it, and the claim is
+            # process-wide, so this key could not be auto-titled again until the
+            # gateway restarts. The pin still precedes ``create_task``, which is
+            # what closes the scheduling-tick window -- see ``pin_record``.
+            #
+            # The pin itself is the one taken under the permit, well above here:
+            # reading it at this point would sit after the release and after the
+            # Slack round-trips in between, which is the window a replacement
+            # record slips through. ABSENT is the one state worth re-reading, and
+            # only because a key with no record has no replacement to confuse:
+            # this turn's own row has landed by now, so the re-read is what makes a
+            # brand-new conversation nameable from its first exchange.
+            _title_pin = _title_pin_held
+            if _title_pin is None or _title_pin.state == auto_title.RECORD_ABSENT:
+                _title_pin = await auto_title.pin_record(conversation_log, session_key)
+            if auto_title.try_claim(session_key):
+                track_background_task(
+                    asyncio.create_task(
+                        _maybe_auto_title_slack(
+                            slack,
+                            sessions,
+                            channel,
+                            session_key,
+                            conversation_log,
+                            text,
+                            accumulated,
+                            pin=_title_pin,
+                        )
                     )
                 )
-            )
     finally:
         # If the verdict was deferred to the footer and this tail is torn down
         # (a raise or cancellation in a decoration) before the footer books it,
@@ -5576,8 +5773,14 @@ async def _maybe_auto_title_slack(
     conversation_log: ConversationLog | None,
     user_text: str,
     assistant_text: str,
+    *,
+    pin: auto_title.RecordPin,
 ) -> None:
-    """Generate and set a Slack thread title after the first response."""
+    """Generate and set a Slack thread title after the first response.
+
+    ``pin`` is captured by the CALLER before this task is scheduled, and is
+    required rather than defaulted -- see ``auto_title.pin_record``.
+    """
 
     async def _set_thread_title(title: str) -> None:
         await slack.set_thread_title(channel, session_key, title)
@@ -5588,25 +5791,43 @@ async def _maybe_auto_title_slack(
         session_key,
         user_text,
         assistant_text,
+        pin=pin,
         source="slack",
         resources=f"{channel}:{session_key}",
         set_channel_title=_set_thread_title,
     )
 
 
-async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") -> None:
+async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") -> bool:
     """Reject a pending ACP permission request that we can no longer surface.
 
     Both the pre-approval stream-prep and the approval-prompt post happen BEFORE
     the permission is answered; if either raises, the ACP request would be left
     unanswered and the agent subprocess wedges forever (every later turn blocks
     behind it). Callers invoke this on failure, then re-raise. Swallows any
-    reject failure (best-effort) so the original error still propagates.
+    reject failure, and audit failure after a successful rejection, so the
+    original error still propagates.
     """
     try:
         await provider.reject_tool(request_id)
     except Exception:
         logger.warning("Failed to reject orphaned tool %s", request_id, exc_info=True)
+        return False
+    # The fallback arms re-raise past the normal permission audit, so record
+    # the denial here: a rejection that reached the wire but never reached the
+    # audit trail is a silent gap in a security control.
+    try:
+        sel().log_tool_invocation(
+            session_key="",
+            source="slack",
+            tool_name="",
+            outcome="rejected",
+            request_id=request_id,
+            metadata={"reason": "orphaned_fallback_reject"},
+        )
+    except Exception:
+        logger.warning("Failed to audit orphaned tool %s", request_id, exc_info=True)
+    return True
 
 
 class _LinkedApprovalEvent:
@@ -5832,11 +6053,78 @@ async def _request_approval(
     _pending_approvals[key] = pending
 
     try:
-        outcome = await asyncio.wait_for(pending.future, timeout=_APPROVAL_TIMEOUT)
+        # shield: on timeout, wait_for would otherwise CANCEL the future, and a
+        # click that claimed the entry just before the deadline could then
+        # never deliver its real outcome (its set_result guards on done()).
+        outcome = await asyncio.wait_for(asyncio.shield(pending.future), timeout=_APPROVAL_TIMEOUT)
     except asyncio.TimeoutError:
         outcome = _OUTCOME_REJECTED
-        await provider.reject_tool(event.request_id)
-        Stats().inc_tool_denial()
+        # Claim the decision BEFORE awaiting anything: while the entry stays
+        # registered, a Slack click landing inside the steer window would take
+        # the live-approval branch and answer the same permission request a
+        # second time. The pop's result says who won: a click that claimed the
+        # entry first is answering (or already answered) the request itself, so
+        # steering "expired unanswered" then would hand the model a false
+        # cause. The finally pop is idempotent, and a late click hits the
+        # already-resolved path.
+        claimed = _pending_approvals.pop(key, None) is not None
+        # Steer FIRST, reject SECOND: while the permission request is still
+        # unanswered the turn is provably in flight, so the notice is queued
+        # rather than dropped, and the model learns the denial was an expired
+        # prompt instead of concluding a human refused the call, matching the
+        # dashboard chat runner's host-decline arms. On Slack the driver stops
+        # rendering after a rejection, so this corrects the model-side
+        # transcript attribution only; the notice's continue-guidance has no
+        # Slack consumer. Best-effort: steer_refusal_notice (capability probe,
+        # redaction, build, bounded send -- the same helper the messaging
+        # TurnDriver uses) swallows every failure, so the reject below still
+        # runs; only cancellation escapes it, handled next.
+        try:
+            if claimed:
+                await steer_refusal_notice(
+                    provider,
+                    event.title,
+                    "the Slack approval prompt went unanswered for "
+                    f"{max(1, round(_APPROVAL_TIMEOUT))}s",
+                    cause=DENY_CAUSE_APPROVAL_TIMEOUT,
+                    bound_secs=_STEER_NOTICE_BOUND_SECS,
+                )
+        except asyncio.CancelledError:
+            # Teardown while steering must still answer the wire: a stranded
+            # session/request_permission blocks the subprocess forever and
+            # wedges every later turn behind it. Shield the reject so it is
+            # stepped even while this coroutine unwinds; _reject_orphaned_tool
+            # retrieves its exception so teardown stays quiet.
+            reject = asyncio.ensure_future(_reject_orphaned_tool(provider, event.request_id))
+            _orphan_rejects.add(reject)
+            reject.add_done_callback(_orphan_rejects.discard)
+            with contextlib.suppress(BaseException):
+                if await asyncio.shield(reject):
+                    Stats().inc_tool_denial()
+            raise
+        if claimed:
+            # Only the claim winner answers the wire. A lost claim means a
+            # click is answering (or answered) this request itself; a second
+            # answer would hit the ACP client's popped-options fallback, whose
+            # cancelled outcome cancels the WHOLE turn. The click's own wire
+            # failure cannot strand the request either: handle_interaction
+            # answers the wire itself when its approve/reject raises.
+            await provider.reject_tool(event.request_id)
+            Stats().inc_tool_denial()
+        else:
+            # A click beat the deadline and owns the answer. The future was
+            # shielded from the timeout's cancellation, so it still carries the
+            # click's REAL decision: await it until the click resolves it, and
+            # report THAT. No bound and no fabricated fallback: the click is the
+            # sole responder and every way it can end resolves this future --
+            # its approve/reject completes (set_result in handle_interaction),
+            # its write raises (handle_interaction self-answers the wire, then
+            # set_result), or the backend stops reading stdin for good, which
+            # the ACP client's tool-stall watchdog turns into a transport close
+            # that raises out of the parked write and lands on the same path.
+            # Returning "rejected" on a timer instead would close this stream
+            # over a tool the person approved and that still executes.
+            outcome = await asyncio.shield(pending.future)
     finally:
         _pending_approvals.pop(key, None)
 
@@ -5948,7 +6236,14 @@ async def handle_interaction(
             return _ACTION_TRUST
         return _ACTION_APPROVE if approved else _ACTION_REJECT
 
-    pending = _pending_approvals.get(key)
+    # Claim-before-await, symmetric with the timeout arm: popping here (not
+    # at the end) means a timeout firing while this click awaits the wire
+    # sees a lost claim and stays entirely off it — only the claim winner may
+    # answer, because a second answer to the same request id lands in the ACP
+    # client's popped-options cancelled-outcome fallback and cancels the whole
+    # turn. It also means the timeout arm's own pop cannot leave this path
+    # deleting a missing key.
+    pending = _pending_approvals.pop(key, None)
     if not pending:
         # Approval already resolved (approved/rejected/timed out).
         # For trust clicks, still set trust using the thread as session key.
@@ -6052,56 +6347,79 @@ async def handle_interaction(
             )
         return None
 
-    if action_id in (_ACTION_APPROVE, _ACTION_TRUST):
-        # Set trust state BEFORE approving (so subsequent tools auto-approve)
-        if action_id == _ACTION_TRUST:
-            if not is_allowed_user(user_id):
-                logger.error("Rejecting trust escalation from non-allowed user %s", user_id)
-                sel().log_api_access(
-                    caller=user_id,
-                    operation="slack.interactive.trust_denied",
-                    outcome="denied",
-                    source="slack",
-                    resources=pending.session_key or "",
-                    error="non-allowed user",
-                )
-                if not pending.future.done():
-                    pending.future.set_result(_OUTCOME_REJECTED)
-                del _pending_approvals[key]
-                return _ACTION_REJECT
-            elif pending.session_key:
-                add_trusted_session(pending.session_key, sessions)
-                logger.info("Trust mode ON for session %s", pending.session_key)
-            else:
-                logger.warning(
-                    "No session_key on pending approval %s; approving without trust", key
-                )
-        if pending.provider:
-            await pending.provider.approve_tool(pending.request_id)
+    # Everything below runs with the entry CLAIMED: the pop above means no
+    # later claimer exists, and _request_approval's lost-claim arm is awaiting
+    # ``pending.future`` unbounded on the promise that every way this click can
+    # end resolves it. The wire calls kept that promise through their own
+    # fallback arms, but the synchronous bookkeeping between the claim and
+    # ``set_result`` (trust grant, audit, stats) could raise and return with
+    # the wire unanswered and the future unresolved — parking that waiter
+    # permanently. One guard over the WHOLE claimed region keeps the promise
+    # on every exit; it subsumes the two per-wire-call fallback arms it
+    # replaces. approve_tool pops the recorded options before sending, so the
+    # guard's fallback reject can land as a cancelled outcome (ends the turn's
+    # remaining tool calls) — still strictly better than a wedged subprocess.
+    try:
+        if action_id in (_ACTION_APPROVE, _ACTION_TRUST):
+            # Set trust state BEFORE approving (so subsequent tools auto-approve)
+            if action_id == _ACTION_TRUST:
+                if not is_allowed_user(user_id):
+                    logger.error("Rejecting trust escalation from non-allowed user %s", user_id)
+                    sel().log_api_access(
+                        caller=user_id,
+                        operation="slack.interactive.trust_denied",
+                        outcome="denied",
+                        source="slack",
+                        resources=pending.session_key or "",
+                        error="non-allowed user",
+                    )
+                    if not pending.future.done():
+                        pending.future.set_result(_OUTCOME_REJECTED)
+                    return _ACTION_REJECT
+                elif pending.session_key:
+                    add_trusted_session(pending.session_key, sessions)
+                    logger.info("Trust mode ON for session %s", pending.session_key)
+                else:
+                    logger.warning(
+                        "No session_key on pending approval %s; approving without trust", key
+                    )
+            if pending.provider:
+                await pending.provider.approve_tool(pending.request_id)
+            if not pending.future.done():
+                pending.future.set_result(_OUTCOME_APPROVED)
+            Stats().inc_tool_approval()
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.interactive.approval",
+                outcome="allowed",
+                source="slack",
+                resources=action_id,
+            )
+        else:
+            if pending.provider:
+                await pending.provider.reject_tool(pending.request_id)
+            if not pending.future.done():
+                pending.future.set_result(_OUTCOME_REJECTED)
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.interactive.approval",
+                outcome="denied",
+                source="slack",
+                resources=action_id,
+            )
+    except BaseException:
+        # An unresolved future is the signal the exit was abnormal: both arms
+        # resolve it immediately after their wire call, so reaching here with
+        # it pending means the wire may be unanswered and the lost-claim
+        # waiter is still parked. Answer best-effort and release the waiter
+        # before propagating; _reject_orphaned_tool swallows its own failure,
+        # so the original error still surfaces.
         if not pending.future.done():
-            pending.future.set_result(_OUTCOME_APPROVED)
-        Stats().inc_tool_approval()
-        sel().log_api_access(
-            caller=user_id,
-            operation="slack.interactive.approval",
-            outcome="allowed",
-            source="slack",
-            resources=action_id,
-        )
-    else:
-        if pending.provider:
-            await pending.provider.reject_tool(pending.request_id)
-        if not pending.future.done():
+            if pending.provider:
+                await _reject_orphaned_tool(pending.provider, pending.request_id)
             pending.future.set_result(_OUTCOME_REJECTED)
-        sel().log_api_access(
-            caller=user_id,
-            operation="slack.interactive.approval",
-            outcome="denied",
-            source="slack",
-            resources=action_id,
-        )
+        raise
 
-    del _pending_approvals[key]
     return action_id
 
 

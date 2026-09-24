@@ -405,6 +405,41 @@ class TestWindowsLocking:
                 with pc.file_lock(handle.fileno()):
                     pytest.fail("body must not run without the lock")
 
+    def test_file_lock_not_waiting_reports_a_held_lock_as_blocking(self, monkeypatch, tmp_path):
+        """``wait=False`` must raise BlockingIOError, not the stuck-holder OSError.
+
+        The two refusals mean different things to a caller — "someone holds it
+        right now, come back later" versus "a holder is stuck past the ceiling" —
+        and only the first is safe to retry, so collapsing them would turn a
+        normal contended write into a reported fault.
+        """
+        _fake_windows(monkeypatch)
+        monkeypatch.setattr(pc, "_win_acquire_blocking", lambda *_a, **_k: False)
+        lock = tmp_path / "nowait.lock"
+        lock.write_text("")
+        with open(lock, "r+") as handle:
+            with pytest.raises(BlockingIOError, match="not waiting for it"):
+                with pc.file_lock(handle.fileno(), wait=False):
+                    pytest.fail("body must not run without the lock")
+
+    def test_file_lock_names_the_callers_own_timeout_in_the_refusal(
+        self, monkeypatch, tmp_path
+    ):
+        """An explicit ``timeout`` is the ceiling the refusal must name.
+
+        The message is the only evidence of WHY the critical section was declined,
+        so reporting the 300s default when the caller waited 2.5s would send a
+        reader hunting for a stall that never happened.
+        """
+        _fake_windows(monkeypatch)
+        monkeypatch.setattr(pc, "_win_acquire_blocking", lambda *_a, **_k: False)
+        lock = tmp_path / "timeout.lock"
+        lock.write_text("")
+        with open(lock, "r+") as handle:
+            with pytest.raises(OSError, match=r"within 2\.5s"):
+                with pc.file_lock(handle.fileno(), timeout=2.5):
+                    pytest.fail("body must not run without the lock")
+
     def test_acquire_lock_fails_closed(self, monkeypatch, tmp_path):
         _fake_windows(monkeypatch)
         monkeypatch.setattr(pc, "_win_acquire_blocking", lambda *_a, **_k: False)

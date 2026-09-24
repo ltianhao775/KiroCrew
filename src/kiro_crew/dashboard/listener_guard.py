@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -164,20 +165,23 @@ async def http_probe(host: str, port: int, *, timeout: float) -> bool:
             writer.close()
 
 
-def _listening_sockets(site: web.TCPSite) -> tuple[Any, ...]:
+def _listening_sockets(site: web.TCPSite | web.SockSite) -> tuple[Any, ...]:
     """The LISTEN sockets behind *site*'s asyncio ``Server`` (``()`` when none).
 
     ``asyncio.Server.sockets`` is a tuple of ``TransportSocket`` wrappers; a
     closed listener stays in it with ``fileno() == -1``. Typed through
-    ``AbstractServer`` by aiohttp, hence the ``getattr``.
+    ``AbstractServer`` by aiohttp, hence the ``getattr`` — and the site itself
+    is read with ``getattr`` too, so a site-shaped double that never grew a
+    ``_server`` (aiohttp's ``BaseSite.__init__`` sets it to ``None``) reads as
+    "no listener" instead of crashing the caller.
     """
-    server = site._server
+    server = getattr(site, "_server", None)
     if server is None:
         return ()
     return tuple(getattr(server, "sockets", None) or ())
 
 
-def release_site(site: web.TCPSite) -> None:
+def release_site(site: web.TCPSite | web.SockSite) -> None:
     """Close *site*'s LISTEN socket and unregister it, without ``TCPSite.stop``.
 
     ``stop()`` is deliberately not used. Across this project's declared
@@ -193,7 +197,7 @@ def release_site(site: web.TCPSite) -> None:
     a half-started site (``start()`` raised, so it is registered with no
     server) and of one already unregistered.
     """
-    server = site._server
+    server = getattr(site, "_server", None)
     if server is not None:
         try:
             server.close()
@@ -210,16 +214,27 @@ def release_site(site: web.TCPSite) -> None:
 
 
 class ListenerGuard:
-    """Watch one ``TCPSite`` and rebind it when its listener dies.
+    """Watch one just-started site and rebind it when its listener dies.
 
-    Construct with the *runner* and the *site* that :func:`_start_site` just
-    started, then :meth:`arm` on the running loop. :meth:`stop` on shutdown.
+    Construct with the *runner* and the site that was just started — the
+    ``TCPSite`` from :func:`_start_site`, or the dashboard's ``SockSite``
+    wrapping the reserved socket (see ``_reserve_dashboard_port``) — then
+    :meth:`arm` on the running loop. :meth:`stop` on shutdown. Recovery
+    rebinds the captured host/port: a plain ``TCPSite`` keeps its own
+    requested posture, while the reserved-socket ``SockSite`` is recovered
+    through *bind_factory* — the reservation's own bind primitive — wrapped
+    in a fresh ``SockSite``, so the rebound listener carries the SAME
+    exclusive-ownership option set (Windows ``SO_EXCLUSIVEADDRUSE``,
+    ``IPV6_V6ONLY``) the reservation held. A recovery must never hold the
+    port more weakly than the socket it replaces: the guard exists on
+    Windows precisely because a co-resident overlap-bind can capture
+    loopback callbacks carrying app secrets.
     """
 
     def __init__(
         self,
         runner: web.BaseRunner,
-        site: web.TCPSite,
+        site: web.TCPSite | web.SockSite,
         shutdown_event: _ShutdownSignal,
         *,
         interval: float = DEFAULT_PROBE_INTERVAL_SECS,
@@ -230,6 +245,7 @@ class ListenerGuard:
         max_backoff: float = DEFAULT_MAX_BACKOFF_SECS,
         max_unverified: int = DEFAULT_MAX_UNVERIFIED_RECOVERIES,
         probe: Callable[..., Any] | None = None,
+        bind_factory: Callable[[str, int], socket.socket] | None = None,
     ) -> None:
         self._runner = runner
         self._site = site
@@ -245,11 +261,40 @@ class ListenerGuard:
         # Bind parameters are captured from the live site so the rebind lands on
         # the SAME host and the port that was REALLY bound (``--port auto`` binds
         # 0 and reads the OS-assigned port back; rebinding 0 would move it).
-        self._host = site._host
-        self._port = self._bound_port(site) or site._port
+        # A ``SockSite`` (the dashboard's reserved-socket handoff — see
+        # ``_reserve_dashboard_port``) carries no requested host/port of its
+        # own, so both are read from the live LISTEN socket's real name; the
+        # rebind after a listener death is a fresh ``TCPSite`` on that same
+        # name, which is exactly where the reservation bound. Reading the
+        # REAL name here is strictly narrower than a requested-host capture —
+        # a loopback reservation can never be re-opened as a wildcard bind.
+        if isinstance(site, web.TCPSite):
+            self._host = site._host
+            self._port = self._bound_port(site) or site._port
+            self._reuse_address = site._reuse_address
+            self._reuse_port = site._reuse_port
+            self._bind_factory: Callable[[str, int], socket.socket] | None = None
+        else:
+            self._host = self._bound_host(site)
+            self._port = self._bound_port(site)
+            self._reuse_address = None
+            self._reuse_port = None
+            # The reserved socket carries an exclusive-ownership option set
+            # (Windows SO_EXCLUSIVEADDRUSE, IPV6_V6ONLY — see server._bind_once)
+            # that a plain TCPSite with reuse_address=None does NOT reproduce:
+            # on Windows that combination sets neither flag, so a co-resident
+            # process could overlap-bind the recovered port and receive the
+            # loopback callbacks carrying app secrets. Recovery of a SockSite
+            # therefore REQUIRES the reservation's own bind primitive; refusing
+            # here beats arming a guard whose recovery would weaken the port.
+            if bind_factory is None:
+                raise ValueError(
+                    "ListenerGuard over a reserved-socket site needs bind_factory: "
+                    "recovery must rebind with the reservation's exclusive option "
+                    "set, not a plain TCPSite"
+                )
+            self._bind_factory = bind_factory
         self._backlog = site._backlog
-        self._reuse_address = site._reuse_address
-        self._reuse_port = site._reuse_port
         self._ssl_context = site._ssl_context
         self._loop: asyncio.AbstractEventLoop | None = None
         self._previous_handler: Callable[..., Any] | None = None
@@ -263,7 +308,7 @@ class ListenerGuard:
     # ── public surface ───────────────────────────────────────────────────
 
     @property
-    def site(self) -> web.TCPSite:
+    def site(self) -> web.TCPSite | web.SockSite:
         """The site currently serving (replaced on every successful rebind)."""
         return self._site
 
@@ -416,11 +461,15 @@ class ListenerGuard:
             if self._stopped or self._shutdown_event.is_set():
                 return False
             release_site(self._site)
-            new_site = self._new_site()
+            new_site: web.TCPSite | web.SockSite | None = None
             try:
+                new_site = await self._new_site()
                 await new_site.start()
             except OSError as exc:
-                release_site(new_site)
+                # A factory bind failure leaves no site (the factory closes its
+                # socket on the way out); a start() failure leaves one to release.
+                if new_site is not None:
+                    release_site(new_site)
                 delay = min(self._backoff_base * (2 ** (attempt - 1)), self._max_backoff)
                 logger.error(
                     "Listener rebind attempt %d/%d failed: %s -- retrying in %.1fs",
@@ -496,9 +545,21 @@ class ListenerGuard:
         )
         self._shutdown_event.set()
 
-    def _new_site(self) -> web.TCPSite:
+    async def _new_site(self) -> web.TCPSite | web.SockSite:
         # shutdown_timeout is deliberately not forwarded: aiohttp owns it on the
         # runner, and the runner is shared with the site being replaced.
+        if self._bind_factory is not None:
+            # Reserved-socket recovery: rebind through the reservation's own
+            # primitive so the recovered listener carries the SAME exclusive
+            # option set the dead one held (Windows SO_EXCLUSIVEADDRUSE,
+            # IPV6_V6ONLY), then hand the live socket to a fresh SockSite —
+            # exactly the boot shape. The factory blocks (getaddrinfo + bind
+            # syscall), so it runs off the loop.
+            # The factory path only arises on the SockSite branch, where the
+            # host was read from the live socket's real name (a str); the
+            # `or ""` only narrows the TCPSite-side Optional for the checker.
+            sock = await asyncio.to_thread(self._bind_factory, self._host or "", self._port)
+            return web.SockSite(self._runner, sock)
         return web.TCPSite(
             self._runner,
             self._host,
@@ -510,7 +571,7 @@ class ListenerGuard:
         )
 
     @staticmethod
-    def _bound_port(site: web.TCPSite) -> int:
+    def _bound_port(site: web.TCPSite | web.SockSite) -> int:
         sockets = _listening_sockets(site)
         if not sockets:
             return 0
@@ -519,6 +580,25 @@ class ListenerGuard:
         except OSError:
             return 0
         return target[1] if target else 0
+
+    @staticmethod
+    def _bound_host(site: web.TCPSite | web.SockSite) -> str:
+        """The live LISTEN socket's own bind address, for a rebind on the same name.
+
+        Read at construction, when the just-started site's socket is live.
+        Falls back to the IPv4 loopback when no socket name is readable — the
+        narrowest possible surface, so a degraded capture can never widen a
+        loopback deployment to a wildcard bind.
+        """
+        sockets = _listening_sockets(site)
+        if sockets:
+            try:
+                name = sockets[0].getsockname()
+            except OSError:
+                name = None
+            if isinstance(name, (tuple, list)) and name and isinstance(name[0], str):
+                return name[0]
+        return "127.0.0.1"
 
 
 def listener_guard_exit_code(guard: ListenerGuard | None) -> int:

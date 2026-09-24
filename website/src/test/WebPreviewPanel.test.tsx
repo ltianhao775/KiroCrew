@@ -734,6 +734,88 @@ describe('WebPreviewPanel — Playwright CLI browser view', () => {
     expect(screen.getByText('Preview a local web server')).toBeInTheDocument()
   })
 
+  it('prefers the same-origin relay path over the loopback URL when the gateway offers one', async () => {
+    // `path` rides the dashboard's own origin, so it is what makes the view
+    // reachable from a remote browser (SSH forward, tunnel) — the absolute
+    // loopback URL stays only as the older-gateway fallback. The path embeds
+    // the relay's capability token; the panel treats it as opaque.
+    getBrowserView.mockResolvedValue({ ...RUNNING, path: '/browser-view/capAbc123xyz_-0/' })
+    renderWithProviders(<WebPreviewPanel sessionKey="sess-1" />)
+    const frame = await screen.findByTitle('Live browser session') as HTMLIFrameElement
+    // jsdom absolutizes a relative src against the page origin; the pathname is
+    // the contract.
+    expect(new URL(frame.src).pathname).toBe('/browser-view/capAbc123xyz_-0/')
+    expect(new URL(frame.src).origin).toBe(window.location.origin)
+  })
+
+  it('frames the view WITHOUT allow-same-origin, so it cannot reach dashboard state', async () => {
+    // The relay serves the view SPA on the dashboard's own origin; the opaque
+    // origin (no allow-same-origin) is what keeps that content — or anything
+    // squatting the relay's loopback target port — away from the parent DOM
+    // and the cookie-authed APIs.
+    getBrowserView.mockResolvedValue({ ...RUNNING, path: '/browser-view/capAbc123xyz_-0/' })
+    renderWithProviders(<WebPreviewPanel sessionKey="sess-1" />)
+    const frame = await screen.findByTitle('Live browser session') as HTMLIFrameElement
+    const sandbox = frame.getAttribute('sandbox') ?? ''
+    expect(sandbox).toContain('allow-scripts')
+    expect(sandbox).not.toContain('allow-same-origin')
+    // Popup parity with the direct path: allowed, but WITHOUT the escape
+    // variant — a popup inherits the sandbox (opaque origin included), so
+    // parity costs no isolation.
+    expect(sandbox).toContain('allow-popups')
+    expect(sandbox).not.toContain('allow-popups-to-escape-sandbox')
+  })
+
+  it('keeps allow-same-origin for the direct-URL fallback, which never gets the relay shim', async () => {
+    // Older gateway, no relay `path`: the frame loads the loopback URL
+    // directly. That is already a FOREIGN origin (allow-same-origin grants
+    // only itself, not the dashboard), and only relayed documents carry the
+    // localStorage shim — an opaque-origin direct frame crashes the view
+    // SPA's boot on its bare storage access.
+    getBrowserView.mockResolvedValue(RUNNING)
+    renderWithProviders(<WebPreviewPanel sessionKey="sess-1" />)
+    const frame = await screen.findByTitle('Live browser session') as HTMLIFrameElement
+    expect(frame.src).toBe('http://127.0.0.1:45613/')
+    const sandbox = frame.getAttribute('sandbox') ?? ''
+    expect(sandbox).toContain('allow-same-origin')
+    expect(sandbox).toContain('allow-scripts')
+  })
+
+  it('refuses a malformed relay path and falls back to the reported URL', async () => {
+    // A protocol-relative value ('//host') would navigate off-origin if framed;
+    // the shape check drops it and the loopback URL is used instead.
+    getBrowserView.mockResolvedValue({ ...RUNNING, path: '//evil.example/x' })
+    renderWithProviders(<WebPreviewPanel sessionKey="sess-1" />)
+    const frame = await screen.findByTitle('Live browser session') as HTMLIFrameElement
+    expect(frame.src).toBe('http://127.0.0.1:45613/')
+  })
+
+  it('never fires the liveness probe against a relay path — only the direct fallback', async () => {
+    // The relay is same-origin, so its health is the dashboard's own — and a
+    // no-cors probe against it would answer opaque (telling us nothing) while
+    // costing the relay's per-request ownership proofs every 5 seconds for
+    // every open panel. The probe exists for the DIRECT loopback fallback,
+    // whose reachability genuinely differs from this browser's point of view.
+    getBrowserView.mockResolvedValue({ ...RUNNING, path: '/browser-view/capAbc123xyz_-0/' })
+    const relayRender = renderWithProviders(<WebPreviewPanel sessionKey="sess-1" />)
+    await screen.findByTitle('Live browser session')
+    const relayProbes = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .map(c => String(c[0]))
+      .filter(u => u.includes('/browser-view'))
+    expect(relayProbes).toEqual([])
+    relayRender.unmount()
+
+    // Positive control, proving this harness detects the probe when it IS
+    // enabled: the direct-URL fallback (old gateway, no `path`) still probes.
+    getBrowserView.mockResolvedValue(RUNNING)
+    renderWithProviders(<WebPreviewPanel sessionKey="sess-2" />)
+    await screen.findByTitle('Live browser session')
+    const directProbes = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .map(c => String(c[0]))
+      .filter(u => u.startsWith('http://127.0.0.1:45613'))
+    expect(directProbes.length).toBeGreaterThan(0)
+  })
+
   it('layers nothing over the frame, so the CLI keeps its remote input', async () => {
     // The CLI dashboard's own mouse/keyboard input IS the control surface. A
     // scrim or hint bar over the frame would swallow exactly those events, so
@@ -1493,9 +1575,10 @@ describe('WebPreviewPanel — address bar launcher (non-native transport)', () =
     const frame = await screen.findByTitle('Live browser session') as HTMLIFrameElement
     expect(frame.src).toBe('http://127.0.0.1:45613/')
     expect(screen.queryByText('Preview server not reachable')).toBeNull()
-    // The header names THIS chat's browser by the session name the framed sidebar
-    // lists (visible label, not a tooltip), and one line says how the next page is opened.
-    expect(screen.getByText("This chat's browser")).toBeInTheDocument()
+    // The header names what THIS chat launched, by the session name the framed
+    // sidebar lists (visible label, not a tooltip), and one line says how the next
+    // page is opened.
+    expect(screen.getByText('Opened from this chat')).toBeInTheDocument()
     expect(screen.getByTestId('web-preview-session-name').textContent).toBe('panel-1234abcd')
     // Narrow widths (320px): the label group is the row's only flexible item and
     // truncates, so the header's controls — the way back to the preview bar —
@@ -1504,8 +1587,29 @@ describe('WebPreviewPanel — address bar launcher (non-native transport)', () =
     expect(group.className).toMatch(/\bmin-w-0\b/)
     expect(group.className).toMatch(/\bflex-1\b/)
     expect(group.className).not.toMatch(/\bshrink-0\b/)
-    expect(screen.getByText("This chat's browser").className).toMatch(/\btruncate\b/)
+    expect(screen.getByText('Opened from this chat').className).toMatch(/\btruncate\b/)
     expect(screen.getByText(/^Click the padlock above the page/)).toBeInTheDocument()
+  })
+
+  it('states what this chat launched, never which session the frame is showing', async () => {
+    // #5940. The reveal that points the framed dashboard's one viewport at a
+    // session is machine-wide, so an agent or CLI launch for another chat's
+    // session -- or a second dashboard tab -- moves the frame with no signal this
+    // panel can see. The header therefore states a launch FACT and withdraws the
+    // ownership claim: "this chat's browser" described a page the reader was
+    // often not looking at, and nothing here can substantiate a stronger reading.
+    // Asserted as the absence of the old wording as well as the presence of the
+    // new one, because a header that regained the claim would still satisfy the
+    // presence half on its own.
+    renderWithProviders(<WebPreviewPanel sessionKey="sess-1" />)
+    submit('google.com')
+    await screen.findByTitle('Live browser session')
+    const label = screen.getByTestId('web-preview-session-label')
+    expect(label).toHaveTextContent('Opened from this chat')
+    expect(label).toHaveTextContent('panel-1234abcd')
+    expect(label.textContent).not.toMatch(/this chat's browser/i)
+    // Nor anywhere else in the panel: the claim must not survive by moving.
+    expect(document.body.textContent).not.toMatch(/this chat's browser/i)
   })
 
   it('the padlock hint is one sentence and stays dismissed in this browser once dismissed', async () => {

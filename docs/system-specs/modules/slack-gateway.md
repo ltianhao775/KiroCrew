@@ -222,6 +222,55 @@ log, per-thread override maps, trust set). The canonical form is stable
 across all messages of a thread; the legacy bare form is folded onto the same
 live session by `SessionManager._fold_key` (see session.md).
 
+`slack.dm_single_session` (default off) splits those two for a 1:1 DM. A
+message in a `D…` channel runs under `slack:<channel_id>` —
+`flat_dm_session_key`, one session for the whole DM instead of one per
+message — and a top-level message posts at channel root, so `post_thread_ts` is
+`None` while `reply_ts` keeps its thread-index and reaction meaning. A THREADED
+reply in that DM joins the same session: in a 1:1 DM a thread is a layout habit
+rather than a new topic, so splitting it off would leave the branch without the
+conversation it answers. Only the session merges — the reply, the `!stop` ack and
+a privacy modifier's confirmation all still post where they were addressed, back
+inside the thread. The session is bound to
+the channel (`set_channel`) and NOT to a thread: a flat conversation has no
+thread for `set_slack_link` to claim, claiming one would give the dashboard
+mirror a thread to post into while the conversation itself is flat, and with
+several threads the scalar `slack_thread_ts` would flip to whichever spoke last.
+Routing needs no claim regardless: the flat key is DERIVED from the channel, so
+it is recomputed rather than looked up. That holds
+for every writer of the link, not just the turn's own self-link:
+`maybe_apply_privacy_modifiers` takes a separate `link_thread` flag, which is
+false in flat mode, so `!temporary` / `!incognito` register no thread while still
+confirming in place. A thread already claimed by its own per-thread session — the
+shape this feature replaces, e.g. from before the flag was on — is ignored so it
+cannot pull the turn back out of the merged conversation; any OTHER owner (a
+dashboard send-to-Slack) still wins.
+Group channels and group DMs (`mpim`) are excluded — a thread there is
+a deliberate scope boundary, and an `mpim` is shared with other people. The key
+keeps the two-segment `slack:<scope>` shape on purpose, so callers that treat a
+Slack key as opaque or reverse-derive from it are unaffected.
+
+One consumer needs the shape spelled out: `file_send`'s upload handler resolves
+its target from the session map, and its thread-first branch requires a thread
+before it will use the linked channel. A flat DM has a channel and no thread, so
+it fell through to the owner's DM — a file sent to a different conversation than
+the one that asked. The handler now also accepts "channel, no thread" when the
+session key IS that channel's key (`slack:<channel_id>`), delivering at the DM's
+root. Deliberately not broader: a thread-scoped or dashboard session that merely
+knows a channel keeps failing closed to the owner DM rather than broadcasting at
+the root of a channel it does not own.
+
+`_route_message` derives the same key for its busy/queue bookkeeping; keyed on
+the message ts instead, a second DM would read as not-busy, skip the queue and
+block inside `get_or_create` with none of the queued-message feedback. That
+derivation (`_dm_single_session_enabled`) additionally requires the turn to
+take the messaging-transport path, because only `handle_message_transport`
+honours the flat key: with `messaging.use_transport` off, or in a review-mode
+channel that `_route_message` deliberately keeps on native for its privacy
+gate, the turn runs under `canonical_key(msg_ts)` and the bookkeeping keys the
+same way. Both conditions live in that one helper so `!stop`, the queue check
+and `message_deleted` cannot disagree.
+
 1. Check hooks for auto-reply
 2. Check `status` keyword — reply with stats summary
 3. Check owner-only `!` commands (`!yolo`, `!agent`, `!ta`, `!allowlist`, `!dashboard`)
@@ -424,7 +473,7 @@ Slack `file_share` messages are processed in `_route_message()` after dedup + au
 - Tool calls shown inline as 🔧 _tool name_
 - **Thinking/reasoning content** filtered from the main response — accumulated separately and posted as a 💭 thread reply after the main message. Inline `<thinking>` / `</thinking>` tags are also stripped as a safety net. The thread reply is suppressed when `slack.show_thinking` is `false` (default `true`).
 - Final message split into multiple posts if over 3900 chars (via `split_message()`)
-- **Redaction notice** — when the delivered text (answer or thinking) still carries a `security.CREDENTIAL_REDACTION_TAGS` placeholder or a `security.EXFILTRATION_REDACTION_TAG_PREFIX` (suspicious-URL) placeholder, one `messaging.renderer.redaction_notice` message is posted in the thread after the answer is committed, so the reader knows a command or link they copy will not run as pasted. Worded by kind (credential → re-enter the secret; URL → re-check the link), and byte-identical to the prior `credential_redaction_notice` sentence when only credentials were rewritten. Redaction is NOT relaxed — Slack is an egress path. Counted from the tag in the sent text rather than the redactor's warnings list, which is empty on the streaming path because each chunk was already redacted upstream. **One notice per turn**: answer and thinking share a single tally. Approving a review-mode draft (`interactions.py`) posts the same notice for the same reason, since that publishes to the whole channel. Both posts are best-effort — a failed notice must never turn a delivered answer into a failed turn
+- **Redaction notice** — when the delivered text (answer or thinking) still carries a `security.CREDENTIAL_REDACTION_TAGS` placeholder or a `security.EXFILTRATION_REDACTION_TAG_PREFIX` (suspicious-URL) placeholder, one `messaging.renderer.redaction_notice` message is posted in the thread after the answer is committed, so the reader knows a command or link they copy will not run as pasted. Worded by kind (credential → re-enter the secret; URL → re-check the link), and byte-identical to the prior `credential_redaction_notice` sentence when only credentials were rewritten. Redaction is NOT relaxed — Slack is an egress path. Counted from the tag in the sent text rather than the redactor's warnings list, which is empty on the streaming path because each chunk was already redacted upstream. **One notice per turn**: answer and thinking share a single tally. Approving a review-mode draft (`interactions.py`) posts the same notice for the same reason, since that publishes to the whole channel. Both posts are best-effort — a failed notice must never turn a delivered answer into a failed turn. The transport-path renderer (`slack/renderer.py`, the default `messaging.use_transport` delivery) posts the same one-per-turn notice: the final display-safe answer body and the posted 💭 reasoning share a single tally, counted with `messaging.renderer.count_redaction_tags` over the form the reader is left with — which can carry placeholders the driver's byte-level stream scan never wrote, because `_display_safe` re-redacts against what Slack renders
 
 ## Message Queue (`session.py` + `events.py`)
 
@@ -558,7 +607,40 @@ A channel-neutral dispatch path that replaces the native `handle_message` stream
 4. `events.py` routes `interactive` Socket Mode event to `interactions.dispatch()`
 5. Approval/rejection sent to ACP, streaming resumes or stops
 6. Approval button message replaced with outcome text
-7. 120s timeout — auto-rejects if no click
+7. Timeout — steers an in-band approval-timeout notice into the running
+   turn (`deny_notice.steer_refusal_notice`: capability-gated, cause
+   `approval_timeout`, bounded by `constants.STEER_NOTICE_BOUND_SECS`,
+   best-effort), then auto-rejects. The model is told the prompt expired
+   unanswered instead of reading kiro-cli generic denial text as a human
+   refusal (dashboard precedent: PR #10217). Both Slack paths do this: the
+   native `_request_approval` arm (120s) below, and the transport path, where
+   `SlackApprovalDecider` records `last_deny_cause = approval_timeout` on
+   expiry and the channel-neutral `TurnDriver` steers it before `reject_tool`
+   (see the messaging spec's approval ladder).
+
+### Claim-winner invariant (timeout arm ↔ `handle_interaction`)
+
+The pending-approval registry entry is claimed with `pop(key)` BEFORE any
+await, on both sides:
+
+- `_request_approval`'s timeout arm pops first; only when it wins the claim
+  does it steer and answer the wire (`reject_tool`). A lost claim means a
+  click owns the answer; the arm then awaits the click's real outcome via the
+  shielded waiter future until it resolves -- no bound, no fabricated
+  rejection, nothing on the wire. Every way the click can end resolves that
+  future: its approve/reject completes, its write raises (the click
+  self-answers the wire), or a backend that stopped reading stdin is torn
+  down by the ACP tool-stall watchdog, which raises out of the parked write.
+- `handle_interaction` pops at lookup. If its `approve_tool`/`reject_tool`
+  raises after claiming, it answers the wire itself (`_reject_orphaned_tool`)
+  and resolves the waiter — a timeout arm that already returned can never
+  claim again.
+
+Exactly one side ever answers a given `request_id`: a second answer lands in
+the ACP client's popped-options cancelled-outcome fallback, which cancels the
+whole turn. Every fallback rejection that reaches the wire is recorded in the
+SEL audit trail by `_reject_orphaned_tool`. Editors of either function must
+preserve this contract.
 
 ## Session Management
 

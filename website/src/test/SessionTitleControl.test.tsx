@@ -51,13 +51,15 @@ function makeStore(memoryMode?: string) {
   })
 }
 
-function renderControl(opts: { onError?: (m: string, t: string) => void; memoryMode?: string } = {}) {
+function renderControl(opts: { onError?: (m: string, t: string) => void; memoryMode?: string; compact?: boolean } = {}) {
   const store = makeStore(opts.memoryMode)
   // Mirrors the real hosts: the title prop follows the store. `slot` is a
   // prop so a test can re-target the same instance like the main header does.
+  // `compact` (the pane header's typography) is the default here; the main
+  // header's variant is opted into where a contract must hold for both hosts.
   const Host = ({ slot }: { slot: string }) => {
     const title = useSelector((s: RootState) => s.dashboard.slots.find((x) => x.key === slot)?.title ?? slot)
-    return <SessionTitleControl slotKey={slot} title={title} compact onError={opts.onError} />
+    return <SessionTitleControl slotKey={slot} title={title} compact={opts.compact ?? true} onError={opts.onError} />
   }
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const tree = (slot: string) => (
@@ -114,19 +116,62 @@ describe('SessionTitleControl', () => {
     await waitFor(() => expect(screen.queryByDisplayValue('  Renamed alpha  ')).toBeNull())
   })
 
-  it('opens with the whole title selected, so a long name shows its start rather than a scrolled tail', () => {
+  // Three nightly GUI testers read the open editor as "highlighted, not
+  // editable" (#13050, #12772, #13325): the input used to strip every piece of the
+  // shared Input chrome and sit inside the same hover pill as the read-only
+  // title, with the whole name selected -- and a range selection paints no
+  // caret in any engine. These pin the affordance the fix adds. Static
+  // contracts on the class strings: happy-dom lays nothing out and computes
+  // no `:focus-visible`, so the measured heights live in the PR's captures.
+  const READ_ONLY_PILL = 'cursor-text flex min-w-0 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover focus-within:bg-bg-hover transition-colors'
+  const INPUT_CHROME = ['border', 'border-accent', 'bg-bg-elevated', 'focus-ring']
+  // The overrides that used to strip the Input's chrome at this call site.
+  const STRIPPED_CHROME = ['bg-transparent', 'border-0', 'rounded-none', 'p-0', 'focus:!shadow-none', 'focus-visible:border-b', 'focus-visible:border-accent']
+  const classes = (el: Element) => el.className.split(/\s+/).filter(Boolean)
+
+  it('opens as an unmistakable text input: the shared Input border, background and focus ring, with a caret at the end', () => {
     renderControl()
     const input = openEditor()
-    // Caret parked at the end, as autofocus leaves it; the focus the browser
-    // delivers on open is what the control selects on.
-    act(() => { input.setSelectionRange(TITLE.length, TITLE.length) })
+    // Some engines leave a programmatic focus with the selection at the
+    // start (and the field scrolled); the focus the browser delivers on open
+    // is what the control places the caret on.
+    act(() => { input.setSelectionRange(0, 0); input.scrollLeft = 40 })
     act(() => { fireEvent.focus(input) })
-    expect(input.selectionStart).toBe(0)
+    // A collapsed selection at the end: a caret the user can see, nothing
+    // selected. (Select-all would replace the title on the first keystroke,
+    // but a range selection suppresses the caret everywhere, and the caret is
+    // the cue the testers missed.) The field itself opens scrolled to its
+    // start, so a name wider than the box still shows its beginning.
+    expect(input.selectionStart).toBe(TITLE.length)
     expect(input.selectionEnd).toBe(TITLE.length)
-    // Anchored backward: the selection FOCUS is at the start, which is what
-    // makes the browser scroll the input to show the beginning of a long name.
-    expect(input.selectionDirection).toBe('backward')
     expect(input.scrollLeft).toBe(0)
+    for (const c of INPUT_CHROME) expect(classes(input)).toContain(c)
+    for (const c of STRIPPED_CHROME) expect(classes(input)).not.toContain(c)
+    // The editor IS the box: no hover pill painted behind it any more.
+    expect(classes(input.parentElement!)).not.toContain('bg-bg-hover')
+  })
+
+  it.each([
+    ['split-view pane header (compact)', true],
+    ['single-session header', false],
+  ])('%s: the editor keeps the read-only title\'s type and box, so the header does not move when editing starts or ends', (_host, compact) => {
+    renderControl({ compact })
+    const pill = screen.getByRole('button', { name: TITLE }).parentElement!
+    expect(pill.className).toBe(READ_ONLY_PILL)
+    const label = screen.getByText(TITLE)
+    const typeClasses = classes(label).filter((c) => /^(text-|font-|session-header-title)/.test(c))
+    // Coherence check: the read-only title's size, weight and colour are what gets mirrored.
+    expect(typeClasses).toEqual(expect.arrayContaining(['font-semibold', compact ? 'text-[13px]' : 'text-sm']))
+    const input = openEditor()
+    for (const c of typeClasses) expect(classes(input)).toContain(c)
+    for (const c of INPUT_CHROME) expect(classes(input)).toContain(c)
+    // The pill's padding (py-0.5 = 2px, px-1.5 = 6px) becomes the editor's
+    // 1px border + 1px / 5px padding, and the editing wrapper adds none of
+    // its own -- the box the title sits in keeps its size in both states.
+    expect(classes(input)).toEqual(expect.arrayContaining(['py-px', 'px-[5px]', 'rounded-l-[2px]', 'rounded-r-md']))
+    expect(classes(input.parentElement!).some((c) => /^-?p[xytrbl]?-/.test(c))).toBe(false)
+    // Same width rule as the read-only title on the main header.
+    expect(classes(input).includes('md:max-w-[50vw]')).toBe(!compact)
   })
 
   it('caps the draft at the 200 characters the rename route keeps, so no typed tail is cut server-side', () => {

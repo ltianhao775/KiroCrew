@@ -16,7 +16,10 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.agent_sdk.backends import effort_config_option_id
+from kiro_crew.agent_sdk.backends import (
+    effort_config_option_id,
+    effort_config_option_value,
+)
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config import live
@@ -25,6 +28,7 @@ from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
+    scrub_agent_subprocess_env,
     wrap_argv,
     wrap_argv_async,
 )
@@ -360,6 +364,12 @@ class AcpWorker(Worker):
                     requested,
                 )
                 return
+            # The harness's own spelling first, then the advertised fold: the
+            # table answers a level this harness does not HAVE, and
+            # ``_select_effort_level`` answers one the current model will not
+            # take. Both are asked here so this site writes the same value as
+            # the three other effort writers.
+            requested = effort_config_option_value(backend, requested)
             supported = client.get_valid_effort_levels()
             if not isinstance(supported, list):
                 supported = []
@@ -437,11 +447,18 @@ class AcpWorker(Worker):
 class CCWorker(Worker):
     """Long-lived external agent CLI subprocess using stream-json I/O."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, sandbox_mode: Optional[str] = None) -> None:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
         self._event_queue: asyncio.Queue[Optional[dict]] = asyncio.Queue()
         self._claude_bin: Optional[str] = None
+        # The operator's ``agent.sandbox`` tier, pre-resolved by the pool off
+        # the event loop -- the same argument, from the same reader
+        # (``_get_sandbox_mode``), that ``AcpWorker`` takes. Every agent child
+        # answers to the one configured tier, so this worker must receive it
+        # rather than take ``wrap_argv``'s own default. ``None`` -> resolve
+        # lazily in ``_spawn`` (direct construction outside the pool / tests).
+        self._sandbox_mode = sandbox_mode
 
     async def start(self) -> None:
         self._claude_bin = shutil.which("claude")
@@ -473,8 +490,28 @@ class CCWorker(Worker):
         fetch_tools = os.environ.get("KIROCREW_KNOWLEDGE_FETCH_TOOLS", "").strip()
         if fetch_tools:
             cmd += ["--allowedTools", fetch_tools]
+        # Resolved per spawn into a LOCAL, never stored: ``_spawn`` also serves
+        # the respawn paths (``send_message``'s recovery, ``reset_conversation``),
+        # so a stored value would pin every later worker process to the tier read
+        # at the first one. Same expression, same reader, same reason as
+        # ``AcpWorker.start``.
+        sandbox_mode = (
+            self._sandbox_mode
+            if self._sandbox_mode is not None
+            else await asyncio.to_thread(_get_sandbox_mode)
+        )
+        # ``strip_python_env`` for the same reason every other agent spawn
+        # passes it: this is a FOREIGN runtime, and any Python it reaches for
+        # must not inherit Kiro Crew's interpreter paths.
         wrapped = cgroup_scope_argv(
-            (await wrap_argv_async(cmd, _prepare=wrap_argv))[0]
+            (
+                await wrap_argv_async(
+                    cmd,
+                    mode=sandbox_mode,
+                    strip_python_env=True,
+                    _prepare=wrap_argv,
+                )
+            )[0]
         )  # cgroup DoS ceiling
         self._proc = await create_subprocess_limited(
             *wrapped,
@@ -496,6 +533,14 @@ class CCWorker(Worker):
             # mypy's Popen overload resolution on the build fleet.
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+            # The agent enforcement point, passed exactly as the agent-CLI
+            # spawns in ``dashboard/handlers/sessions.py`` pass it. This worker
+            # runs with its permission prompts disabled and its inputs are
+            # knowledge documents, so gateway-owned credentials must not be
+            # readable inside it. The tier does not cover this: no tier below
+            # ``strict`` scrubs the agent-denied keys, so the parent side is
+            # where they are removed.
+            env=scrub_agent_subprocess_env(),
         )
         self._event_queue = asyncio.Queue()
         self._reader_task = asyncio.create_task(self._stdout_reader())
@@ -628,7 +673,6 @@ class LLMPool:
         self._available: asyncio.Queue[int] = asyncio.Queue()
         self._started = False
         self._provider_type: str = ""
-        self._sandbox_mode: str = "auto"
         self._config: dict = {}
         self._start_lock = asyncio.Lock()
         # Idle-TTL scale-to-zero (see DEFAULT_IDLE_TTL_SECS). Set from config in
@@ -731,7 +775,6 @@ class LLMPool:
             # Read config once, off the event loop, and reuse for every worker.
             config = await asyncio.to_thread(_read_config)
             self._provider_type = _get_provider_type(config)
-            self._sandbox_mode = _get_sandbox_mode(config)
             # Allow config to override pool size (knowledge.extraction_pool_size).
             # Only applies when the key is explicitly set in config (not the
             # fallback default), so callers that pass a specific pool_size to the
@@ -777,12 +820,25 @@ class LLMPool:
             )
 
     async def _create_worker(self) -> Worker:
-        """Create and start a new worker based on provider type."""
+        """Create and start a new worker based on provider type.
+
+        The tier is read HERE, per construction, rather than taken from the
+        value ``start`` resolved. A pool outlives many workers -- the idle
+        reaper scales it to zero and ``acquire`` builds it back up, and a
+        worker that dies is replaced -- so a value stored at start became the
+        tier for every worker the pool ever built, and the operator's later
+        ``agent.sandbox`` edit reached none of them. The config subscription
+        does not cover this: it watches the two pool-size keys only.
+
+        Off the loop because the read stats and may re-parse ``config.json``,
+        the same reason ``start`` offloads its own read.
+        """
+        sandbox_mode = await asyncio.to_thread(_get_sandbox_mode)
         if is_claude_code(self._provider_type):
-            worker: Worker = CCWorker()
+            worker: Worker = CCWorker(sandbox_mode=sandbox_mode)
         else:
             worker = AcpWorker(
-                sandbox_mode=self._sandbox_mode,
+                sandbox_mode=sandbox_mode,
                 effort=self._effort,
             )
         await worker.start()

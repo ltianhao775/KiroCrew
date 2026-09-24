@@ -625,6 +625,40 @@ class TestCredentialShapedNamesAreRefusedAtCreation:
             assert _roster_mask(benign) == benign
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad", ["Issue Radar", "-radar", "radar-", "Радар", "ra/dar", "a" * 65]
+    )
+    async def test_creation_refuses_a_name_the_roster_would_skip(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        """``GET /api/members`` drops any row failing ``_AGENT_NAME_RE``; a name that
+        fails it must never be persisted, or the crew exists and no roster can
+        show or open it. Refused at the source, for every client of this route."""
+        seed = _seed_config_with_every_field_set()
+        tmp = tmp_path / "config.json"
+        tmp.write_text(json.dumps(seed), encoding="utf-8")
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+            from kiro_crew.dashboard.handlers import api_kirocrew_agents_create
+
+            @web.middleware
+            async def _owner(request: web.Request, handler):  # type: ignore[no-untyped-def]
+                request["app"] = ""
+                request["user"] = "owner-1"
+                return await handler(request)
+
+            app = web.Application(middlewares=[_owner])
+            app["state"] = types.SimpleNamespace(owner_id="owner-1", conversation_log=None)
+            app.router.add_post("/api/agents", api_kirocrew_agents_create)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/agents", json={"name": bad, "kiro_agent": "kirocrew"}
+                )
+                assert resp.status == 400, await resp.text()
+                payload = await resp.json()
+                assert payload["code"] == "invalid_agent_name"
+                assert bad not in json.loads(tmp.read_text(encoding="utf-8")).get("agents", {})
+
+    @pytest.mark.asyncio
     async def test_creation_refuses_a_credential_shaped_name(self, tmp_path: Path) -> None:
         seed = _seed_config_with_every_field_set()
         tmp = tmp_path / "config.json"

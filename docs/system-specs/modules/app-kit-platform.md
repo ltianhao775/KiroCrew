@@ -50,8 +50,8 @@ The registry key `@kirocrew/ui` is internal to the host registry,
 not a browser import-map specifier.
 
 `@tanstack/react-query` resolves through the import map to a vendor stub backed
-by the host's existing module instance. Its hooks, providers and context are
-shared with the dashboard; apps must externalize this dependency rather than
+by the host's existing module instance. Its hooks, provider component and context
+are shared with the dashboard; apps must externalize this dependency rather than
 bundle a second copy. Runtime export parity and identity are regression-tested
 against the pinned dependency. That runtime export surface is app-facing: a
 dependency upgrade must preserve those names and their behavior, or ship an
@@ -61,6 +61,39 @@ Apps needing a newly added export declare `minKiroCrewVersion` for the first
 host release supplying it; this minimum-version gate is not protection against
 future incompatible removals. No independent dependency-version negotiation is
 introduced.
+
+The module is shared; the CACHE is not. An external app renders inside a
+host-mounted provider holding a client of that app's own, so `clear()`, the four
+`*Queries` methods with an absent filter, `setQueryData` and an empty-prefix
+`setQueryDefaults` all reach that app's keys only, and no host key is readable
+from an app bundle. The boundary is the client rather than a guarded wrapper
+because a missing filter means every key on four separate methods, so a separate
+cache answers the whole surface at once instead of a list that must stay complete.
+A builtin app keeps the dashboard's client, matching the namespace `useTrustedAppId()`
+already grants it: builtin pages are host code and share key prefixes with the
+dashboard deliberately. The client is held per app id AND per host session binding,
+so the cache an app returns to under one binding is the one it left, two installed
+apps cannot read each other's, and two mounts of ONE app under different bindings
+cannot either. The binding belongs in that identity because the same app id is
+hosted under several at once -- `AppPage` as `dashboard:ui`, a chat side panel as
+`dashboard:<slot>` per slot -- while the binding travels only as the `X-Session-Key`
+header `scopedApi` sends and an external app's query key is passed through
+unprefixed, since `useTrustedAppId()` refuses it a namespace. Without the binding in
+the key, two panels reading one key under two sessions share one entry and
+`staleTime: Infinity` serves the first session's value to the second panel with no
+error surface. A host that passes no binding shares one entry under a sentinel no
+app id can spell. Holding the
+client is not a retention guarantee for the queries in it: `resolveCacheRetention`
+returns `null` for an external app, so its queries expire on the client's own
+`gcTime` and the thirty-minute `APP_CACHE_RETENTION_MS` window belongs to builtin
+pages, which `BuiltinAppRoute` mounts `AppCacheRetention` for.
+Each app client registers with `registerRecoverableQueryClient`, and the host's
+post-lapse recovery invalidation runs through `invalidateAcrossQueryClients`, so a
+query an app lost to a session lapse heals on recovery like a dashboard query.
+That direction is host to app: it refreshes an app's own failed query and reaches
+no host key from an app bundle.
+The dashboard's own client is reachable from host code only; it is absent from
+the import map and from every vendor stub, which is what the boundary rests on.
 
 ## Host-mediated chat launch and cron toggles
 
@@ -287,9 +320,9 @@ emitted: besides the external-source label and older clients,
 `appManifest.ts::keysFor` (first-party copy gate) and `pickFeatured`'s
 legacy arm still read it.
 
-## 1. App MCP servers land in KiroCrew's agent config, never the shared kiro file
+## 1. App MCP servers land in Kiro Crew's agent config, never the shared kiro file
 
-An app's `mcpServers` are written into KiroCrew's own agent config
+An app's `mcpServers` are written into Kiro Crew's own agent config
 (`<kiro agents dir>/kirocrew.json`, resolved through `config.paths.kiro_agents_dir`
 so test/dev home redirects are honoured), **not** the shared
 `~/.kiro/settings/mcp.json`.
@@ -298,7 +331,7 @@ Why it is a contract and not a detail: the shared file is read by everything els
 living under `~/.kiro` — the Kiro IDE and every other kiro-cli agent — so
 registering an app's servers there leaked that app's private tools into surfaces
 that never installed it, and a dead HTTP entry there broke EVERY kiro session, not
-just the app's. KiroCrew sessions read only the agent config (`includeMcpJson` is
+just the app's. Kiro Crew sessions read only the agent config (`includeMcpJson` is
 pinned False in `agent.py`), so the narrower target is also sufficient.
 
 **Migration is finished at boot, not at disable.** `reconcile_enabled_app_resources`
@@ -690,6 +723,10 @@ Writer: `dashboard/server.py::discover_app_window_entries`
 (`APP_WINDOW_URL_PREFIX = "app-windows"`);
 exclusion: `dashboard/token_auth.py::register_app_window_paths`.
 
+The dashboard service worker also declines every `/app-windows/` request. These are standalone top-level documents, not SPA routes, so a failed app-window navigation must never fall back to the cached dashboard shell. In Electron that fallback can put the full dashboard inside a frameless, non-focusable, full-display overlay with no close controls.
+
+Full-display window hosts additionally fail closed on their own network result. Mochi and Crew Companion hide an overlay whose main-frame navigation completes with a 4xx/5xx response or fails at the transport; Crew Companion also keeps its hidden notification owner inert on either failure. The shared latch classifies completed responses, transport failures, sub-frames, and superseded navigations; each host retains its own visibility, credential, retry, and ownership policy. The corresponding reconcile loop alone may reload failed windows after a gateway probe accepts the current credential. A failed page never performs its reveal or ownership handshake, and retries stay bounded by the reconcile cadence. Writers: `website/public/sw.js`, `website/electron/app-window-error-latch.js`, `website/electron/mochi/petOverlays.js`, `website/electron/crew-companion/petOverlay.js`; executable contracts: `website/src/test/serviceWorkerSkipRules.test.ts`, `website/electron/test/app-window-error-latch.test.js`, `website/electron/mochi/test/petOverlays.test.js`, `website/electron/crew-companion/test/petOverlay.test.js`.
+
 ## 7. Enabled-app resources are reconciled at startup
 
 Registration used to happen ONLY in the enable path, so an app that gained
@@ -766,6 +803,58 @@ gateway spawned** (`apps/hooks_integration.py::on_gateway_shutdown` →
 `stop_app_backend`). Spawned backends are gateway children: without this stop
 they reparent to PID 1 when the gateway exits and keep listening on their
 ports, and the startup stale-reap only recovers them at the **next** boot.
+A backend is spawned with `start_new_session=True`, so it **leads its own process
+group** and that group outlives it. A SIGKILLed gateway can therefore leave the
+recorded leader dead while a worker or build child keeps the app's port bound, and
+the leader pid is the only thing the pidfile names. The stale-reap handles both
+shapes: a leader still alive is torn down through its group
+(`kill_process_tree_pinned` resolves it via `getpgid`), while a leader already
+**dead** is not simply dropped — its pgid is recoverable from the session-leader
+contract (`pgid == leader pid`) and the group's members are reaped through
+`session_pid.signal_orphaned_spawn_group`. That path never signals the group
+NUMBER, which the kernel may have reissued to an unrelated session leader; it
+lists the group's live members, keeps only those whose environment carries the
+spawn's own `KIROCREW_SPAWN_INSTANCE` token (minted per spawn and persisted in the
+pidfile row beside `(pid, start_time)`), and signals each one pinned to its own pid
+plus start instant. No vouching member means no signal, and the vouch reads
+`/proc/<pid>/environ`, so off Linux nothing is signalled at all. Nothing else
+recovers those survivors either: the periodic orphan sweep identifies an agent
+runtime, an MCP entrypoint, a gatewayd, a browser daemon or a **test-runner**
+argv, and an app backend's worker is none of those — so off Linux such a group is
+neither reaped nor reported, and the decline log line is its only record. That is
+the deliberate trade against signalling a stranger's tree, and the operator's
+recourse is to kill the process holding the port by hand. Without
+this the next generation spawns onto a port an orphan still owns and the app's
+routes answer 502.
+
+The pidfile row is that orphan's **only** handle, so retention is decided from a
+census taken at DECISION time. `signal_orphaned_spawn_group` reports the live members
+it VOUCHED separately from the subset a signal actually reached, and the reap trusts
+neither as the membership: the signalled set is incomplete, because a signal can fail
+on one member and land on another (`pidfd_open` answering EMFILE, or EPERM), and the
+OPENING census is stale, because a backend whose SIGTERM handler forks a replacement
+into the same session group (a supervisor/worker server does) produces a live member that
+snapshot could not contain. So the kill pass runs unconditionally — it is also the
+fresh reading — with its `expected` restricting the SIGNAL to the members the first
+pass vouched, so a post-census newcomer is observed but never signalled: it owes no
+grace, and it is indistinguishable from a fresh occupant of a recycled group number.
+An empty census is not evidence of an empty group either: every read the vouch makes
+is fail-OPEN (the `/proc` scan, each `stat` and each `environ` read all swallow
+`OSError`), so fd exhaustion silently yields an empty census rather than an error. The
+row is therefore dropped only once absence is confirmed POSITIVELY — no live member in
+the final reading AND `pgroup_exists` answering False, which it does on ESRCH alone and
+never for a group it merely cannot read or signal. Being wrong that way costs one
+retained pidfile row, which the app's next successful spawn replaces; being wrong the
+other way costs a port held forever by a process nothing names. The two declines
+detected before any census (no instance token, a host that cannot read the vouch) still
+drop the row, since neither changes between starts.
+
+That retention is real but **bounded by the spawn path**: `start_enabled_app_backends`
+reaps and then spawns every enabled app, and `_record_app_pid` re-records the row
+under the same app name, so a retained handle survives to a later start only while
+the app stays down — disabled, failing to spawn, or not restarted. A start that
+reaped only groups logs its own summary line, because the count the reap RETURNS is
+leaders terminated and would otherwise be zero with nothing said.
 Ordering is deliberate — hooks first, so an app's `on_shutdown` still has its
 own backend alive. Stop targets come from the runtime tracking table
 (`apps/backend.py::spawned_backend_names`), never from persisted `enabled`
@@ -841,6 +930,133 @@ lifecycle lock and the one step that can safely refuse runs FIRST:
 3. Backend stop and resource deregistration (gateway-managed only).
 4. Dependency cleanup (see §11).
 5. File removal, preserving `data/` unless the caller asked to purge.
+6. Resume pointers dropped for every conversation the app owned, on success only.
+
+Step 6 exists because an app's slot key is often DETERMINISTIC — one slot per object
+it tracks, named after that object — and `session.py` resumes a slot's previous
+kiro-cli conversation by that key. Correct while the app is installed; wrong once it
+is gone, since a reinstall would open the same key and resume a transcript from the
+previous installation.
+
+Ownership is read from each conversation's own metadata line, which every save —
+including the save that closes a tab — stamps with `app`. Read through
+`get_metadata_status`, not `get_metadata`: the latter answers `{}` for both "no `app`"
+and "could not read the record", and those are different answers. An unreadable record
+is neither claimed (that would sweep up a conversation this app may not own, worse than
+the pointer it leaves) nor dropped in silence — the keys are logged with a count, and
+completion is not refused, because an uninstall the user asked for does not fail over
+bookkeeping. It has to be a record that
+outlives the tab: a closed app slot is the mainline state before an uninstall, and
+both live `_ChatSlot._app` and `open_slots.json` are gone by then (the latter tracks
+tabs to REOPEN, while the resume pointer deliberately survives close). The scan is
+scoped to session-map keys that still hold a sid, so the index is exactly as wide as
+the pointer problem.
+
+**Known residual, and why it is left open.** An allocation that RESERVES after the
+scan is not in the enumeration, so the conversation it goes on to publish keeps its
+pointer. Closing that window means holding turn admission against this app's keys for
+the duration of the uninstall, and the only admission gate on `SessionManager` is
+`pause_turn_admission_for_update`, which sets `_closing` PROCESS-WIDE: it would refuse
+turns for every app and every conversation while one app uninstalls. A per-key
+admission gate is a change to the allocation boundary, not to this cleanup step. The
+cost of the residual is one stale pointer on one key of an app the user has already
+removed, and the next cold start under that key self-corrects once the suppression
+flag is consumed — so it is stated rather than approximated by a retry loop that would
+read as though the window were closed.
+
+Who performs the write differs by path, because `SessionMap`'s rule 3 makes a
+throwaway instance READ-ONLY — two instances that loaded `_data` independently do not
+merge, each write being a whole-file rewrite of one snapshot:
+
+- **In-gateway** (the uninstall route) both ENUMERATES and clears through the LIVE
+  map. It clears via `SessionManager.discard_conversation`, which also tears the live
+  session down, so a still-open tab of the uninstalled app cannot re-record a sid from
+  the session it was holding. It enumerates via
+  `SessionManager.mapped_session_keys() | session_keys()` rather than a detached read,
+  for the same reason stated from the other side: the file lags the live map by
+  whatever it has not flushed, so a detached enumeration can omit a key whose pointer
+  already exists and the clear then leaves that pointer for a reinstall to resume
+  (`session_keys()` covers an allocation still in flight). One pass: see the residual
+  above for what that leaves and why the alternative is worse. It runs INSIDE
+  `app_lifecycle_lock`, because a step of
+  the uninstall released before the clear lands lets a concurrent reinstall be serving
+  the same slot key again — and the pointer dropped is then the new installation's.
+- **Gateway-less** (`kirocrew app uninstall`) writes through its own `SessionMap`
+  while HOLDING `GatewayLock` across the scan and the write, and declines when it
+  cannot take it. Asking whether a gateway is up cannot establish this: one starting
+  between the question and the write lands in exactly the excluded case. Holding the
+  lock the gateway itself takes makes the exclusion real both ways, and it is also
+  what makes this path's detached READ sound — it is the one path that knows no live
+  map exists. Cost: a gateway starting inside that window is refused as by any other
+  holder.
+
+  A running gateway is the common state and `uninstall` is deliberately not routed
+  through it (unlike `enable`/`disable`), so the decline is an ORDINARY outcome, not
+  an extreme one. Two things follow, and both are part of the contract rather than
+  polish. The clear returns `SessionPointerCleanup(dropped, declined, failed)` because
+  `dropped == 0` is otherwise "owned nothing", "did not try", and "could not write",
+  which need different messages — `failed` covers an ENOSPC or permission error on the
+  write, where the pointer is still on disk and the default result would have said the
+  app owned nothing. And the CLI prints both non-clear cases to stderr naming the
+  consequence and the recovery, because the operator who can act on it is standing at
+  the command that otherwise printed a success tick; they get different text because
+  they need different actions — stop the gateway, versus fix the storage error. The recovery is re-running
+  `kirocrew app uninstall <name>` with the gateway stopped, which works because the
+  bookkeeping half also runs when `uninstall_app` fails with *not installed* — the
+  pointers outlive the app, so that is the one failure whose cleanup is still owed.
+  Every other failure leaves the app whole and must keep its pointers.
+
+Dropping the pointer is only half of "a reinstall starts fresh". `clear_sid` stops
+the NATIVE resume; the transcript stays on disk on purpose, so a cold start under the
+same slot key would still have `build_session_replay` inject the removed app's history
+into the next installation's first turn — the same user-visible bug through a second
+channel. So both paths also set `SUPPRESS_REPLAY_FLAG` on every key they clear:
+
+- Persisted on the session-map entry, not held in memory, because the two writers are
+  different processes (the gateway-less CLI has no live manager) and because a gateway
+  restart between the uninstall and the reinstall must not lose it.
+- Honoured at one chokepoint, `SessionManager.consume_replay_suppression`, so the flag
+  cannot be respected on one path and ignored on the other. The persisted marker is
+  consumed there UNCONDITIONALLY, never as the `elif` tail of the in-memory branch: the
+  in-gateway path sets both markers, so a chain that stopped at the first hit would
+  leave the durable one standing and make a later cold start of the NEW installation
+  start empty — a fix for stale history turned into amnesia about live history.
+- One-shot: read and cleared together, matching the in-memory branch. Left set, every
+  later cold start on that key — an idle-timeout expiry, a restart — would be silently
+  amnesiac, which an uninstall never asked for.
+- A member of `_DURABLE_FLAGS`, because `prune` deletes a sid-less entry that nothing
+  holds back — and after the clear the entry is exactly that. Losing it there would
+  lose it in the case the flag exists for: clear the pointer, restart the gateway,
+  reinstall. The constant's "grows without bound" cost does not apply, since one-shot
+  consumption makes the row collectable again at the first cold start.
+- The in-gateway path additionally passes `replay=False` to `discard_conversation`.
+  That is not belt-and-braces against the default: `replay=True` actively DISCARDS a
+  standing suppression, so omitting the keyword is worse than neutral.
+
+Durability is ordered, not incidental. The CLI path flushes before releasing
+`GatewayLock`; the in-gateway path `await`s `sessions.aflush()` after all the clears
+and BEFORE the uninstall reports success, because `clear_sid` on the loop only
+schedules a debounced flush — without it the handler answers 200 while the drop is
+still only in memory, and a restart inside that window brings the stale sid back with
+the app already gone. Both flushes are REPORTED on failure, never raised: the files
+are gone by then, so an ENOSPC there must not skip the teardown that follows it —
+`invalidate_app_secret_cache`, `_unregister_notification_channels`, `forget_app_hooks`
+— and a stale slot-close hook makes the removed app's leftover tabs undismissable. The
+CLI path says so as `SessionPointerCleanup(failed=True)`, the route as a `uninstall_log`
+line naming the pointer that did not persist; neither reports the sweep as clean.
+
+Deliberately NOT part of step 3: deregistration also runs on **disable**, and App
+Store Sync is a disable/enable pair, so clearing there would discard every
+long-lived conversation's accumulated context on every sync. `clear_sid`, not
+`delete` — the entry keeps its Slack linkage and the dropped value is stashed as
+`discarded_sid`.
+
+Stated cost: the index stays keyed on "still holds a sid", so a conversation whose
+pointer was already dropped by something else (a provider switch, a poisoned-
+conversation escalation) keeps its transcript and is not flagged. Widening to every
+transcript an app owns means enumerating transcripts rather than session-map rows — a
+different and much wider index, and a separate decision. The narrow answer fails
+toward the pre-existing behaviour.
 
 The lock spans the script deliberately: the script may itself be destructive, so
 holding the lock across it stops a racing enable or update from starting a
@@ -926,7 +1142,7 @@ stamp instead of running pip twice.
 ## 12. Store visibility is a manifest flag, not a code removal
 
 Built-in apps ship default-DISABLED. `manager._DEFAULT_ON_BUILTINS` is the single
-source of truth for the exemption (`projects`, the Task Runner, and `command-bar`,
+source of truth for the exemption (`projects` (the Task Runner) and `command-bar`,
 which replaces the quick-search gesture rather than adding a sidebar entry),
 read by the policy tests over both the hardcoded list and the file-based
 manifests, so a builtin cannot become default-on through one registration path
@@ -1451,19 +1667,22 @@ Four properties keep the tier from becoming a hole, and none is optional:
   cannot tell two repos on one forge apart.
 
 **A registry name claimed by two different repositories is refused outright.**
-The on-disk index cache is keyed by registry NAME, so if a pinned row and an
-operator row share a name but not a repo, serving either would read the other's
-cached index under the winner's identity — and every reader stamps `_registry`
-from the registry it asked for, so those rows would be attributed to it: apps the
-winning repository does not list, presented as its own and installable under it.
-`_effective_registries` therefore serves NEITHER row for a contested name and
-logs both claimants. Same name AND same repo is not contested: the pinned row
-simply supersedes an operator row that already agreed, and the shared cache is
-correct. `PUT /api/apps/registries` refuses to create such a collision, so the
-case that reaches this rule is a `config.json` that already used the name before
-the build pinned it. (Re-keying the cache on `(name, repo)` would fix the wider
-pre-existing case — an operator repointing a registry's `repo` has the same
-hazard — and is left as separate work.)
+The on-disk index cache is keyed by the registry's full source identity —
+`name|normalized credential-free repo|branch` — so an operator repointing a
+registry misses the former source's cache by construction. The same source
+coordinates are used by every reader and writer; changing the repo or branch
+therefore cannot make the new source serve the old source's cached rows.
+
+The build-pinned/config collision rule remains a control-plane ownership rule,
+not a cache-isolation mechanism. A build-pinned name carries build-owned trust
+and review metadata, while an operator row with that same public name claims a
+different source. Silently choosing either row would hide the other claimant
+and make the public `_registry` attribution ambiguous, so
+`_effective_registries` serves NEITHER row and logs both claimants. Same name,
+repo, AND branch is not contested: the pinned row supersedes an operator row
+that already agrees with it. `PUT /api/apps/registries` refuses to create a
+conflicting claim, so the case that reaches this rule is a `config.json` that
+predates the build pin.
 
 **Only the BUILD can grant `owner`.** `_registry_trust_tier` resolves the tier
 solely from `AppsLoader.default_registries()`; a row in `config.json` reads as
@@ -1549,7 +1768,17 @@ banner art, while `screenshots*` must be a capture of the real App UI. The detai
 page prefers the wide `heroImageDetail*` banner when present and renders the
 screenshot gallery independently. Registry manifests project `useCases` and
 `configuration` as display metadata and rewrite repo-relative screenshot and
-hero paths through the same-origin blob proxy.
+hero paths through the same-origin blob proxy. That rewrite (`_merge_manifest`,
+via `_store_asset_path`) first joins each art path under the entry's
+`subdirectory` — the directory `app.json` was read from — because the blob
+route resolves `path` against the repo root: a monorepo entry's
+`ui/icons/app.png` is served from `apps/<name>/ui/icons/app.png`, and the bare
+path 502s. The join is the store-card reader's alone; the manifest field keeps
+its meaning, because the installed-app reader below resolves the same value
+against the install directory. It preserves containment rather than re-deriving
+it: a `subdirectory` the lexical gate rejects is not joined, an absolute path or
+URL is left untouched, and no normalisation happens, so a `..` in the asset path
+still reaches the blob route's own rejection.
 
 **An INSTALLED app's art is served from its own install directory, not the blob
 proxy.** `GET /apps/{name}/art/{path}` (`handle_app_art_file`) reads the bytes
@@ -1845,14 +2074,14 @@ are `_health_check_loop` (bounded startup poll) and `_watch_backend_health`
   itself and have no port to be dead, so removing them because an HTTP backend died would
   take working tools away for a reason unrelated to them. That path pops each HTTP entry
   and keeps the rest, and its port lookup is health-gated, so it cannot resurrect the
-  port it is removing. It calls `_register_mcp_servers` DIRECTLY rather than
-  `reregister_app_mcp_servers`, because the latter also re-materializes the app's agents
-  — an ungated write that would land before the caller's enablement check and make a
-  disabled app's agents dispatchable in the gap. The scrub owns the mcp.json half only;
-  the agent refresh belongs to the caller, which gates it. The admission gate is applied
-  explicitly here so a denied app still gets a FULL removal rather than the selective
-  keep-stdio treatment. It falls back to removing EVERY entry for the app when the
-  manifest cannot be resolved or declares no servers: that case cannot tell a
+  port it is removing. It calls `scrub_backend_mcp_url` and then, after a positive
+  enablement check, `refresh_app_agents`; the latter re-materializes the agent copies so
+  the dead URL is removed from the config kiro-cli actually loads. A failed refresh leaves
+  reconciliation unlanded for retry. A confirmed disabled app takes the resource-removal
+  path instead, while an unreadable enabled state neither refreshes nor deletes.
+  The admission gate is applied explicitly here so a denied app still gets a FULL
+  removal rather than the selective keep-stdio treatment. It falls back to removing
+  EVERY entry for the app when the manifest cannot be resolved or declares no servers: that case cannot tell a
   backend-dependent server from an independent one, and the dead url must not survive on
   the strength of not knowing. The fallback **never deletes the app's materialized
   agents**. Deleting them is unrecoverable — it takes the user-owned fields

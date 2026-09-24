@@ -123,6 +123,29 @@ TENANT_SCHEMA_VERSION = 1
 #: 64 bits does that for any number of connections a gateway will ever hold.
 _TENANT_NONCE_BYTES = 8
 
+#: Servers whose POOLED separation rests on the nonce above, by name.
+#:
+#: Membership is a statement about the BACKEND: for a caller the gateway cannot
+#: name, this server keeps per-tenant state and separates it by the nonce, so one
+#: pooled process serving N unnamed connections is separated only while a nonce
+#: keeps arriving. ``kirocrew-computer`` is the case — its
+#: ``_unresolved_session_key`` composes ``unresolved:<pid>#<nonce>`` and hands
+#: that to ``SnapshotIndex``, so without the nonce half every unnamed co-tenant
+#: of one pooled process holds a single namespace.
+#:
+#: The stub reads this to refuse the one combination nothing downstream can
+#: detect: pooling asked for, and a serving daemon that mints no nonce (see
+#: ``mcp_gateway.stub.must_degrade_nonce_blind``). Absence of the tenant block is
+#: ambiguous at the backend by construction — for an unnamed caller it is also
+#: what a 1:1 topology with no gateway at all looks like, and there the
+#: per-process fallback is correct — so the judgement has to be made on the
+#: handshake, where the daemon's own attestation is readable.
+#:
+#: A NAME set, like the discovery classification: the stub decides before any
+#: backend module has been imported, and importing one to ask would put package
+#: code on the handshake path.
+POOLING_REQUIRES_TENANT_NONCE: frozenset[str] = frozenset({"kirocrew-computer"})
+
 #: Process-lifetime cache of a RESOLVED ``from_env()`` identity. The env var
 #: and ancestor pidfile chain are immutable once present, so the walk need run
 #: at most once. The walk does not fork ``ps`` per ancestor (``_parent_pid``
@@ -193,6 +216,15 @@ class CallerContext:
     #: a shared backend from its own environment, so the per-session env token
     #: never reaches it. Never forwarded to a third-party backend.
     session_token: str = ""
+    #: Why gatewayd withheld ``session_token`` from a backend spawned under one
+    #: of Kiro Crew's OWN server names (the ``_deny_control_plane`` reason:
+    #: "spawned '/opt/local/bin/kirocrew' is not the spec's '…'"). Set only
+    #: on the frames forwarded to such a denied backend, so its
+    #: ``identity_unattested`` refusal can name the cause; the reason otherwise
+    #: reaches only the daemon's own log, which no session surfaces
+    #: (the Toolbox-shim report took three wrong diagnoses to find it). Diagnostic text,
+    #: never a credential; empty everywhere else.
+    identity_denial: str = ""
 
     @classmethod
     def from_meta(cls, meta: Any) -> "CallerContext | None":
@@ -224,6 +256,7 @@ class CallerContext:
             from_gateway=True,
             raw=MappingProxyType(dict(block)),
             session_token=str(block.get("sessionToken") or ""),
+            identity_denial=str(block.get("identityDenial") or ""),
         )
 
     @classmethod
@@ -361,6 +394,8 @@ def build_caller_meta(ctx: CallerContext) -> dict[str, Any]:
     }
     if ctx.session_token:
         meta[CALLER_META_KEY]["sessionToken"] = ctx.session_token
+    if ctx.identity_denial:
+        meta[CALLER_META_KEY]["identityDenial"] = ctx.identity_denial
     return meta
 
 

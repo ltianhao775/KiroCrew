@@ -1,16 +1,16 @@
 # Session Control — driving another session
 
-One chat session can open, seed, watch, stop and close another one. The tools
-come from the `kirocrew-dashboard` MCP server, so an agent that does not mount
-that server never has them — exactly like any other MCP server. This page is the
-reference for all 14 of its tools, written for the agent that is about to use
-them.
+One chat session can open, fork, seed, watch, stop and close another one, and take
+another one under itself in the sidebar. The tools come from the
+`kirocrew-dashboard` MCP server, so an agent that does not mount that server
+never has them — exactly like any other MCP server. This page is the reference
+for all 17 of its tools, written for the agent that is about to use them.
 
 The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
 
-- **Session control** — `session_create`, `session_send`,
-  `session_read_message`, `session_stop`, `session_close`. These reach another
-  session.
+- **Session control** — `session_create`, `session_fork`, `session_send`,
+  `session_read_message`, `session_stop`, `session_close`, `session_adopt`,
+  `session_release`. These reach another session.
 - **Sidebar shape** — `chat_folder_tree`, `chat_folder_create`,
   `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`,
   `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`.
@@ -55,6 +55,59 @@ waiting in the user's sidebar; watch it with session_read_message.
 ```
 
 Pass that key as `target` to every other session tool.
+
+`session_create` always starts empty. When the new session should already know
+what you know — you are splitting a long investigation into several sessions —
+use `session_fork` instead.
+
+### `session_fork`
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `source` | no | The session to copy from: a session key, slot key, or its exact unique title. Omit to fork **your own** session |
+| `title` | no | Short sidebar name. Omit to keep the fork's own `Fork of <source title>` |
+| `folder` | no | Sidebar folder id or `/`-separated path, created if missing (`mkdir -p`), as for `session_create`. Omit to leave the child in the source's folder |
+| `at_message_index` | no | Fork point: the position of the LAST message to carry, counting the source's user and assistant messages from 0. Omit to carry the whole transcript |
+
+The same thing as the dashboard's Fork button, for an agent. The new session
+**carries a copy of the source's transcript** up to and including the fork
+point, so it starts with the context already built instead of empty. It starts
+**idle**: the copied messages are history, and nothing runs until you
+`session_send` into it or the person types. It appears in the sidebar for the
+person to read, take over and close, like any other session.
+
+```
+🔀 Forked `chat-3` into `chat-9` (cluster 3: duid) carrying 41 message(s) filed
+in `Gamma failures`. It is idle and waiting in the user's sidebar; seed it with
+session_send and watch it with session_read_message.
+```
+
+Two things it deliberately does not take:
+
+- **No `agent`, `model` or `mode` override.** The child inherits the source's
+  agent, model, memory store and mode, project and folder — exactly what a human
+  fork inherits, and for the same reason: a transcript belongs to the memory
+  boundary it was written in, and a fork must stay inside it. A session bound to
+  a different agent is `session_create`'s job.
+- **No tail fork.** Only the head (everything up to the fork point) is offered.
+
+Forking another session is a **read** of its transcript, so naming a `source`
+that is not your own needs exactly what `session_read_message` needs on that
+session — same fence, same refusal codes. Either way you must be an eligible
+creator: every caller class `session_create` refuses, `session_fork` refuses
+too, because a fork manufactures a session you then own. Naming your own key as
+`source` is the default case spelled out, not a `self_target` refusal.
+
+Refusals minted by the fork itself come back under the fork's own codes, the
+same ones the dashboard's Fork button reports: `value_out_of_range` for a fork
+point past the source's last visible message, `no_messages_to_fork` for a
+source with no user or assistant messages yet, and `fork_snapshot_unstable`
+(retry) for a source that is being written to.
+
+The child is attributed to you (`created_by`), so `session_send`,
+`session_read_message` and `session_close` reach it afterwards, and it counts
+against your creation budget and per-creator ceiling exactly as a created
+session does.
 
 ### `session_send`
 
@@ -112,6 +165,40 @@ not re-read what it already saw. Two readings matter:
   rows this window did not reach — read again immediately instead of waiting.
 
 `wait`, then read. See [Monitor loops](monitor-loops.md) for the loop shape.
+
+### `session_adopt` and `session_release`
+
+Both take only `target`. They change where a session sits in the sidebar and
+nothing else: the target keeps its conversation, its turns, its tools and its
+agent.
+
+`session_adopt` puts the target under YOU. The adopter is the calling session,
+resolved from the connection — there is no argument for it, so no session can
+rearrange a part of the tree it is not in.
+
+The case it exists for is a takeover. Open one session, adopt each of the
+sessions you are now running, and the workers THEY opened come along with them:
+a session hangs under another session, not under a path, so one call moves a
+whole branch. A target that already has a parent can be adopted, and the parent
+it had is kept in the record.
+
+| Refusal | Why |
+|---|---|
+| `would_cycle` | The target is already above you, so the tree would hold a loop. A loop is a shape the tree cannot show — it marks every session on it and nests none of them — so this would flatten a branch rather than move it. |
+| `already_root` | On release only: the target has no parent, so there is nothing to let go. |
+| `not_parent` | On release only: the target hangs under a third session. Only that session, or the target itself, can release it. |
+| `tree_unavailable` | The session tree is not being recorded on this gateway, so there is nowhere to write the edge. Nothing moved, and the tool says so rather than reporting a success the sidebar will not show. |
+| `tree_not_ready` | The tree cannot be read whole right now — the gateway has not seeded it yet, or a unit's log could not be read. Retryable: a decision taken on a partial tree could admit the loop `would_cycle` exists to refuse, so it is refused instead of guessed. |
+| `tree_write_pending` | An earlier move of this same session is still being written. Retryable: read the tree first, because the earlier write may have landed. |
+
+`session_release` is the only way to undo an adoption. You may release a session
+you hold, and you may release YOURSELF — pass your own key — so a session whose
+holder has stopped running is not stuck under it. Sessions the released one
+holds stay with it: only its own edge upward goes.
+
+Both are recorded in the target's own crew log, on the side the creating edge is
+already written on, which is why the whole subtree follows with no entry of its
+own.
 
 ### `session_stop` vs `session_close`
 
@@ -214,7 +301,7 @@ gateway-issued key counts. Refusals you should expect, by code:
 | `unattended_caller` / `unattended_target` | Scheduled runs cannot be controlled; a cron caller reaches only what it created |
 | `linked_session_target` / `mirrored_target` | A channel-linked or channel-mirrored session is out of scope — reaching it would cross into a thread other people read |
 | `session_control_disabled` | `agent.session_control` is off in config |
-| `create_rate_limited` | Per-caller creation budget spent |
+| `create_rate_limited` | Per-caller creation budget spent — a fork spends the same budget |
 
 `target` resolves three ways, all of them checked before any answer: the slot
 key (`chat-7`), the transcript name `list_sessions` prints
@@ -229,7 +316,7 @@ session-control tool refuses it: its identity would resolve to its parent slot,
 handing it the parent's authority. Drive sessions from a real session, not from
 inside a subagent.
 
-A **channel agent** (Slack, Telegram, and the rest) is blocked from all five
+A **channel agent** (Slack, Telegram, and the rest) is blocked from all eight
 session tools by `CHANNEL_AGENT_BLOCKED_TOOLS` in `src/kiro_crew/channel.py`.
 Reading a dashboard transcript would pull a private conversation into a channel
 other humans can see, and sending would run channel text as a turn inside it.
@@ -240,9 +327,10 @@ other humans can see, and sending would run channel text as a turn inside it.
 |---|---|---|
 | `agent.session_control` | `true` | The whole surface. Turn it off to withdraw the capability from every agent at once without editing a spec |
 | `agent.member_dispatch` | `true` | A crew member's DM session drives workers it created even when session control is off. Turn it off to put member callers back under the switch |
+| `agent.crew_panel` | `true` | A crew member publishes its own webview, shown in that member's drawer on the Crew page. Its own mount and its own switch, so withdrawing session control leaves the drawer alone and withdrawing the drawer leaves session control alone |
 
 Rate limits are per caller, per verb, over a 300-second window: **20** session
-creates, **10** folder creates, **10** tag creates. Capacity ceilings sit behind
+creates (forks included), **10** folder creates, **10** tag creates. Capacity ceilings sit behind
 them: 500 live sessions, 50 per creator, 500 folders.
 
 ## This or `spawn_run`?

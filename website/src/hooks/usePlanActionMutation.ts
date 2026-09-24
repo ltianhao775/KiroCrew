@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { api, ApiError } from '../api/client'
+import { errMessage } from '../utils/thunkError'
 
 /**
  * True when a follow-up chip label is an actual plan action — the only three
@@ -95,16 +96,53 @@ const isCancel = (action: string) => action.trim().toLowerCase() === 'cancel'
  * the Go map that is the safe failure (a duplicate Go would be worse than a
  * stuck one); on the Cancel map it wedges the stop control itself for that
  * slot — accepted as the cost of double-row suppression, and bounded by a
- * reload. The user-visible cost is that the wedged retry has NO affordance:
- * the chip silently does nothing, because this hook renders no pending or
- * error state. That missing affordance is tracked as #6056 and is
- * deliberately NOT fixed here — it belongs in the shared FollowUpBar so
- * every chip surface gains it at once.
+ * reload. The chip keeps its spinner while the latch is held, so a refused
+ * re-click looks like the dispatch it is still waiting on.
  */
-const goLatchBySlot = new Map<string, string>()
-const cancelLatchBySlot = new Map<string, string>()
+interface LatchHold {
+  source: string
+  /** Carried so the chips can tell WHICH one is busy, not merely that one is. */
+  action: string
+}
+
+const goLatchBySlot = new Map<string, LatchHold>()
+const cancelLatchBySlot = new Map<string, LatchHold>()
 
 const latchFor = (action: string) => (isCancel(action) ? cancelLatchBySlot : goLatchBySlot)
+
+/**
+ * The latch maps published as a store, because they are shared: a per-instance
+ * copy leaves a SECOND instance on the same slot (split pane collapsing, a
+ * remount) drawing an idle chip over a latch that still refuses the click. The
+ * snapshot is cached per slot and cleared on publish — `useSyncExternalStore`
+ * compares with `Object.is`, so rebuilding the Set per read never settles.
+ */
+const latchListeners = new Set<() => void>()
+const latchedActionCache = new Map<string, ReadonlySet<string>>()
+const NO_ACTIONS: ReadonlySet<string> = new Set()
+function publishLatches(): void {
+  latchedActionCache.clear()
+  for (const notify of latchListeners) notify()
+}
+
+function subscribeLatches(notify: () => void): () => void {
+  latchListeners.add(notify)
+  return () => { latchListeners.delete(notify) }
+}
+
+/** At most one per class, so at most two: Go and Cancel latch independently. */
+function latchedActionsFor(slot: string | null): ReadonlySet<string> {
+  if (slot === null) return NO_ACTIONS
+  const cached = latchedActionCache.get(slot)
+  if (cached !== undefined) return cached
+  const actions = new Set<string>()
+  for (const latch of [goLatchBySlot, cancelLatchBySlot]) {
+    const held = latch.get(slot)
+    if (held !== undefined) actions.add(held.action)
+  }
+  latchedActionCache.set(slot, actions)
+  return actions
+}
 
 /**
  * Statuses that arrive as a 4xx but say nothing about whether the plan action
@@ -164,21 +202,36 @@ const isDefinitiveRejection = (e: unknown): boolean =>
  * `mutateAsync` is deliberately NOT exposed: it would bypass the single-flight
  * this hook exists to guarantee.
  *
- * Fire-and-forget beyond that: no onSuccess invalidation (the plan advances
- * over the event stream); a failed dispatch is logged to the console. Nothing
- * else of the mutation state is currently rendered by either host.
+ * No onSuccess invalidation — the plan advances over the event stream; the chips
+ * read `latchedActions` for the spinner and `failure` for the error row.
  */
 export function usePlanActionMutation(slot: string | null, followUpSourceKey: string | null) {
+  // The LATCH lifetime, not the request's: the latch outlives the response until
+  // an acknowledgement row arrives, and a chip idle in that window reads as dead.
+  const latchedActions = useSyncExternalStore(subscribeLatches, () => latchedActionsFor(slot))
+  // Carries the slot and row it belongs to, and is filtered on READ: `ChatPage`
+  // swaps `activeSlot` without remounting, and filtering on read (not at write
+  // time) also survives a superseded observer whose closure names a stale slot.
+  // `''` is a failure with no readable message, which still has to be shown.
+  // Per-instance `useState` on purpose, unlike the latches above, which are a
+  // module store: a latch is a fact about the SERVER (the dispatch is in flight,
+  // so every mount must refuse), while a failure is feedback on the click that
+  // was made here — surfacing it in a pane the user never clicked in would
+  // report an error against a chip that mount never dispatched.
+  const [failure, setFailure] = useState<{ slot: string, source: string, message: string } | null>(null)
   // The acknowledgement: a DIFFERENT non-null source row than the one a
   // latched dispatch acted on releases that latch. Evaluated against the
   // observed transcript state — a remount or slot re-entry re-derives the
   // same stale row and therefore releases nothing.
   useEffect(() => {
     if (!slot || followUpSourceKey === null) return
+    let released = false
     for (const latch of [goLatchBySlot, cancelLatchBySlot]) {
       const held = latch.get(slot)
-      if (held !== undefined && held !== followUpSourceKey) latch.delete(slot)
+      if (held !== undefined && held.source !== followUpSourceKey) { latch.delete(slot); released = true }
     }
+    // Guarded: publishing on every render would notify every instance, forever.
+    if (released) publishLatches()
   }, [slot, followUpSourceKey])
 
   // Read at dispatch time through a ref so the captured identity is the row
@@ -206,12 +259,20 @@ export function usePlanActionMutation(slot: string | null, followUpSourceKey: st
       // observer has been superseded.
       if (isDefinitiveRejection(e)) {
         const latch = latchFor(vars.action)
-        if (latch.get(vars.slot) === vars.source) latch.delete(vars.slot)
+        if (latch.get(vars.slot)?.source === vars.source) {
+          latch.delete(vars.slot)
+          // Only this class stops spinning; the other map keeps its own hold.
+          publishLatches()
+        }
       }
-      // No host reads this mutation's error state (both callers hold it in a ref
-      // purely to dispatch through), so a Go/Cancel chip whose POST never landed is
-      // otherwise a click with no effect and no message anywhere.
-      // eslint-disable-next-line no-console -- only trace of an undelivered plan click
+      // Only the CURRENT row may write. `onError` is options-level and fires for a
+      // superseded mutation, so a stalled dispatch rejecting late would otherwise
+      // overwrite a newer row's real failure and take its row off screen.
+      // The console line stays: for an ambiguous failure the stack is all there is.
+      if (vars.source === sourceKeyRef.current) {
+        setFailure({ slot: vars.slot, source: vars.source, message: errMessage(e) })
+      }
+      // eslint-disable-next-line no-console -- keeps the stack for an ambiguous failure
       console.error('plan action failed', e)
     },
     // Deliberately NO success/settled release: success holds the latch until
@@ -247,9 +308,24 @@ export function usePlanActionMutation(slot: string | null, followUpSourceKey: st
     if (clickedSourceKey !== undefined && clickedSourceKey !== source) return
     const latch = latchFor(vars.action)
     if (latch.has(vars.slot)) return
-    latch.set(vars.slot, source)
+    // Past the guards: a refused click sends nothing, so the failure still stands.
+    setFailure(null)
+    latch.set(vars.slot, { source, action: vars.action })
+    publishLatches()
     rawMutate({ slot: vars.slot, action: vars.action, source })
   }, [rawMutate])
   const { mutateAsync: _dropped, ...rest } = mutation
-  return { ...rest, mutate }
+  // Gated on the ROW as well as the slot: a late or lost-response rejection can
+  // land after the next row arrived, and must not show against a row it is not about.
+  // Whether a click on this label would be REFUSED now. Wider than
+  // `latchedActions`, which names only what was DISPATCHED: the latch is per CLASS,
+  // so a held `Go` refuses `Go All`. Reads the map live, and its identity is stable
+  // on purpose — callers must invoke it DURING RENDER (a publish re-renders them
+  // through the store), never memoize on its result, which would go stale.
+  const isRefused = useCallback(
+    (action: string) => isPlanAction(action) && slot !== null && latchFor(action).has(slot),
+    [slot],
+  )
+  const shown = failure !== null && failure.slot === slot && failure.source === followUpSourceKey
+  return { ...rest, mutate, latchedActions, isRefused, failure: shown ? failure.message : null }
 }

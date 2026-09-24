@@ -593,6 +593,14 @@ class TestTokenMint:
         argv = _build_ssh_argv("cd-1", "echo hi")
         assert argv[0] == "ssh" and argv[-2] == "cd-1"
         assert "BatchMode=yes" in argv and "AddressFamily=inet" in argv
+        # -n redirects ssh's stdin from the null device. Without it the child
+        # inherits the gateway's stdin, and through a ProxyCommand that channel
+        # stays open after the remote command exits, so ssh waits for an EOF a
+        # console-less gateway never sends and the probe reports a reachable
+        # host as unreachable. It must precede the host, or ssh reads it as
+        # part of the remote command.
+        assert "-n" in argv
+        assert argv.index("-n") < argv.index("cd-1")
         # Default fail-fast connect bound is preserved for callers that
         # don't thread a budget (e.g. run_remote_kirocrew).
         assert "ConnectTimeout=10" in argv
@@ -1343,6 +1351,64 @@ class TestRegistry:
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         assert InstancesRegistry().path == tmp_path / "instances.json"
 
+    def test_two_registries_over_one_file_share_a_lock(self, tmp_path):
+        """Objects over the same file hold one lock; different files hold two.
+
+        Callers construct a registry per request, so a lock owned by the object
+        serialises nothing between them.
+        """
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        first = self._reg(tmp_path)
+        second = self._reg(tmp_path)
+        assert first._lock is second._lock
+
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        assert InstancesRegistry(other / "instances.json")._lock is not first._lock
+
+    def test_a_second_writer_cannot_read_between_a_read_and_its_write(self, tmp_path):
+        """An interleaved second registry must not drop the first's record.
+
+        The writing thread is held inside its own write and the second thread is
+        released to add a different instance. Both records have to survive: a
+        reader admitted before the first write lands sees the pre-add document
+        and persists it back without that record.
+
+        Both waits are bounded, so the serialised case simply times out and
+        proceeds rather than hanging.
+        """
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        path = tmp_path / "instances.json"
+        writer = InstancesRegistry(path)
+        intruder = InstancesRegistry(path)
+
+        inside_write = threading.Event()
+        intruder_done = threading.Event()
+        real_write = type(writer)._write
+
+        def holding_write(self, doc):
+            inside_write.set()
+            intruder_done.wait(timeout=2.0)
+            real_write(self, doc)
+
+        writer._write = types.MethodType(holding_write, writer)
+
+        def add_intruder():
+            inside_write.wait(timeout=2.0)
+            intruder.add(name="Second", ssh_host="second-1", instance_id="second-1")
+            intruder_done.set()
+
+        thread = threading.Thread(target=add_intruder, daemon=True)
+        thread.start()
+        writer.add(name="First", ssh_host="first-1", instance_id="first-1")
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "the second writer never finished"
+
+        ids = sorted(inst.id for inst in InstancesRegistry(path).list())
+        assert ids == ["first-1", "second-1"]
+
 
 # ── SshTunnelManager (mocked) ─────────────────────────────────────────────────
 
@@ -2006,17 +2072,39 @@ class TestSshTunnelManager:
 
 
 class _FakeReq:
-    def __init__(self, state, *, headers=None, match=None, body=None, query=None, user="owner"):
+    def __init__(
+        self,
+        state,
+        *,
+        headers=None,
+        match=None,
+        body=None,
+        query=None,
+        user="owner",
+        app_token="",
+    ):
         self.app = {"state": state}
         self.headers = headers or {}
         self.match_info = match or {}
         self.query = query or {}
         self._body = body
-        # Mirrors aiohttp Request mapping: require_auth sets request["user"].
-        self._attrs = {"user": user} if user is not None else {}
+        # Mirrors the aiohttp Request MAPPING, all three reads the owner predicate
+        # in ``_guard`` performs: ``.get("user")`` for the subject, ``"app" in``
+        # then ``["app"]`` for the app-token claim. A double that serves only
+        # ``.get`` raises on the ``in`` test. ``app_token`` stays "" for a browser
+        # session; a test wanting an app token passes it.
+        self._attrs = {"app": app_token}
+        if user is not None:
+            self._attrs["user"] = user
 
     def get(self, key, default=None):
         return self._attrs.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._attrs
+
+    def __getitem__(self, key):
+        return self._attrs[key]
 
     async def json(self):
         if self._body is None:
@@ -2042,6 +2130,17 @@ def _fake_reconfigure(mgr, keep_intent=True):
 
 
 class _State:
+    """Dashboard-state stand-in for the instances handlers.
+
+    ``owner_id`` matches ``_FakeReq``'s default caller, because ``_guard`` demands
+    the positively-identified owner: the whole control plane mints peer dashboard
+    credentials with the owner's manager-held credential, so an authenticated
+    non-owner must not reach it. A test wanting that caller passes a different
+    ``user=``.
+    """
+
+    owner_id = "owner"
+
     def __init__(self, registry, manager=None):
         self.instances_registry = registry
         self.instances_manager = manager
@@ -4151,11 +4250,17 @@ class TestDiagnostics:
 
         async def fake_exec(*argv, **k):
             captured["argv"] = argv
+            captured["kw"] = k
             return FakeProc()
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
         assert asyncio.run(diag._probe_ssh("cd-1", connect_timeout_secs=42.0)) is True
         assert "ConnectTimeout=42" in captured["argv"]
+        # Probe children never inherit the gateway's stdin: an inherited one
+        # keeps the ssh stdin channel open past the remote command's exit and
+        # the probe's only bound is its wall-clock cap, whose expiry the ladder
+        # renders as SSH_UNREACHABLE on a healthy host.
+        assert captured["kw"].get("stdin") is asyncio.subprocess.DEVNULL
         # Both probes share token_mint._build_ssh_argv with the mint, so the two
         # options a probe cannot work without are pinned HERE too: without
         # BatchMode a probe hangs on an interactive prompt instead of reporting
@@ -4172,6 +4277,8 @@ class TestDiagnostics:
         assert "ConnectTimeout=42" in captured["argv"]
         assert "BatchMode=yes" in captured["argv"]
         assert "AddressFamily=inet" in captured["argv"]
+        # Same for the stdout-capturing probe path (_run_stdout).
+        assert captured["kw"].get("stdin") is asyncio.subprocess.DEVNULL
 
     def test_probe_local_forward(self):
         from kiro_crew.instances import diagnostics as diag
@@ -5014,6 +5121,9 @@ class TestSelfHealRefreshRestart:
                 self.returncode = -9
                 self._exited.set()
 
+            # A real asyncio Process always exposes both stream attributes, and
+            # they are None for a stream that was not piped.
+            stdout = None
             stderr = None
 
         async def fake_exec(*a, **k):
@@ -6257,6 +6367,8 @@ class TestSsmTunnelArgv:
 
         class FakeProc:
             returncode = None
+            # A real asyncio Process always exposes both stream attributes.
+            stdout = None
             stderr = None
             pid = 4242
 
@@ -6273,6 +6385,12 @@ class TestSsmTunnelArgv:
             return FakeProc()
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        # stop() on the SSM transport reaps the child's whole process group by
+        # pid. FakeProc.pid is a made-up number, so the real signal would land
+        # on whatever unrelated process holds that pid on the host (on CI, an
+        # xdist worker). Keep the signal out of the OS; the fake's terminate()
+        # is the fallback path and settles returncode.
+        monkeypatch.setattr(stm._SshTunnel, "_signal_group", staticmethod(lambda pid, sig: False))
 
         async def main():
             t = _SshTunnel(

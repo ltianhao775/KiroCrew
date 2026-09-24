@@ -22,6 +22,11 @@ def tombstone_terminal_state(cause: str) -> str | None:
     return {
         "delivered": taskq.DONE,
         "user_stop": taskq.CANCELLED,
+        # A parent end and a stage cancel are deliberate stops like a user's,
+        # written by the same reap: the row they leave behind is cancelled, not
+        # a run to recover on the next boot.
+        "parent_end": taskq.CANCELLED,
+        "stage_cancel": taskq.CANCELLED,
         "cancelled": taskq.CANCELLED,
         "error": taskq.FAILED,
         "timeout": taskq.FAILED,
@@ -91,9 +96,13 @@ class ClaimPoint:
     event-loop dispatcher takes the claim on the store's writer thread and
     re-enters with ``_claimed``, which CONSUMES the reservation (registration
     does not count the run a second time); every non-start exit of that
-    re-entry releases it (:meth:`SpawnAdmissionCoordinator.release_reservation`)."""
+    re-entry releases it (:meth:`SpawnAdmissionCoordinator.release_reservation`).
+    Boundary identity crosses the await so cancellation can be revalidated
+    immediately before registration instead of trusting a stale claim result."""
 
     agent_id: str
+    parent_session_key: str = ""
+    boundary_owner: str = ""
 
 
 @dataclass(frozen=True)

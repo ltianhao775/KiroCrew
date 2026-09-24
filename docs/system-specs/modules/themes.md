@@ -7,7 +7,7 @@ up to a full "experience pack" (fonts, sandboxed overlays, audio, persona). A
 color theme is the degenerate case of a pack — the whole spectrum lives behind
 **one Theme dropdown** in Settings → Display: install many, select one.
 
-Themes are a **standalone subsystem built on `useTheme`**, not KiroCrew apps. This document is the **source of truth** for the end-to-end subsystem.
+Themes are a **standalone subsystem built on `useTheme`**, not Kiro Crew apps. This document is the **source of truth** for the end-to-end subsystem.
 The frontend pack-author contract (the CSS-var surface and the
 `overrides.css` selector allowlist) lives in
 [`website/docs/theming-contract.md`](../../../website/docs/theming-contract.md);
@@ -18,8 +18,8 @@ where the two overlap, this spec governs.
 `theme.json` MUST declare `"formatVersion": 1` (required integer major,
 mirroring the platform layer's pinned-`CONTRACT_VERSION` precedent). Validation
 rejects a missing/non-integer value, and rejects an unknown major with an
-explicit *"this pack requires a newer version of KiroCrew"* message — never the
-opaque generic-validation errors — so an older KiroCrew degrades honestly when
+explicit *"this pack requires a newer version of Kiro Crew"* message — never the
+opaque generic-validation errors — so an older Kiro Crew degrades honestly when
 handed a newer pack. Semantics changes within a major stay backward-tolerant;
 breaking manifest changes bump the major.
 
@@ -87,7 +87,7 @@ runtime scoper still removes the pin, so the preference is protected either way.
 
 ## Install Pipeline
 
-1. **Source** — a local directory (moved/copied) or an https `github.com` repo
+1. **Source** — a local directory (read in place, then copied into staging) or an https `github.com` repo
    shallow-cloned server-side (`_clone_github`, `--depth 1`, 30s timeout, host
    allowlist). The clone spawns through the sandbox chokepoint, which fails
    **closed** where no OS sandbox backend exists: that refusal answers `503`
@@ -123,14 +123,34 @@ Registered in `dashboard/server.py`. The validation/parsing core lives in
 |---|---|---|
 | `POST` | `/api/themes/install` | Install from local dir or GitHub (overwrite on re-install) |
 | `DELETE` | `/api/themes/{slug}` | Remove an installed theme |
-| `GET` | `/api/themes` | List all themes (built-in + custom + installed) |
+| `GET` | `/api/themes` | List custom + installed themes (the frontend adds built-ins) |
 | `GET` | `/api/themes/{slug}` | Theme detail + resolved `level` |
-| `GET` | `/api/theme/{slug}/assets/{path}` | Serve a pack asset (nosniff + content-type allowlist) |
-| `GET` | `/api/theme/{slug}/overlay/{id}` | Serve overlay HTML (locked CSP) |
-| `GET` | `/api/theme/{slug}/topbar/{mode}` | Serve topbar HTML for `dark`/`light` (locked CSP) |
+| `GET` | `/api/theme/{slug}/assets/{path}` | Serve a pack asset (nosniff + content-type allowlist, validator + 304) |
+| `GET` | `/api/theme/{slug}/overlay/{id}` | Serve overlay HTML (locked CSP, validator + 304) |
+| `GET` | `/api/theme/{slug}/topbar/{mode}` | Serve topbar HTML for `dark`/`light` (locked CSP, validator + 304) |
 
 (`GET /api/theme/boot` and the editor CRUD `POST/PUT /api/themes[/{slug}]`
 predate this subsystem and remain the color-theme surface.)
+
+### Asset, overlay and topbar responses revalidate, never expire
+
+All three serving routes answer through one helper (`_theme_asset_response`).
+A `200` carries `ETag: W/"<hex>"` — the 8-byte blake2b digest of the body bytes
+just read — and `Cache-Control: private, max-age=0, must-revalidate`. A request
+whose `If-None-Match` matches (weak comparison via aiohttp's parsed
+`request.if_none_match`, so a list, the strong form of the same value and `*`
+all match) answers `304` with no body. The `304` repeats the `200`'s `ETag`,
+`Cache-Control`, `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy` (`_THEME_ASSET_CSP` for assets, `_THEME_OVERLAY_CSP`
+for overlay/topbar HTML), so a revalidation never relaxes what the full
+response promised.
+
+There is deliberately no long `max-age`: a re-install replaces the pack
+directory in place under the same slug and the same asset URLs, so a
+freshness lifetime would keep serving the old pack's bytes from the browser
+cache. Hashing the body keeps the validator honest across that swap while
+still turning the fonts, `overrides.css` and branding images fetched on every
+dashboard load into header-only round trips.
 
 ## Security Model
 
@@ -153,8 +173,9 @@ predate this subsystem and remain the color-theme surface.)
   install destination guard, which still refuses a source inside its own
   destination before promotion and preserves source and sibling contents.
 - **postMessage allowlist** — the parent (`ThemeExperienceLayer.tsx`) accepts
-  only `theme:resize`, `theme:sound`, `theme:visibility`, and `theme:state`
-  messages from a pack iframe; all others are dropped.
+  only `theme:resize`, `theme:sound`, and `theme:visibility` messages from a
+  pack iframe; all others are dropped. `theme:state` travels in the opposite
+  direction, from the parent to each live theme iframe.
 - **CSS containment** — install-time denylist (no `@import`, external `url()`,
   dangerous functions/bindings, forbidden selectors, `z-index` >
   `_THEME_OVERLAY_MAX_ZINDEX`) via a string-aware top-level rule tokenizer, plus
@@ -231,9 +252,38 @@ predate this subsystem and remain the color-theme surface.)
 | Surface | File | Role |
 |---|---|---|
 | Loader | `website/src/hooks/useTheme.tsx` | Applies CSS vars; `applyThemeOverrides` → `_scopeOverridesCss` + `_rewriteOverridesUrls`; `injectThemeFonts`; pre-apply self-repair; `themeSwitching` state |
+| Render cache | `website/src/hooks/themeRenderCache.ts` | Persists the active pack's detail under `localStorage["mc-theme-data"]` and reads it back synchronously at `ThemeProvider` mount so the first paint is themed |
 | Experience layer | `website/src/components/ThemeExperienceLayer.tsx` | Mounts sandboxed overlay/topbar iframes + audio; enforces the postMessage allowlist |
 | Settings UI | `website/src/pages/settings/DisplayPanel.tsx` | Single Theme dropdown + install-from-local/GitHub + remove + "Applying…" status indicator |
 | Utility bridge | `website/src/tailwind-theme.css` | Tailwind v4 `@theme` mapping each utility (`bg-accent`, `text-muted/40`, `rounded-md`, `shadow-sm`, `font-mono`) onto the runtime CSS variable of the same stem, plus the `dark:` variant keyed on `[data-theme="dark"]`. A pack changes what a utility renders by writing the variable; it never touches this file. |
+
+### Boot sequence: themed first paint
+
+A cold load used to paint an installed theme seconds late: the client fetched
+`/api/themes`, then each pack's detail, then `overrides.css`, then the fonts,
+each round trip behind the last. The boot path now has two parts.
+
+1. **Render cache (zero requests).** `localStorage["mc-theme-data"]` holds ONE
+   entry: the active pack's `CustomThemeData` JSON (the `GET /api/themes/{slug}`
+   detail), written when that pack is applied. `ThemeProvider` reads it
+   synchronously at mount and seeds variables, fonts and branding before the
+   first paint. The cache holds only the Level-1 projection (colors, fonts,
+   branding, overrides flag and loader art); Level-2 experience content
+   (overlays, topbar, audio and persona) is applied only from the current server
+   detail because consent is bound to its content hash. The server stays the
+   source of truth: `customThemesLoaded` is never set from the cache, so
+   self-repair and the picker still wait for the real catalog. The entry is
+   removed when the selection moves to a built-in theme, when the pack is
+   deleted, or when the catalog no longer lists the slug (the pack was removed
+   elsewhere). It is never written when the serialized detail exceeds roughly
+   200 KB (`MAX_ENTRY_CHARS`), so the cache cannot grow past one small pack.
+2. **Parallel active fetch.** `loadCustomThemes` requests the active pack's
+   detail alongside `/api/themes` instead of after it, applies it on arrival
+   (refreshing the cache entry), and skips that slug in the catalog pass.
+
+The asset routes' validators (above) cover the third leg: once the detail is
+applied, the fonts and `overrides.css` it references revalidate as `304`s
+rather than re-downloading.
 
 ### One theme, one picker row (registered vs installed)
 

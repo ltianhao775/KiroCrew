@@ -48,6 +48,7 @@ from kiro_crew.messaging.commands import (
     task_arg_reply,
     task_command_reply,
 )
+from kiro_crew.messaging.queue_drain import owner_token
 from kiro_crew.messaging.queue_receipt import ReceiptQueue, receipt_text
 
 
@@ -100,10 +101,16 @@ class _Sessions:
     def get_provider(self, key: str) -> Any:
         return self._provider
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.cleared.append(key)
         if self._queue is not None:
             self.locked_during_clear.append(self._queue.lock.locked())
+
+
+#: One caller's own principal, the token a channel builds for whoever typed the command.
+#: The helper below tags the receipt line with it AND stops under it, which is the live
+#: arrangement: an owner that matches nothing on the queue would clear nothing.
+_CALLER = owner_token("fake", ("u1", "c1"))
 
 
 def _stop(sessions: _Sessions, queue: ReceiptQueue, surface: _Surface) -> str:
@@ -111,8 +118,8 @@ def _stop(sessions: _Sessions, queue: ReceiptQueue, surface: _Surface) -> str:
         # A live receipt so the finalize has a bubble to flip, exactly as a
         # mid-turn burst would have left one.
         async with queue.lock:
-            await queue.create_or_grow_locked("s", surface, "what time is it")
-        return await stop_running_turn(sessions, "s", queue=queue, surface=surface)
+            await queue.create_or_grow_locked("s", surface, "what time is it", _CALLER)
+        return await stop_running_turn(sessions, "s", queue=queue, surface=surface, owner=_CALLER)
 
     return asyncio.run(go())
 

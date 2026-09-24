@@ -20,6 +20,7 @@ Endpoints
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1000,18 +1001,9 @@ async def api_theme_detail(request: web.Request) -> web.Response:
 #
 # Static assets are served with a strict Content-Type + ``nosniff``; overlay and
 # topbar HTML get a locked-down CSP (they run in sandboxed iframes, §8.2). All
-# routes resolve the requested path *within* the theme directory (no traversal).
-
-def _theme_html_response(text: str) -> web.Response:
-    """Serve overlay/topbar HTML with the sandbox CSP + nosniff."""
-    return web.Response(
-        text=text,
-        content_type="text/html",
-        headers={
-            "Content-Security-Policy": _THEME_OVERLAY_CSP,
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+# routes resolve the requested path *within* the theme directory (no traversal),
+# and all three routes answer through ``_theme_asset_response`` so the
+# validator / 304 contract is the same for every byte a pack serves.
 
 
 async def api_theme_asset(request: web.Request) -> web.Response:
@@ -1039,14 +1031,60 @@ async def api_theme_asset(request: web.Request) -> web.Response:
     )
     if body is None:
         return web.json_response({"error": "not found"}, status=404)
-    return web.Response(
-        body=body,
-        content_type=ct,
-        headers={
-            "X-Content-Type-Options": "nosniff",
-            "Content-Security-Policy": _THEME_ASSET_CSP,
-        },
-    )
+    return _theme_asset_response(request, body, ct)
+
+
+# Fonts, overrides.css and branding images are fetched on EVERY dashboard load;
+# without a validator the browser re-downloads each full body every time. The
+# validator is a digest of the bytes just read, so a reinstall under the same
+# slug (the pack directory is replaced in place) changes it and a stale cached
+# copy is never revalidated as fresh. ``must-revalidate`` + ``max-age=0`` keeps
+# the browser asking; a matching ``If-None-Match`` turns the answer into a
+# header-only 304.
+_THEME_ASSET_CACHE_CONTROL = "private, max-age=0, must-revalidate"
+
+
+def _theme_asset_etag(body: bytes) -> str:
+    """Bare weak-validator value for a theme asset body: 16 hex chars, no quotes.
+
+    The response header is built from it as ``W/"<hex>"``; the bare form is
+    what aiohttp's parsed ``request.if_none_match`` entries carry in ``.value``.
+    """
+    return hashlib.blake2b(body, digest_size=8).hexdigest()
+
+
+def _theme_asset_response(
+    request: web.Request,
+    body: bytes,
+    content_type: str,
+    *,
+    csp: str = _THEME_ASSET_CSP,
+    charset: str | None = None,
+) -> web.Response:
+    """200 with the body, or 304 when the client already holds these bytes.
+
+    Both answers carry the same ETag / Cache-Control and the same ``nosniff``
+    + CSP headers, so a 304 never relaxes what the 200 promised. Overlay and
+    topbar HTML pass their sandbox CSP via ``csp``.
+    """
+    etag_value = _theme_asset_etag(body)
+    headers = {
+        "ETag": f'W/"{etag_value}"',
+        "Cache-Control": _THEME_ASSET_CACHE_CONTROL,
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": csp,
+    }
+    # aiohttp's parsed accessor, not the raw header: it already splits the
+    # list, strips the ``W/`` weak marker and hands ``*`` back as a single
+    # entry. RFC 9110 §13.1.2: If-None-Match uses the WEAK comparison, so a
+    # weak form of the current tag matches too (same shape as apps/routes.py).
+    if_none_match = request.if_none_match
+    if if_none_match and (
+        (len(if_none_match) == 1 and if_none_match[0].value == "*")
+        or any(t.value == etag_value for t in if_none_match)
+    ):
+        return web.Response(status=304, headers=headers)
+    return web.Response(body=body, content_type=content_type, charset=charset, headers=headers)
 
 
 async def api_theme_overlay(request: web.Request) -> web.Response:
@@ -1074,7 +1112,9 @@ async def api_theme_overlay(request: web.Request) -> web.Response:
     )
     if raw is None:
         return web.json_response({"error": "not found"}, status=404)
-    return _theme_html_response(raw.decode("utf-8", errors="replace"))
+    return _theme_asset_response(
+        request, raw, "text/html", csp=_THEME_OVERLAY_CSP, charset="utf-8"
+    )
 
 
 async def api_theme_topbar(request: web.Request) -> web.Response:
@@ -1102,4 +1142,6 @@ async def api_theme_topbar(request: web.Request) -> web.Response:
     )
     if raw is None:
         return web.json_response({"error": "not found"}, status=404)
-    return _theme_html_response(raw.decode("utf-8", errors="replace"))
+    return _theme_asset_response(
+        request, raw, "text/html", csp=_THEME_OVERLAY_CSP, charset="utf-8"
+    )
